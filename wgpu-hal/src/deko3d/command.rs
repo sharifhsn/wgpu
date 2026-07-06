@@ -1,0 +1,961 @@
+use alloc::vec::Vec;
+use core::mem;
+use core::ops::Range;
+
+#[cfg(target_os = "horizon")]
+use core::ptr;
+
+#[cfg(target_os = "horizon")]
+use deko3d_sys as dk;
+
+use super::{
+    Api, BindGroupInner, Buffer, DeviceResult, Queue, RawImage, RawQueueHandle,
+    RenderPipelineInner, Resource, TextureInner,
+};
+
+/// Command buffer type, which performs double duty as the command encoder type too.
+#[derive(Debug)]
+pub struct CommandBuffer {
+    commands: Vec<Command>,
+}
+
+#[derive(Debug)]
+enum Command {
+    ClearBuffer {
+        buffer: Buffer,
+        range: crate::MemoryRange,
+    },
+    CopyBufferToBuffer {
+        src: Buffer,
+        dst: Buffer,
+        regions: Vec<crate::BufferCopy>,
+    },
+    CopyBufferToTexture {
+        src: Buffer,
+        dst: Option<alloc::sync::Arc<TextureInner>>,
+        regions: Vec<crate::BufferTextureCopy>,
+    },
+    BeginRenderPass {
+        image: RawImage,
+        extent: wgt::Extent3d,
+        clear_value: Option<wgt::Color>,
+    },
+    SetRenderPipeline {
+        pipeline: alloc::sync::Arc<RenderPipelineInner>,
+    },
+    SetVertexBuffer {
+        index: u32,
+        buffer: Buffer,
+        offset: wgt::BufferAddress,
+        size: Option<wgt::BufferSize>,
+    },
+    SetIndexBuffer {
+        buffer: Buffer,
+        offset: wgt::BufferAddress,
+        size: Option<wgt::BufferSize>,
+        format: wgt::IndexFormat,
+    },
+    SetBindGroup {
+        index: u32,
+        group: alloc::sync::Arc<BindGroupInner>,
+    },
+    Draw {
+        first_vertex: u32,
+        vertex_count: u32,
+        first_instance: u32,
+        instance_count: u32,
+    },
+    DrawIndexed {
+        first_index: u32,
+        index_count: u32,
+        base_vertex: i32,
+        first_instance: u32,
+        instance_count: u32,
+    },
+}
+
+#[derive(Default)]
+struct ExecutionState {
+    target: Option<RenderTarget>,
+    pipeline: Option<alloc::sync::Arc<RenderPipelineInner>>,
+    vertex_buffers: Vec<Option<VertexBinding>>,
+    index_buffer: Option<IndexBinding>,
+    bind_groups: Vec<Option<alloc::sync::Arc<BindGroupInner>>>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+struct RenderTarget {
+    image: RawImage,
+    extent: wgt::Extent3d,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct VertexBinding {
+    buffer: Buffer,
+    offset: wgt::BufferAddress,
+    size: Option<wgt::BufferSize>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct IndexBinding {
+    buffer: Buffer,
+    offset: wgt::BufferAddress,
+    size: Option<wgt::BufferSize>,
+    format: wgt::IndexFormat,
+}
+
+impl CommandBuffer {
+    /// # Safety
+    ///
+    /// Must be called with appropriate synchronization for the resources affected by the command,
+    /// such as ensuring that buffers are not accessed by a command while aliasing references exist.
+    pub(crate) unsafe fn execute(
+        &self,
+        queue: &Queue,
+        surface_queue: Option<RawQueueHandle>,
+    ) -> DeviceResult<()> {
+        let mut state = ExecutionState::default();
+        for command in &self.commands {
+            unsafe { command.execute(queue, surface_queue, &mut state) }?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn new() -> Self {
+        Self {
+            commands: Vec::new(),
+        }
+    }
+}
+
+impl crate::CommandEncoder for CommandBuffer {
+    type A = Api;
+
+    unsafe fn begin_encoding(&mut self, label: crate::Label) -> DeviceResult<()> {
+        assert!(self.commands.is_empty());
+        Ok(())
+    }
+    unsafe fn discard_encoding(&mut self) {
+        self.commands.clear();
+    }
+    unsafe fn end_encoding(&mut self) -> DeviceResult<CommandBuffer> {
+        Ok(CommandBuffer {
+            commands: mem::take(&mut self.commands),
+        })
+    }
+    unsafe fn reset_all<I>(&mut self, command_buffers: I) {}
+
+    unsafe fn transition_buffers<'a, T>(&mut self, barriers: T)
+    where
+        T: Iterator<Item = crate::BufferBarrier<'a, Buffer>>,
+    {
+    }
+
+    unsafe fn transition_textures<'a, T>(&mut self, barriers: T)
+    where
+        T: Iterator<Item = crate::TextureBarrier<'a, Resource>>,
+    {
+    }
+
+    unsafe fn clear_buffer(&mut self, buffer: &Buffer, range: crate::MemoryRange) {
+        self.commands.push(Command::ClearBuffer {
+            buffer: buffer.clone(),
+            range,
+        })
+    }
+
+    unsafe fn copy_buffer_to_buffer<T>(&mut self, src: &Buffer, dst: &Buffer, regions: T)
+    where
+        T: Iterator<Item = crate::BufferCopy>,
+    {
+        self.commands.push(Command::CopyBufferToBuffer {
+            src: src.clone(),
+            dst: dst.clone(),
+            regions: regions.collect(),
+        });
+    }
+
+    #[cfg(webgl)]
+    unsafe fn copy_external_image_to_texture<T>(
+        &mut self,
+        src: &wgt::CopyExternalImageSourceInfo,
+        dst: &Resource,
+        dst_premultiplication: bool,
+        regions: T,
+    ) where
+        T: Iterator<Item = crate::TextureCopy>,
+    {
+    }
+
+    unsafe fn copy_texture_to_texture<T>(
+        &mut self,
+        src: &Resource,
+        src_usage: wgt::TextureUses,
+        dst: &Resource,
+        regions: T,
+    ) {
+        // TODO: consider implementing this and other texture manipulation
+    }
+
+    unsafe fn copy_buffer_to_texture<T>(&mut self, src: &Buffer, dst: &Resource, regions: T)
+    where
+        T: Iterator<Item = crate::BufferTextureCopy>,
+    {
+        let dst = match dst {
+            Resource::Texture(texture) => Some(texture.clone()),
+            _ => None,
+        };
+        self.commands.push(Command::CopyBufferToTexture {
+            src: src.clone(),
+            dst,
+            regions: regions.collect(),
+        });
+    }
+
+    unsafe fn copy_texture_to_buffer<T>(
+        &mut self,
+        src: &Resource,
+        src_usage: wgt::TextureUses,
+        dst: &Buffer,
+        regions: T,
+    ) {
+        // TODO: consider implementing this and other texture manipulation
+    }
+
+    unsafe fn begin_query(&mut self, set: &Resource, index: u32) {}
+    unsafe fn end_query(&mut self, set: &Resource, index: u32) {}
+    unsafe fn write_timestamp(&mut self, set: &Resource, index: u32) {}
+    unsafe fn read_acceleration_structure_compact_size(
+        &mut self,
+        acceleration_structure: &Resource,
+        buf: &Buffer,
+    ) {
+    }
+    unsafe fn reset_queries(&mut self, set: &Resource, range: Range<u32>) {}
+    unsafe fn copy_query_results(
+        &mut self,
+        set: &Resource,
+        range: Range<u32>,
+        buffer: &Buffer,
+        offset: wgt::BufferAddress,
+        stride: wgt::BufferSize,
+    ) {
+    }
+
+    // render
+
+    unsafe fn begin_render_pass(
+        &mut self,
+        desc: &crate::RenderPassDescriptor<Resource, Resource>,
+    ) -> DeviceResult<()> {
+        if desc.depth_stencil_attachment.is_some()
+            || desc.multiview_mask.is_some()
+            || desc.timestamp_writes.is_some()
+            || desc.occlusion_query_set.is_some()
+            || desc.sample_count != 1
+        {
+            return Err(crate::DeviceError::Lost);
+        }
+
+        let mut attachments = desc.color_attachments.iter().flatten();
+        let Some(attachment) = attachments.next() else {
+            return Err(crate::DeviceError::Lost);
+        };
+        if attachments.next().is_some() {
+            return Err(crate::DeviceError::Lost);
+        }
+        {
+            if attachment.resolve_target.is_some() || attachment.depth_slice.is_some() {
+                return Err(crate::DeviceError::Lost);
+            }
+            let Resource::TextureView { image, extent, .. } = attachment.target.view else {
+                return Err(crate::DeviceError::Lost);
+            };
+            let clear_value = if attachment.ops.contains(crate::AttachmentOps::LOAD_CLEAR) {
+                Some(attachment.clear_value)
+            } else if attachment.ops.contains(crate::AttachmentOps::LOAD)
+                || attachment
+                    .ops
+                    .contains(crate::AttachmentOps::LOAD_DONT_CARE)
+            {
+                None
+            } else {
+                return Err(crate::DeviceError::Lost);
+            };
+            self.commands.push(Command::BeginRenderPass {
+                image: *image,
+                extent: *extent,
+                clear_value,
+            });
+        }
+        Ok(())
+    }
+    unsafe fn end_render_pass(&mut self) {}
+
+    unsafe fn set_bind_group(
+        &mut self,
+        layout: &Resource,
+        index: u32,
+        group: &Resource,
+        dynamic_offsets: &[wgt::DynamicOffset],
+    ) {
+        if let Resource::BindGroup(group) = group {
+            self.commands.push(Command::SetBindGroup {
+                index,
+                group: group.clone(),
+            });
+        }
+    }
+    unsafe fn set_immediates(&mut self, layout: &Resource, offset_bytes: u32, data: &[u32]) {}
+
+    unsafe fn insert_debug_marker(&mut self, label: &str) {}
+    unsafe fn begin_debug_marker(&mut self, group_label: &str) {}
+    unsafe fn end_debug_marker(&mut self) {}
+
+    unsafe fn set_render_pipeline(&mut self, pipeline: &Resource) {
+        if let Resource::RenderPipeline(pipeline) = pipeline {
+            self.commands.push(Command::SetRenderPipeline {
+                pipeline: pipeline.clone(),
+            });
+        }
+    }
+
+    unsafe fn set_index_buffer<'a>(
+        &mut self,
+        binding: crate::BufferBinding<'a, Buffer>,
+        format: wgt::IndexFormat,
+    ) {
+        self.commands.push(Command::SetIndexBuffer {
+            buffer: binding.buffer.clone(),
+            offset: binding.offset,
+            size: binding.size,
+            format,
+        });
+    }
+    unsafe fn set_vertex_buffer<'a>(
+        &mut self,
+        index: u32,
+        binding: crate::BufferBinding<'a, Buffer>,
+    ) {
+        self.commands.push(Command::SetVertexBuffer {
+            index,
+            buffer: binding.buffer.clone(),
+            offset: binding.offset,
+            size: binding.size,
+        });
+    }
+    unsafe fn set_viewport(&mut self, rect: &crate::Rect<f32>, depth_range: Range<f32>) {}
+    unsafe fn set_scissor_rect(&mut self, rect: &crate::Rect<u32>) {}
+    unsafe fn set_stencil_reference(&mut self, value: u32) {}
+    unsafe fn set_blend_constants(&mut self, color: &[f32; 4]) {}
+
+    unsafe fn draw(
+        &mut self,
+        first_vertex: u32,
+        vertex_count: u32,
+        first_instance: u32,
+        instance_count: u32,
+    ) {
+        self.commands.push(Command::Draw {
+            first_vertex,
+            vertex_count,
+            first_instance,
+            instance_count,
+        });
+    }
+    unsafe fn draw_indexed(
+        &mut self,
+        first_index: u32,
+        index_count: u32,
+        base_vertex: i32,
+        first_instance: u32,
+        instance_count: u32,
+    ) {
+        self.commands.push(Command::DrawIndexed {
+            first_index,
+            index_count,
+            base_vertex,
+            first_instance,
+            instance_count,
+        });
+    }
+    unsafe fn draw_mesh_tasks(
+        &mut self,
+        group_count_x: u32,
+        group_count_y: u32,
+        group_count_z: u32,
+    ) {
+    }
+    unsafe fn draw_indirect(
+        &mut self,
+        buffer: &Buffer,
+        offset: wgt::BufferAddress,
+        draw_count: u32,
+    ) {
+    }
+    unsafe fn draw_indexed_indirect(
+        &mut self,
+        buffer: &Buffer,
+        offset: wgt::BufferAddress,
+        draw_count: u32,
+    ) {
+    }
+    unsafe fn draw_mesh_tasks_indirect(
+        &mut self,
+        buffer: &<Self::A as crate::Api>::Buffer,
+        offset: wgt::BufferAddress,
+        draw_count: u32,
+    ) {
+    }
+    unsafe fn draw_indirect_count(
+        &mut self,
+        buffer: &Buffer,
+        offset: wgt::BufferAddress,
+        count_buffer: &Buffer,
+        count_offset: wgt::BufferAddress,
+        max_count: u32,
+    ) {
+    }
+    unsafe fn draw_indexed_indirect_count(
+        &mut self,
+        buffer: &Buffer,
+        offset: wgt::BufferAddress,
+        count_buffer: &Buffer,
+        count_offset: wgt::BufferAddress,
+        max_count: u32,
+    ) {
+    }
+    unsafe fn draw_mesh_tasks_indirect_count(
+        &mut self,
+        buffer: &<Self::A as crate::Api>::Buffer,
+        offset: wgt::BufferAddress,
+        count_buffer: &<Self::A as crate::Api>::Buffer,
+        count_offset: wgt::BufferAddress,
+        max_count: u32,
+    ) {
+    }
+
+    // compute
+
+    unsafe fn begin_compute_pass(&mut self, desc: &crate::ComputePassDescriptor<Resource>) {}
+    unsafe fn end_compute_pass(&mut self) {}
+
+    unsafe fn set_compute_pipeline(&mut self, pipeline: &Resource) {}
+
+    unsafe fn dispatch_workgroups(&mut self, count: [u32; 3]) {}
+    unsafe fn dispatch_workgroups_indirect(&mut self, buffer: &Buffer, offset: wgt::BufferAddress) {
+    }
+
+    unsafe fn begin_ray_tracing_pass(&mut self, desc: &crate::RayTracingPassDescriptor) {
+        unimplemented!()
+    }
+    unsafe fn end_ray_tracing_pass(&mut self) {
+        unimplemented!()
+    }
+    unsafe fn set_ray_tracing_pipeline(&mut self, pipeline: &Resource) {
+        unimplemented!()
+    }
+    unsafe fn trace_rays(
+        &mut self,
+        count: [u32; 3],
+        ray_generation_group_data: crate::PipelineGroupData<Buffer>,
+        miss_group_data: crate::PipelineGroupData<Buffer>,
+        intersection_group_data: crate::PipelineGroupData<Buffer>,
+    ) {
+        unimplemented!()
+    }
+
+    unsafe fn build_acceleration_structures<'a, T>(
+        &mut self,
+        _descriptor_count: u32,
+        descriptors: T,
+    ) where
+        Api: 'a,
+        T: IntoIterator<Item = crate::BuildAccelerationStructureDescriptor<'a, Buffer, Resource>>,
+    {
+    }
+
+    unsafe fn place_acceleration_structure_barrier(
+        &mut self,
+        _barriers: crate::AccelerationStructureBarrier,
+    ) {
+    }
+
+    unsafe fn copy_acceleration_structure_to_acceleration_structure(
+        &mut self,
+        src: &Resource,
+        dst: &Resource,
+        copy: wgt::AccelerationStructureCopy,
+    ) {
+    }
+
+    unsafe fn set_acceleration_structure_dependencies(
+        command_buffers: &[&CommandBuffer],
+        dependencies: &[&Resource],
+    ) {
+    }
+}
+
+impl Command {
+    /// # Safety
+    ///
+    /// Must be called with appropriate synchronization for the resources affected by the command,
+    /// such as ensuring that buffers are not accessed by a command while aliasing references exist.
+    unsafe fn execute(
+        &self,
+        queue: &Queue,
+        surface_queue: Option<RawQueueHandle>,
+        state: &mut ExecutionState,
+    ) -> DeviceResult<()> {
+        match self {
+            Command::ClearBuffer { ref buffer, range } => {
+                // SAFETY:
+                // Caller is responsible for ensuring this does not alias.
+                let buffer_slice: &mut [u8] = unsafe { &mut *buffer.get_slice_ptr(range.clone()) };
+                buffer_slice.fill(0);
+                Ok(())
+            }
+
+            Command::CopyBufferToBuffer { src, dst, regions } => {
+                for &crate::BufferCopy {
+                    src_offset,
+                    dst_offset,
+                    size,
+                } in regions
+                {
+                    // SAFETY:
+                    // Caller is responsible for ensuring this does not alias.
+                    let src_region: &[u8] =
+                        unsafe { &*src.get_slice_ptr(src_offset..src_offset + size.get()) };
+                    let dst_region: &mut [u8] =
+                        unsafe { &mut *dst.get_slice_ptr(dst_offset..dst_offset + size.get()) };
+                    dst_region.copy_from_slice(src_region);
+                }
+                Ok(())
+            }
+            Command::CopyBufferToTexture { src, dst, regions } => {
+                let dst = dst.as_ref().ok_or(crate::DeviceError::Lost)?;
+                unsafe { submit_copy_buffer_to_texture(queue, surface_queue, src, dst, regions) }
+            }
+            Command::BeginRenderPass {
+                image,
+                extent,
+                clear_value,
+            } => {
+                state.target = Some(RenderTarget {
+                    image: *image,
+                    extent: *extent,
+                });
+                unsafe {
+                    submit_begin_render_pass(queue, surface_queue, *image, *extent, *clear_value)
+                }
+            }
+            Command::SetRenderPipeline { pipeline } => {
+                state.pipeline = Some(pipeline.clone());
+                Ok(())
+            }
+            Command::SetVertexBuffer {
+                index,
+                buffer,
+                offset,
+                size,
+            } => {
+                let index = usize::try_from(*index).map_err(|_| crate::DeviceError::Lost)?;
+                if state.vertex_buffers.len() <= index {
+                    state.vertex_buffers.resize(index + 1, None);
+                }
+                state.vertex_buffers[index] = Some(VertexBinding {
+                    buffer: buffer.clone(),
+                    offset: *offset,
+                    size: *size,
+                });
+                Ok(())
+            }
+            Command::SetIndexBuffer {
+                buffer,
+                offset,
+                size,
+                format,
+            } => {
+                state.index_buffer = Some(IndexBinding {
+                    buffer: buffer.clone(),
+                    offset: *offset,
+                    size: *size,
+                    format: *format,
+                });
+                Ok(())
+            }
+            Command::SetBindGroup { index, group } => {
+                let index = usize::try_from(*index).map_err(|_| crate::DeviceError::Lost)?;
+                if state.bind_groups.len() <= index {
+                    state.bind_groups.resize(index + 1, None);
+                }
+                state.bind_groups[index] = Some(group.clone());
+                Ok(())
+            }
+            Command::Draw {
+                first_vertex,
+                vertex_count,
+                first_instance,
+                instance_count,
+            } => unsafe {
+                submit_draw(
+                    queue,
+                    surface_queue,
+                    state,
+                    *first_vertex,
+                    *vertex_count,
+                    *first_instance,
+                    *instance_count,
+                )
+            },
+            Command::DrawIndexed {
+                first_index,
+                index_count,
+                base_vertex,
+                first_instance,
+                instance_count,
+            } => unsafe {
+                submit_draw_indexed(
+                    queue,
+                    surface_queue,
+                    state,
+                    *first_index,
+                    *index_count,
+                    *base_vertex,
+                    *first_instance,
+                    *instance_count,
+                )
+            },
+        }
+    }
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_copy_buffer_to_texture(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    src: &Buffer,
+    dst: &TextureInner,
+    regions: &[crate::BufferTextureCopy],
+) -> DeviceResult<()> {
+    unsafe {
+        submit_deko_commands(queue, surface_queue, |cmdbuf| {
+            let dst_view = dk::DkImageView::defaults(dst.raw_image().0);
+            for region in regions {
+                if region.texture_base.mip_level != 0
+                    || region.texture_base.array_layer != 0
+                    || region.texture_base.origin.z != 0
+                    || region.texture_base.aspect != crate::FormatAspects::COLOR
+                    || region.size.depth != 1
+                {
+                    return Err(crate::DeviceError::Lost);
+                }
+                let extent = dst.extent();
+                if region.texture_base.origin.x + region.size.width > extent.width
+                    || region.texture_base.origin.y + region.size.height > extent.height
+                {
+                    return Err(crate::DeviceError::Lost);
+                }
+
+                let row_bytes = region
+                    .size
+                    .width
+                    .checked_mul(4)
+                    .ok_or(crate::DeviceError::Lost)?;
+                let bytes_per_row = region.buffer_layout.bytes_per_row.unwrap_or(row_bytes);
+                if bytes_per_row < row_bytes || bytes_per_row % 4 != 0 {
+                    return Err(crate::DeviceError::Lost);
+                }
+                let rows_per_image = region
+                    .buffer_layout
+                    .rows_per_image
+                    .unwrap_or(region.size.height);
+                if rows_per_image < region.size.height {
+                    return Err(crate::DeviceError::Lost);
+                }
+                let required_bytes = if region.size.height == 0 {
+                    0
+                } else {
+                    u64::from(bytes_per_row)
+                        .checked_mul(u64::from(region.size.height - 1))
+                        .and_then(|bytes| bytes.checked_add(u64::from(row_bytes)))
+                        .ok_or(crate::DeviceError::Lost)?
+                };
+                let required_bytes =
+                    wgt::BufferSize::new(required_bytes).ok_or(crate::DeviceError::Lost)?;
+                let (src_addr, _) =
+                    src.gpu_binding(region.buffer_layout.offset, Some(required_bytes))?;
+                let copy_src = dk::DkCopyBuf {
+                    addr: src_addr,
+                    rowLength: if bytes_per_row == row_bytes {
+                        0
+                    } else {
+                        bytes_per_row / 4
+                    },
+                    imageHeight: if rows_per_image == region.size.height {
+                        0
+                    } else {
+                        rows_per_image
+                    },
+                };
+                let copy_rect = dk::DkImageRect {
+                    x: region.texture_base.origin.x,
+                    y: region.texture_base.origin.y,
+                    z: region.texture_base.origin.z,
+                    width: region.size.width,
+                    height: region.size.height,
+                    depth: region.size.depth,
+                };
+                dk::dkCmdBufCopyBufferToImage(cmdbuf, &copy_src, &dst_view, &copy_rect, 0);
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_copy_buffer_to_texture(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _src: &Buffer,
+    _dst: &TextureInner,
+    _regions: &[crate::BufferTextureCopy],
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_begin_render_pass(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    image: RawImage,
+    extent: wgt::Extent3d,
+    clear_value: Option<wgt::Color>,
+) -> DeviceResult<()> {
+    unsafe {
+        submit_deko_commands(queue, surface_queue, |cmdbuf| {
+            let image_view = dk::DkImageView::defaults(image.0);
+            dk::dkCmdBufBindRenderTarget(cmdbuf, &image_view, ptr::null());
+            let viewport = dk::DkViewport {
+                x: 0.0,
+                y: 0.0,
+                width: extent.width as f32,
+                height: extent.height as f32,
+                near: 0.0,
+                far: 1.0,
+            };
+            let scissor = dk::DkScissor {
+                x: 0,
+                y: 0,
+                width: extent.width,
+                height: extent.height,
+            };
+            dk::dkCmdBufSetViewports(cmdbuf, 0, &viewport, 1);
+            dk::dkCmdBufSetScissors(cmdbuf, 0, &scissor, 1);
+            if let Some(clear_value) = clear_value {
+                dk::dkCmdBufClearColorFloat(
+                    cmdbuf,
+                    0,
+                    dk::DkColorMask_RGBA,
+                    clear_value.r as f32,
+                    clear_value.g as f32,
+                    clear_value.b as f32,
+                    clear_value.a as f32,
+                );
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_begin_render_pass(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _image: RawImage,
+    _extent: wgt::Extent3d,
+    _clear_value: Option<wgt::Color>,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_draw(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    state: &ExecutionState,
+    first_vertex: u32,
+    vertex_count: u32,
+    first_instance: u32,
+    instance_count: u32,
+) -> DeviceResult<()> {
+    unsafe {
+        submit_deko_draw(queue, surface_queue, state, |cmdbuf, pipeline| {
+            dk::dkCmdBufDraw(
+                cmdbuf,
+                pipeline.primitive,
+                vertex_count,
+                instance_count,
+                first_vertex,
+                first_instance,
+            );
+            Ok(())
+        })
+    }
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_draw_indexed(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    state: &ExecutionState,
+    first_index: u32,
+    index_count: u32,
+    base_vertex: i32,
+    first_instance: u32,
+    instance_count: u32,
+) -> DeviceResult<()> {
+    let index_binding = state
+        .index_buffer
+        .as_ref()
+        .ok_or(crate::DeviceError::Lost)?;
+    unsafe {
+        submit_deko_draw(queue, surface_queue, state, |cmdbuf, pipeline| {
+            let (index_addr, _) = index_binding
+                .buffer
+                .gpu_binding(index_binding.offset, index_binding.size)?;
+            dk::dkCmdBufBindIdxBuffer(cmdbuf, map_index_format(index_binding.format), index_addr);
+            dk::dkCmdBufDrawIndexed(
+                cmdbuf,
+                pipeline.primitive,
+                index_count,
+                instance_count,
+                first_index,
+                base_vertex,
+                first_instance,
+            );
+            Ok(())
+        })
+    }
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_deko_draw(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    state: &ExecutionState,
+    draw: impl FnOnce(dk::DkCmdBuf, &super::RenderPipelineInnerRaw) -> DeviceResult<()>,
+) -> DeviceResult<()> {
+    let target = state.target.ok_or(crate::DeviceError::Lost)?;
+    let pipeline = state.pipeline.as_ref().ok_or(crate::DeviceError::Lost)?;
+    let pipeline = pipeline.raw();
+    unsafe {
+        submit_deko_commands(queue, surface_queue, |cmdbuf| {
+            let viewport = dk::DkViewport {
+                x: 0.0,
+                y: 0.0,
+                width: target.extent.width as f32,
+                height: target.extent.height as f32,
+                near: 0.0,
+                far: 1.0,
+            };
+            let scissor = dk::DkScissor {
+                x: 0,
+                y: 0,
+                width: target.extent.width,
+                height: target.extent.height,
+            };
+            let shaders = [
+                pipeline.vertex_shader.raw_shader(),
+                pipeline.fragment_shader.raw_shader(),
+            ];
+            dk::dkCmdBufSetViewports(cmdbuf, 0, &viewport, 1);
+            dk::dkCmdBufSetScissors(cmdbuf, 0, &scissor, 1);
+            dk::dkCmdBufBindShaders(
+                cmdbuf,
+                dk::DkStageFlag_GraphicsMask,
+                shaders.as_ptr(),
+                shaders.len() as u32,
+            );
+            if let Some(Some(group)) = state.bind_groups.first() {
+                group.bind_descriptor_sets(cmdbuf)?;
+            }
+            dk::dkCmdBufBindRasterizerState(cmdbuf, &pipeline.rasterizer_state);
+            dk::dkCmdBufBindColorState(cmdbuf, &pipeline.color_state);
+            dk::dkCmdBufBindColorWriteState(cmdbuf, &pipeline.color_write_state);
+            for (index, binding) in state.vertex_buffers.iter().enumerate() {
+                let Some(binding) = binding else {
+                    continue;
+                };
+                let (gpu_addr, gpu_size) =
+                    binding.buffer.gpu_binding(binding.offset, binding.size)?;
+                dk::dkCmdBufBindVtxBuffer(
+                    cmdbuf,
+                    u32::try_from(index).map_err(|_| crate::DeviceError::Lost)?,
+                    gpu_addr,
+                    gpu_size,
+                );
+            }
+            dk::dkCmdBufBindVtxAttribState(
+                cmdbuf,
+                pipeline.vertex_attributes.as_ptr(),
+                pipeline.vertex_attributes.len() as u32,
+            );
+            dk::dkCmdBufBindVtxBufferState(
+                cmdbuf,
+                pipeline.vertex_buffers.as_ptr(),
+                pipeline.vertex_buffers.len() as u32,
+            );
+            draw(cmdbuf, pipeline)
+        })
+    }
+}
+
+#[cfg(target_os = "horizon")]
+fn map_index_format(format: wgt::IndexFormat) -> dk::DkIdxFormat {
+    match format {
+        wgt::IndexFormat::Uint16 => dk::DkIdxFormat::DkIdxFormat_Uint16,
+        wgt::IndexFormat::Uint32 => dk::DkIdxFormat::DkIdxFormat_Uint32,
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_draw(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _state: &ExecutionState,
+    _first_vertex: u32,
+    _vertex_count: u32,
+    _first_instance: u32,
+    _instance_count: u32,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_draw_indexed(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _state: &ExecutionState,
+    _first_index: u32,
+    _index_count: u32,
+    _base_vertex: i32,
+    _first_instance: u32,
+    _instance_count: u32,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_deko_commands(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    record: impl FnOnce(dk::DkCmdBuf) -> DeviceResult<()>,
+) -> DeviceResult<()> {
+    let raw_queue = surface_queue.unwrap_or_else(|| queue.raw_queue()).0;
+    unsafe { queue.record_and_submit(raw_queue, record) }
+}

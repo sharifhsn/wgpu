@@ -49,6 +49,10 @@ pub enum Backend {
     Gl = 4,
     /// WebGPU in the browser
     BrowserWebGpu = 5,
+    /// Nintendo Switch homebrew through Deko3D.
+    ///
+    /// Experimental backend for original-Switch homebrew builds.
+    Deko3d = 6,
 }
 
 impl Backend {
@@ -60,6 +64,7 @@ impl Backend {
         Self::Dx12,
         Self::Gl,
         Self::BrowserWebGpu,
+        Self::Deko3d,
     ];
 
     /// Returns the string name of the backend.
@@ -72,6 +77,7 @@ impl Backend {
             Backend::Dx12 => "dx12",
             Backend::Gl => "gl",
             Backend::BrowserWebGpu => "webgpu",
+            Backend::Deko3d => "deko3d",
         }
     }
 }
@@ -118,6 +124,11 @@ bitflags::bitflags! {
         /// *not* upon adapter creation. See `wgpu::Instance::new`.
         const BROWSER_WEBGPU = 1 << Backend::BrowserWebGpu as u32;
 
+        /// [`Backend::Deko3d`].
+        ///
+        /// Experimental homebrew backend for original Nintendo Switch through Deko3D.
+        const DEKO3D = 1 << Backend::Deko3d as u32;
+
         /// All the apis that wgpu offers first tier of support for.
         ///
         /// * [`Backends::VULKAN`]
@@ -133,7 +144,8 @@ bitflags::bitflags! {
         /// be unsupported/still experimental.
         ///
         /// * [`Backends::GL`]
-        const SECONDARY = Self::GL.bits();
+        /// * [`Backends::DEKO3D`]
+        const SECONDARY = Self::GL.bits() | Self::DEKO3D.bits();
     }
 }
 
@@ -179,6 +191,7 @@ impl Backends {
     /// - metal  = "metal" or "mtl"
     /// - gles   = "opengl" or "gles" or "gl"
     /// - webgpu = "webgpu"
+    /// - deko3d = "deko3d" or "deko" or "dk"
     pub fn from_comma_list(string: &str) -> Self {
         let mut backends = Self::empty();
         for backend in string.to_lowercase().split(',') {
@@ -189,6 +202,7 @@ impl Backends {
                 "opengl" | "gles" | "gl" => Self::GL,
                 "webgpu" => Self::BROWSER_WEBGPU,
                 "noop" => Self::NOOP,
+                "deko3d" | "deko" | "dk" => Self::DEKO3D,
                 b => {
                     log::warn!("unknown backend string '{b}'");
                     continue;

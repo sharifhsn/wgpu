@@ -156,6 +156,8 @@ drm = ["wgpu-core-deps-windows-linux-android/drm"]
 ## Enable the `noop` backend.
 # TODO(https://github.com/gfx-rs/wgpu/issues/7120): there should be a hal feature
 noop = []
+## Enable the experimental Deko3D backend for original Nintendo Switch homebrew.
+deko3d = ["wgpu-hal/deko3d"]
 
 # The target limitation here isn't needed, but prevents more than one of these
 # platform crates from being included in the build at a time, preventing users

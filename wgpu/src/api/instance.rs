@@ -126,6 +126,9 @@ impl Instance {
         if cfg!(webgpu) {
             backends = backends.union(Backends::BROWSER_WEBGPU);
         }
+        if cfg!(deko3d) {
+            backends = backends.union(Backends::DEKO3D);
+        }
         backends
     }
 

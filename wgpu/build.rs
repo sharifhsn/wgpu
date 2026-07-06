@@ -34,6 +34,7 @@ fn main() {
             all(target_vendor = "apple", feature = "angle")
         ) },
         noop: { feature = "noop" },
+        deko3d: { feature = "deko3d" },
 
         wgpu_core: {
             any(
@@ -41,7 +42,7 @@ fn main() {
                 native,
                 // `wgpu_core` is implied if any backend other than WebGPU is enabled.
                 // (this is redundant except for `gles` and `noop`)
-                webgl, dx12, metal, vulkan, gles, noop
+                webgl, dx12, metal, vulkan, gles, noop, deko3d
             )
         },
 
