@@ -878,17 +878,12 @@ impl RenderPipelineInner {
         else {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         };
-        if !vertex_stage.entry_point.is_empty() && vertex_stage.entry_point != "main" {
-            return Err(crate::PipelineError::EntryPoint(naga::ShaderStage::Vertex));
-        }
         let Some(fragment_stage) = &desc.fragment_stage else {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         };
-        if !fragment_stage.entry_point.is_empty() && fragment_stage.entry_point != "main" {
-            return Err(crate::PipelineError::EntryPoint(
-                naga::ShaderStage::Fragment,
-            ));
-        }
+        // Deko3D DKSH blobs are already compiled for a concrete shader program.
+        // wgpu-core validates passthrough/Naga entry-point metadata before HAL
+        // pipeline creation, and Deko3D does not inspect the source-level name.
 
         let Resource::ShaderModule(vertex_shader) = vertex_stage.module else {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
