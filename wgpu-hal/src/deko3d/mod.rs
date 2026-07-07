@@ -5,10 +5,7 @@ use core::{cell::UnsafeCell, ptr, sync::atomic::Ordering, time::Duration};
 
 use core::fmt;
 #[cfg(target_os = "horizon")]
-use core::{
-    mem::{size_of, size_of_val},
-    slice,
-};
+use core::mem::size_of;
 
 #[cfg(supports_64bit_atomics)]
 use core::sync::atomic::AtomicU64;
@@ -761,12 +758,7 @@ impl SurfaceState {
 
 #[cfg(target_os = "horizon")]
 impl ShaderModuleInner {
-    unsafe fn new_dksh(
-        raw_device: dk::DkDevice,
-        words: &[u32],
-    ) -> Result<Self, crate::ShaderError> {
-        let bytes =
-            unsafe { slice::from_raw_parts(words.as_ptr().cast::<u8>(), size_of_val(words)) };
+    unsafe fn new_dksh(raw_device: dk::DkDevice, bytes: &[u8]) -> Result<Self, crate::ShaderError> {
         if bytes.len() < size_of::<DkshHeader>() {
             return Err(shader_error("deko3d DKSH input is shorter than its header"));
         }
@@ -1862,13 +1854,13 @@ impl crate::Device for Device {
         #[cfg(target_os = "horizon")]
         {
             match shader {
-                // Temporary convention: Deko3D treats this aligned word slice as
-                // raw offline DKSH bytes in both direct-HAL and public-wgpu paths.
-                crate::ShaderInput::SpirV(words) => Ok(Resource::ShaderModule(Arc::new(unsafe {
-                    ShaderModuleInner::new_dksh(self.inner.raw_device(), words)?
-                }))),
+                crate::ShaderInput::Deko3dDksh(bytes) => {
+                    Ok(Resource::ShaderModule(Arc::new(unsafe {
+                        ShaderModuleInner::new_dksh(self.inner.raw_device(), bytes)?
+                    })))
+                }
                 _ => Err(crate::ShaderError::Compilation(String::from(
-                    "deko3d only accepts offline DKSH bytes through the direct HAL path",
+                    "deko3d only accepts offline DKSH bytes through the Deko3D shader path",
                 ))),
             }
         }

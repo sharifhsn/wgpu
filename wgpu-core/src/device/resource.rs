@@ -2558,11 +2558,9 @@ impl Device {
             wgt::Backend::Noop => {
                 return Err(pipeline::CreateShaderModuleError::NotCompiledForBackend)
             }
-            wgt::Backend::Deko3d => hal::ShaderInput::SpirV(
-                // Temporary public-wgpu convention: Deko3D treats the SPIR-V word
-                // field as aligned offline DKSH bytes, matching the direct HAL path.
+            wgt::Backend::Deko3d => hal::ShaderInput::Deko3dDksh(
                 descriptor
-                    .spirv
+                    .deko3d_dksh
                     .as_ref()
                     .ok_or(pipeline::CreateShaderModuleError::NotCompiledForBackend)?,
             ),

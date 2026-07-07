@@ -1316,6 +1316,7 @@ impl crate::Device for super::Device {
                 })
             }
             crate::ShaderInput::SpirV(_)
+            | crate::ShaderInput::Deko3dDksh(_)
             | crate::ShaderInput::Dxil { .. }
             | crate::ShaderInput::Hlsl { .. }
             | crate::ShaderInput::Glsl { .. } => unreachable!(),

@@ -44,6 +44,7 @@ pub enum DataKind {
     /// IR of Naga module, serialized in RON format
     Ron,
     Spv,
+    Dksh,
     Dxil,
     Hlsl,
     MetalLib,
@@ -58,6 +59,7 @@ impl core::fmt::Display for DataKind {
             DataKind::Wgsl => "wgsl",
             DataKind::Ron => "ron",
             DataKind::Spv => "spv",
+            DataKind::Dksh => "dksh",
             DataKind::Dxil => "dxil",
             DataKind::Hlsl => "hlsl",
             DataKind::MetalLib => "metallib",
@@ -75,7 +77,11 @@ impl DataKind {
             DataKind::Wgsl | DataKind::Ron | DataKind::Hlsl | DataKind::Msl | DataKind::Glsl => {
                 true
             }
-            DataKind::Bin | DataKind::Spv | DataKind::Dxil | DataKind::MetalLib => false,
+            DataKind::Bin
+            | DataKind::Spv
+            | DataKind::Dksh
+            | DataKind::Dxil
+            | DataKind::MetalLib => false,
         }
     }
 }
@@ -92,6 +98,8 @@ impl Data {
                     DataKind::Ron
                 } else if file.ends_with(".spv") {
                     DataKind::Spv
+                } else if file.ends_with(".dksh") {
+                    DataKind::Dksh
                 } else if file.ends_with(".dxil") {
                     DataKind::Dxil
                 } else if file.ends_with(".hlsl") {

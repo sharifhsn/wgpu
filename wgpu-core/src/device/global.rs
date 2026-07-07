@@ -1057,6 +1057,7 @@ impl Global {
                         desc.spirv.as_ref().map(|a| bytemuck::cast_slice(a)),
                         DataKind::Spv,
                     ),
+                    (desc.deko3d_dksh.as_deref(), DataKind::Dksh),
                     (desc.dxil.as_deref(), DataKind::Dxil),
                     (desc.hlsl.as_ref().map(|a| a.as_bytes()), DataKind::Hlsl),
                     (desc.metallib.as_deref(), DataKind::MetalLib),

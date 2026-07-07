@@ -1488,6 +1488,7 @@ impl crate::Device for super::Device {
                     source: shader.to_owned(),
                 },
                 crate::ShaderInput::SpirV(_)
+                | crate::ShaderInput::Deko3dDksh(_)
                 | crate::ShaderInput::MetalLib { .. }
                 | crate::ShaderInput::Msl { .. }
                 | crate::ShaderInput::Dxil { .. }

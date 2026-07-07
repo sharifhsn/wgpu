@@ -1903,6 +1903,7 @@ impl crate::Device for super::Device {
             }
             crate::ShaderInput::MetalLib { .. }
             | crate::ShaderInput::Msl { .. }
+            | crate::ShaderInput::Deko3dDksh(_)
             | crate::ShaderInput::Dxil { .. }
             | crate::ShaderInput::Hlsl { .. }
             | crate::ShaderInput::Glsl { .. } => unreachable!(),
