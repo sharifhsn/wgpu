@@ -1051,9 +1051,8 @@ fn map_blend_factor(factor: wgt::BlendFactor) -> Result<dk::DkBlendFactor, crate
         wgt::BlendFactor::OneMinusSrc1 => Ok(dk::DkBlendFactor::DkBlendFactor_InvSrc1Color),
         wgt::BlendFactor::Src1Alpha => Ok(dk::DkBlendFactor::DkBlendFactor_Src1Alpha),
         wgt::BlendFactor::OneMinusSrc1Alpha => Ok(dk::DkBlendFactor::DkBlendFactor_InvSrc1Alpha),
-        wgt::BlendFactor::Constant | wgt::BlendFactor::OneMinusConstant => {
-            Err(crate::PipelineError::Device(crate::DeviceError::Lost))
-        }
+        wgt::BlendFactor::Constant => Ok(dk::DkBlendFactor::DkBlendFactor_ConstColor),
+        wgt::BlendFactor::OneMinusConstant => Ok(dk::DkBlendFactor::DkBlendFactor_InvConstColor),
     }
 }
 

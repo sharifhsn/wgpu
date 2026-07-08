@@ -70,6 +70,9 @@ enum Command {
     SetScissorRect {
         rect: crate::Rect<u32>,
     },
+    SetBlendConstants {
+        color: [f32; 4],
+    },
     Draw {
         first_vertex: u32,
         vertex_count: u32,
@@ -104,6 +107,7 @@ struct ExecutionState {
     bind_groups: Vec<Option<BoundBindGroup>>,
     viewport: Option<ViewportState>,
     scissor: Option<ScissorState>,
+    blend_constants: [f32; 4],
 }
 
 #[allow(dead_code)]
@@ -402,7 +406,10 @@ impl crate::CommandEncoder for CommandBuffer {
             .push(Command::SetScissorRect { rect: rect.clone() });
     }
     unsafe fn set_stencil_reference(&mut self, value: u32) {}
-    unsafe fn set_blend_constants(&mut self, color: &[f32; 4]) {}
+    unsafe fn set_blend_constants(&mut self, color: &[f32; 4]) {
+        self.commands
+            .push(Command::SetBlendConstants { color: *color });
+    }
 
     unsafe fn draw(
         &mut self,
@@ -613,6 +620,7 @@ impl Command {
                 });
                 state.viewport = None;
                 state.scissor = None;
+                state.blend_constants = [0.0; 4];
                 unsafe {
                     submit_begin_render_pass(queue, surface_queue, *image, *extent, *clear_value)
                 }
@@ -676,6 +684,10 @@ impl Command {
             }
             Command::SetScissorRect { rect } => {
                 state.scissor = Some(ScissorState { rect: rect.clone() });
+                Ok(())
+            }
+            Command::SetBlendConstants { color } => {
+                state.blend_constants = *color;
                 Ok(())
             }
             Command::Draw {
@@ -1087,6 +1099,13 @@ unsafe fn submit_deko_draw(
             dk::dkCmdBufBindColorState(cmdbuf, &pipeline.color_state);
             dk::dkCmdBufBindColorWriteState(cmdbuf, &pipeline.color_write_state);
             dk::dkCmdBufBindBlendStates(cmdbuf, 0, &pipeline.blend_state, 1);
+            dk::dkCmdBufSetBlendConst(
+                cmdbuf,
+                state.blend_constants[0],
+                state.blend_constants[1],
+                state.blend_constants[2],
+                state.blend_constants[3],
+            );
             for (index, binding) in state.vertex_buffers.iter().enumerate() {
                 let Some(binding) = binding else {
                     continue;
