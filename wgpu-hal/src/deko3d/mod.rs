@@ -876,12 +876,10 @@ impl RenderPipelineInner {
         let Some(color_target) = &desc.color_targets[0] else {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         };
-        if color_target.format != wgt::TextureFormat::Rgba8Unorm
-            || color_target.blend.is_some()
-            || color_target.write_mask != wgt::ColorWrites::ALL
-        {
+        if color_target.format != wgt::TextureFormat::Rgba8Unorm || color_target.blend.is_some() {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         }
+        let color_write_state = map_color_write_state(color_target.write_mask);
 
         let crate::VertexProcessor::Standard {
             vertex_buffers,
@@ -942,10 +940,29 @@ impl RenderPipelineInner {
                 vertex_attributes,
                 rasterizer_state: dk::DkRasterizerState::defaults(),
                 color_state: dk::DkColorState::defaults(),
-                color_write_state: dk::DkColorWriteState::defaults(),
+                color_write_state,
             },
         })
     }
+}
+
+#[cfg(target_os = "horizon")]
+fn map_color_write_state(write_mask: wgt::ColorWrites) -> dk::DkColorWriteState {
+    let mut mask = 0;
+    if write_mask.contains(wgt::ColorWrites::RED) {
+        mask |= dk::DkColorMask_R;
+    }
+    if write_mask.contains(wgt::ColorWrites::GREEN) {
+        mask |= dk::DkColorMask_G;
+    }
+    if write_mask.contains(wgt::ColorWrites::BLUE) {
+        mask |= dk::DkColorMask_B;
+    }
+    if write_mask.contains(wgt::ColorWrites::ALPHA) {
+        mask |= dk::DkColorMask_A;
+    }
+
+    dk::DkColorWriteState { masks: mask }
 }
 
 #[cfg(target_os = "horizon")]
