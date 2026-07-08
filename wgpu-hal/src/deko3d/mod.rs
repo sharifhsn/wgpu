@@ -863,7 +863,6 @@ impl RenderPipelineInner {
         }
         if desc.primitive.topology != wgt::PrimitiveTopology::TriangleList
             || desc.primitive.strip_index_format.is_some()
-            || desc.primitive.cull_mode.is_some()
             || desc.primitive.unclipped_depth
             || desc.primitive.polygon_mode != wgt::PolygonMode::Fill
             || desc.primitive.conservative
@@ -880,6 +879,7 @@ impl RenderPipelineInner {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         }
         let color_write_state = map_color_write_state(color_target.write_mask);
+        let rasterizer_state = map_rasterizer_state(&desc.primitive);
 
         let crate::VertexProcessor::Standard {
             vertex_buffers,
@@ -938,12 +938,29 @@ impl RenderPipelineInner {
                 primitive: dk::DkPrimitive::DkPrimitive_Triangles,
                 vertex_buffers: vertex_buffer_states,
                 vertex_attributes,
-                rasterizer_state: dk::DkRasterizerState::defaults(),
+                rasterizer_state,
                 color_state: dk::DkColorState::defaults(),
                 color_write_state,
             },
         })
     }
+}
+
+#[cfg(target_os = "horizon")]
+fn map_rasterizer_state(primitive: &wgt::PrimitiveState) -> dk::DkRasterizerState {
+    let mut state = dk::DkRasterizerState::defaults();
+    let cull_mode = match primitive.cull_mode {
+        None => dk::DkFace_None,
+        Some(wgt::Face::Front) => dk::DkFace_Front,
+        Some(wgt::Face::Back) => dk::DkFace_Back,
+    };
+    let front_face = match primitive.front_face {
+        wgt::FrontFace::Cw => dk::DkFrontFace_CW,
+        wgt::FrontFace::Ccw => dk::DkFrontFace_CCW,
+    };
+    state.set_cull_mode(cull_mode);
+    state.set_front_face(front_face);
+    state
 }
 
 #[cfg(target_os = "horizon")]
