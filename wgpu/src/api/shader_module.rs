@@ -1,4 +1,4 @@
-use alloc::{string::String, vec::Vec};
+use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::{future::Future, marker::PhantomData};
 
 use crate::*;
@@ -6,9 +6,9 @@ use crate::*;
 /// Handle to a compiled shader module.
 ///
 /// A `ShaderModule` represents a compiled shader module on the GPU. It can be created by passing
-/// source code to [`Device::create_shader_module`]. MSL shader or SPIR-V binary can also be passed
-/// directly using [`Device::create_shader_module_passthrough`]. Shader modules are used to define
-/// programmable stages of a pipeline.
+/// source code to [`Device::create_shader_module`]. MSL shader, SPIR-V binary, or
+/// Deko3D DKSH binary can also be passed directly using passthrough helpers.
+/// Shader modules are used to define programmable stages of a pipeline.
 ///
 /// Corresponds to [WebGPU `GPUShaderModule`](https://gpuweb.github.io/gpuweb/#shader-module).
 #[derive(Debug, Clone)]
@@ -235,3 +235,19 @@ static_assertions::assert_impl_all!(ShaderModuleDescriptor<'_>: Send, Sync);
 /// only WGSL source code strings are accepted.
 pub type ShaderModuleDescriptorPassthrough<'a> =
     wgt::CreateShaderModuleDescriptorPassthrough<'a, Label<'a>>;
+
+/// Descriptor for a Deko3D shader module backed by offline-compiled DKSH bytes.
+///
+/// This is a Deko3D extension to the Rust API of `wgpu`. The DKSH payload is
+/// passed to the backend as-is and must already match the entry points and
+/// pipeline state that will consume it.
+#[derive(Clone, Debug)]
+pub struct Deko3dDkshShaderModuleDescriptor<'a> {
+    /// Debug label of the shader module. This will show up in graphics debuggers for easy identification.
+    pub label: Label<'a>,
+    /// The list of entry points and their corresponding workgroup sizes.
+    pub entry_points: Cow<'a, [PassthroughShaderEntryPoint<'a>]>,
+    /// Binary Deko3D DKSH data, as produced by the offline deko3d shader compiler.
+    pub dksh: Cow<'a, [u8]>,
+}
+static_assertions::assert_impl_all!(Deko3dDkshShaderModuleDescriptor<'_>: Send, Sync);

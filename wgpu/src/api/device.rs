@@ -202,6 +202,38 @@ impl Device {
         ShaderModule { inner: module }
     }
 
+    /// Creates a Deko3D shader module from offline-compiled DKSH bytes.
+    ///
+    /// This is a Deko3D extension over [`create_shader_module_passthrough`][Self::create_shader_module_passthrough].
+    /// It fills only the Deko3D DKSH passthrough payload, making Deko3D call sites
+    /// explicit without changing the underlying unsafe passthrough semantics.
+    ///
+    /// # Safety
+    ///
+    /// This function passes DKSH bytes to the Deko3D backend as-is. The caller must
+    /// ensure that the DKSH payload is valid for Deko3D and matches the provided
+    /// entry points and the pipeline state that will consume it.
+    #[must_use]
+    pub unsafe fn create_shader_module_deko3d_dksh(
+        &self,
+        desc: Deko3dDkshShaderModuleDescriptor<'_>,
+    ) -> ShaderModule {
+        unsafe {
+            self.create_shader_module_passthrough(ShaderModuleDescriptorPassthrough {
+                label: desc.label,
+                entry_points: desc.entry_points,
+                spirv: None,
+                deko3d_dksh: Some(desc.dksh),
+                dxil: None,
+                hlsl: None,
+                metallib: None,
+                msl: None,
+                glsl: None,
+                wgsl: None,
+            })
+        }
+    }
+
     /// Creates an empty [`CommandEncoder`].
     #[must_use]
     pub fn create_command_encoder(&self, desc: &CommandEncoderDescriptor<'_>) -> CommandEncoder {
