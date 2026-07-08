@@ -1651,6 +1651,9 @@ pub fn adapter_info() -> wgt::AdapterInfo {
 /// `PASSTHROUGH_SHADERS` carries offline DKSH bytes through the public wgpu
 /// unsafe shader path. `MAPPABLE_PRIMARY_BUFFERS` lets the first public triangle
 /// proof initialize a vertex buffer directly, matching the direct-HAL smoke app.
+/// `MULTI_DRAW_INDIRECT_COUNT` is currently CPU-side count-buffer emulation
+/// over this backend's CPU-addressable buffers, not native Deko3D count-buffer
+/// execution.
 pub fn supported_features() -> wgt::Features {
     wgt::Features::PASSTHROUGH_SHADERS
         | wgt::Features::MAPPABLE_PRIMARY_BUFFERS

@@ -1031,24 +1031,15 @@ unsafe fn submit_draw_indirect(
     offset: wgt::BufferAddress,
     draw_count: u32,
 ) -> DeviceResult<()> {
-    if draw_count == 0 {
+    let Some(indirect) =
+        IndirectDrawRange::new::<dk::DkDrawIndirectData>(buffer, offset, draw_count)?
+    else {
         return Ok(());
-    }
-    let indirect_stride = size_of::<dk::DkDrawIndirectData>() as u64;
-    let indirect_size = indirect_stride
-        .checked_mul(u64::from(draw_count))
-        .and_then(wgt::BufferSize::new)
-        .ok_or(crate::DeviceError::Lost)?;
+    };
     unsafe {
         submit_deko_draw(queue, surface_queue, state, |cmdbuf, pipeline| {
-            let (indirect_addr, _) = buffer.gpu_binding(offset, Some(indirect_size))?;
-            for draw_index in 0..draw_count {
-                let draw_offset = u64::from(draw_index)
-                    .checked_mul(indirect_stride)
-                    .ok_or(crate::DeviceError::Lost)?;
-                let draw_addr = indirect_addr
-                    .checked_add(draw_offset)
-                    .ok_or(crate::DeviceError::Lost)?;
+            for draw_index in 0..indirect.draw_count {
+                let draw_addr = indirect.record_addr(draw_index)?;
                 dk::dkCmdBufDrawIndirect(cmdbuf, pipeline.primitive, draw_addr);
             }
             Ok(())
@@ -1065,32 +1056,23 @@ unsafe fn submit_draw_indexed_indirect(
     offset: wgt::BufferAddress,
     draw_count: u32,
 ) -> DeviceResult<()> {
-    if draw_count == 0 {
+    let Some(indirect) =
+        IndirectDrawRange::new::<dk::DkDrawIndexedIndirectData>(buffer, offset, draw_count)?
+    else {
         return Ok(());
-    }
+    };
     let index_binding = state
         .index_buffer
         .as_ref()
-        .ok_or(crate::DeviceError::Lost)?;
-    let indirect_stride = size_of::<dk::DkDrawIndexedIndirectData>() as u64;
-    let indirect_size = indirect_stride
-        .checked_mul(u64::from(draw_count))
-        .and_then(wgt::BufferSize::new)
         .ok_or(crate::DeviceError::Lost)?;
     unsafe {
         submit_deko_draw(queue, surface_queue, state, |cmdbuf, pipeline| {
             let (index_addr, _) = index_binding
                 .buffer
                 .gpu_binding(index_binding.offset, index_binding.size)?;
-            let (indirect_addr, _) = buffer.gpu_binding(offset, Some(indirect_size))?;
             dk::dkCmdBufBindIdxBuffer(cmdbuf, map_index_format(index_binding.format), index_addr);
-            for draw_index in 0..draw_count {
-                let draw_offset = u64::from(draw_index)
-                    .checked_mul(indirect_stride)
-                    .ok_or(crate::DeviceError::Lost)?;
-                let draw_addr = indirect_addr
-                    .checked_add(draw_offset)
-                    .ok_or(crate::DeviceError::Lost)?;
+            for draw_index in 0..indirect.draw_count {
+                let draw_addr = indirect.record_addr(draw_index)?;
                 dk::dkCmdBufDrawIndexedIndirect(cmdbuf, pipeline.primitive, draw_addr);
             }
             Ok(())
@@ -1109,7 +1091,7 @@ unsafe fn submit_draw_indirect_count(
     count_offset: wgt::BufferAddress,
     max_count: u32,
 ) -> DeviceResult<()> {
-    let draw_count = count_buffer.read_u32(count_offset)?.min(max_count);
+    let draw_count = read_indirect_draw_count(count_buffer, count_offset, max_count)?;
     unsafe { submit_draw_indirect(queue, surface_queue, state, buffer, offset, draw_count) }
 }
 
@@ -1124,8 +1106,57 @@ unsafe fn submit_draw_indexed_indirect_count(
     count_offset: wgt::BufferAddress,
     max_count: u32,
 ) -> DeviceResult<()> {
-    let draw_count = count_buffer.read_u32(count_offset)?.min(max_count);
+    let draw_count = read_indirect_draw_count(count_buffer, count_offset, max_count)?;
     unsafe { submit_draw_indexed_indirect(queue, surface_queue, state, buffer, offset, draw_count) }
+}
+
+#[cfg(target_os = "horizon")]
+struct IndirectDrawRange {
+    base_addr: dk::DkGpuAddr,
+    stride: u64,
+    draw_count: u32,
+}
+
+#[cfg(target_os = "horizon")]
+impl IndirectDrawRange {
+    fn new<T>(
+        buffer: &Buffer,
+        offset: wgt::BufferAddress,
+        draw_count: u32,
+    ) -> DeviceResult<Option<Self>> {
+        if draw_count == 0 {
+            return Ok(None);
+        }
+        let stride = size_of::<T>() as u64;
+        let indirect_size = stride
+            .checked_mul(u64::from(draw_count))
+            .and_then(wgt::BufferSize::new)
+            .ok_or(crate::DeviceError::Lost)?;
+        let (base_addr, _) = buffer.gpu_binding(offset, Some(indirect_size))?;
+        Ok(Some(Self {
+            base_addr,
+            stride,
+            draw_count,
+        }))
+    }
+
+    fn record_addr(&self, draw_index: u32) -> DeviceResult<dk::DkGpuAddr> {
+        let offset = u64::from(draw_index)
+            .checked_mul(self.stride)
+            .ok_or(crate::DeviceError::Lost)?;
+        self.base_addr
+            .checked_add(offset)
+            .ok_or(crate::DeviceError::Lost)
+    }
+}
+
+#[cfg(target_os = "horizon")]
+fn read_indirect_draw_count(
+    count_buffer: &Buffer,
+    count_offset: wgt::BufferAddress,
+    max_count: u32,
+) -> DeviceResult<u32> {
+    Ok(count_buffer.read_u32(count_offset)?.min(max_count))
 }
 
 #[cfg(target_os = "horizon")]
