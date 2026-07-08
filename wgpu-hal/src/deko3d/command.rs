@@ -1086,6 +1086,7 @@ unsafe fn submit_deko_draw(
             dk::dkCmdBufBindRasterizerState(cmdbuf, &pipeline.rasterizer_state);
             dk::dkCmdBufBindColorState(cmdbuf, &pipeline.color_state);
             dk::dkCmdBufBindColorWriteState(cmdbuf, &pipeline.color_write_state);
+            dk::dkCmdBufBindBlendStates(cmdbuf, 0, &pipeline.blend_state, 1);
             for (index, binding) in state.vertex_buffers.iter().enumerate() {
                 let Some(binding) = binding else {
                     continue;

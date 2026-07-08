@@ -179,6 +179,7 @@ pub(super) struct RenderPipelineInnerRaw {
     rasterizer_state: dk::DkRasterizerState,
     color_state: dk::DkColorState,
     color_write_state: dk::DkColorWriteState,
+    blend_state: dk::DkBlendState,
 }
 
 #[cfg(target_os = "horizon")]
@@ -875,9 +876,10 @@ impl RenderPipelineInner {
         let Some(color_target) = &desc.color_targets[0] else {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         };
-        if color_target.format != wgt::TextureFormat::Rgba8Unorm || color_target.blend.is_some() {
+        if color_target.format != wgt::TextureFormat::Rgba8Unorm {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         }
+        let (color_state, blend_state) = map_blend_state(color_target.blend)?;
         let color_write_state = map_color_write_state(color_target.write_mask);
         let rasterizer_state = map_rasterizer_state(&desc.primitive);
 
@@ -939,8 +941,9 @@ impl RenderPipelineInner {
                 vertex_buffers: vertex_buffer_states,
                 vertex_attributes,
                 rasterizer_state,
-                color_state: dk::DkColorState::defaults(),
+                color_state,
                 color_write_state,
+                blend_state,
             },
         })
     }
@@ -993,6 +996,65 @@ fn map_color_write_state(write_mask: wgt::ColorWrites) -> dk::DkColorWriteState 
     }
 
     dk::DkColorWriteState { masks: mask }
+}
+
+#[cfg(target_os = "horizon")]
+fn map_blend_state(
+    blend: Option<wgt::BlendState>,
+) -> Result<(dk::DkColorState, dk::DkBlendState), crate::PipelineError> {
+    let mut color_state = dk::DkColorState::defaults();
+    let mut blend_state = dk::DkBlendState::defaults();
+
+    if let Some(blend) = blend {
+        let color_op = map_blend_operation(blend.color.operation);
+        let alpha_op = map_blend_operation(blend.alpha.operation);
+        let src_color = map_blend_factor(blend.color.src_factor)?;
+        let dst_color = map_blend_factor(blend.color.dst_factor)?;
+        let src_alpha = map_blend_factor(blend.alpha.src_factor)?;
+        let dst_alpha = map_blend_factor(blend.alpha.dst_factor)?;
+        blend_state.set_ops(color_op, alpha_op);
+        blend_state.set_factors(src_color, dst_color, src_alpha, dst_alpha);
+        color_state.set_blend_enable(0, true);
+    }
+
+    Ok((color_state, blend_state))
+}
+
+#[cfg(target_os = "horizon")]
+fn map_blend_operation(operation: wgt::BlendOperation) -> dk::DkBlendOp {
+    match operation {
+        wgt::BlendOperation::Add => dk::DkBlendOp::DkBlendOp_Add,
+        wgt::BlendOperation::Subtract => dk::DkBlendOp::DkBlendOp_Sub,
+        wgt::BlendOperation::ReverseSubtract => dk::DkBlendOp::DkBlendOp_RevSub,
+        wgt::BlendOperation::Min => dk::DkBlendOp::DkBlendOp_Min,
+        wgt::BlendOperation::Max => dk::DkBlendOp::DkBlendOp_Max,
+    }
+}
+
+#[cfg(target_os = "horizon")]
+fn map_blend_factor(factor: wgt::BlendFactor) -> Result<dk::DkBlendFactor, crate::PipelineError> {
+    match factor {
+        wgt::BlendFactor::Zero => Ok(dk::DkBlendFactor::DkBlendFactor_Zero),
+        wgt::BlendFactor::One => Ok(dk::DkBlendFactor::DkBlendFactor_One),
+        wgt::BlendFactor::Src => Ok(dk::DkBlendFactor::DkBlendFactor_SrcColor),
+        wgt::BlendFactor::OneMinusSrc => Ok(dk::DkBlendFactor::DkBlendFactor_InvSrcColor),
+        wgt::BlendFactor::SrcAlpha => Ok(dk::DkBlendFactor::DkBlendFactor_SrcAlpha),
+        wgt::BlendFactor::OneMinusSrcAlpha => Ok(dk::DkBlendFactor::DkBlendFactor_InvSrcAlpha),
+        wgt::BlendFactor::Dst => Ok(dk::DkBlendFactor::DkBlendFactor_DstColor),
+        wgt::BlendFactor::OneMinusDst => Ok(dk::DkBlendFactor::DkBlendFactor_InvDstColor),
+        wgt::BlendFactor::DstAlpha => Ok(dk::DkBlendFactor::DkBlendFactor_DstAlpha),
+        wgt::BlendFactor::OneMinusDstAlpha => Ok(dk::DkBlendFactor::DkBlendFactor_InvDstAlpha),
+        wgt::BlendFactor::SrcAlphaSaturated => {
+            Ok(dk::DkBlendFactor::DkBlendFactor_SrcAlphaSaturate)
+        }
+        wgt::BlendFactor::Src1 => Ok(dk::DkBlendFactor::DkBlendFactor_Src1Color),
+        wgt::BlendFactor::OneMinusSrc1 => Ok(dk::DkBlendFactor::DkBlendFactor_InvSrc1Color),
+        wgt::BlendFactor::Src1Alpha => Ok(dk::DkBlendFactor::DkBlendFactor_Src1Alpha),
+        wgt::BlendFactor::OneMinusSrc1Alpha => Ok(dk::DkBlendFactor::DkBlendFactor_InvSrc1Alpha),
+        wgt::BlendFactor::Constant | wgt::BlendFactor::OneMinusConstant => {
+            Err(crate::PipelineError::Device(crate::DeviceError::Lost))
+        }
+    }
 }
 
 #[cfg(target_os = "horizon")]
