@@ -96,6 +96,20 @@ enum Command {
         offset: wgt::BufferAddress,
         draw_count: u32,
     },
+    DrawIndirectCount {
+        buffer: Buffer,
+        offset: wgt::BufferAddress,
+        count_buffer: Buffer,
+        count_offset: wgt::BufferAddress,
+        max_count: u32,
+    },
+    DrawIndexedIndirectCount {
+        buffer: Buffer,
+        offset: wgt::BufferAddress,
+        count_buffer: Buffer,
+        count_offset: wgt::BufferAddress,
+        max_count: u32,
+    },
 }
 
 #[derive(Default)]
@@ -487,6 +501,13 @@ impl crate::CommandEncoder for CommandBuffer {
         count_offset: wgt::BufferAddress,
         max_count: u32,
     ) {
+        self.commands.push(Command::DrawIndirectCount {
+            buffer: buffer.clone(),
+            offset,
+            count_buffer: count_buffer.clone(),
+            count_offset,
+            max_count,
+        });
     }
     unsafe fn draw_indexed_indirect_count(
         &mut self,
@@ -496,6 +517,13 @@ impl crate::CommandEncoder for CommandBuffer {
         count_offset: wgt::BufferAddress,
         max_count: u32,
     ) {
+        self.commands.push(Command::DrawIndexedIndirectCount {
+            buffer: buffer.clone(),
+            offset,
+            count_buffer: count_buffer.clone(),
+            count_offset,
+            max_count,
+        });
     }
     unsafe fn draw_mesh_tasks_indirect_count(
         &mut self,
@@ -743,6 +771,42 @@ impl Command {
                     buffer,
                     *offset,
                     *draw_count,
+                )
+            },
+            Command::DrawIndirectCount {
+                buffer,
+                offset,
+                count_buffer,
+                count_offset,
+                max_count,
+            } => unsafe {
+                submit_draw_indirect_count(
+                    queue,
+                    surface_queue,
+                    state,
+                    buffer,
+                    *offset,
+                    count_buffer,
+                    *count_offset,
+                    *max_count,
+                )
+            },
+            Command::DrawIndexedIndirectCount {
+                buffer,
+                offset,
+                count_buffer,
+                count_offset,
+                max_count,
+            } => unsafe {
+                submit_draw_indexed_indirect_count(
+                    queue,
+                    surface_queue,
+                    state,
+                    buffer,
+                    *offset,
+                    count_buffer,
+                    *count_offset,
+                    *max_count,
                 )
             },
         }
@@ -1035,6 +1099,36 @@ unsafe fn submit_draw_indexed_indirect(
 }
 
 #[cfg(target_os = "horizon")]
+unsafe fn submit_draw_indirect_count(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    state: &ExecutionState,
+    buffer: &Buffer,
+    offset: wgt::BufferAddress,
+    count_buffer: &Buffer,
+    count_offset: wgt::BufferAddress,
+    max_count: u32,
+) -> DeviceResult<()> {
+    let draw_count = count_buffer.read_u32(count_offset)?.min(max_count);
+    unsafe { submit_draw_indirect(queue, surface_queue, state, buffer, offset, draw_count) }
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_draw_indexed_indirect_count(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    state: &ExecutionState,
+    buffer: &Buffer,
+    offset: wgt::BufferAddress,
+    count_buffer: &Buffer,
+    count_offset: wgt::BufferAddress,
+    max_count: u32,
+) -> DeviceResult<()> {
+    let draw_count = count_buffer.read_u32(count_offset)?.min(max_count);
+    unsafe { submit_draw_indexed_indirect(queue, surface_queue, state, buffer, offset, draw_count) }
+}
+
+#[cfg(target_os = "horizon")]
 unsafe fn submit_deko_draw(
     queue: &Queue,
     surface_queue: Option<RawQueueHandle>,
@@ -1189,6 +1283,34 @@ unsafe fn submit_draw_indexed_indirect(
     _buffer: &Buffer,
     _offset: wgt::BufferAddress,
     _draw_count: u32,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_draw_indirect_count(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _state: &ExecutionState,
+    _buffer: &Buffer,
+    _offset: wgt::BufferAddress,
+    _count_buffer: &Buffer,
+    _count_offset: wgt::BufferAddress,
+    _max_count: u32,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_draw_indexed_indirect_count(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _state: &ExecutionState,
+    _buffer: &Buffer,
+    _offset: wgt::BufferAddress,
+    _count_buffer: &Buffer,
+    _count_offset: wgt::BufferAddress,
+    _max_count: u32,
 ) -> DeviceResult<()> {
     Err(crate::DeviceError::Lost)
 }

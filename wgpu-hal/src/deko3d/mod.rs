@@ -1652,7 +1652,9 @@ pub fn adapter_info() -> wgt::AdapterInfo {
 /// unsafe shader path. `MAPPABLE_PRIMARY_BUFFERS` lets the first public triangle
 /// proof initialize a vertex buffer directly, matching the direct-HAL smoke app.
 pub fn supported_features() -> wgt::Features {
-    wgt::Features::PASSTHROUGH_SHADERS | wgt::Features::MAPPABLE_PRIMARY_BUFFERS
+    wgt::Features::PASSTHROUGH_SHADERS
+        | wgt::Features::MAPPABLE_PRIMARY_BUFFERS
+        | wgt::Features::MULTI_DRAW_INDIRECT_COUNT
 }
 
 /// Conservative capabilities for the first Deko3D adapter slice.
