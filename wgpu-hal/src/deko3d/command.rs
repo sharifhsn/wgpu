@@ -955,15 +955,26 @@ unsafe fn submit_draw_indirect(
     offset: wgt::BufferAddress,
     draw_count: u32,
 ) -> DeviceResult<()> {
-    if draw_count != 1 {
-        return Err(crate::DeviceError::Lost);
+    if draw_count == 0 {
+        return Ok(());
     }
-    let indirect_size = wgt::BufferSize::new(size_of::<dk::DkDrawIndirectData>() as u64)
+    let indirect_stride = size_of::<dk::DkDrawIndirectData>() as u64;
+    let indirect_size = indirect_stride
+        .checked_mul(u64::from(draw_count))
+        .and_then(wgt::BufferSize::new)
         .ok_or(crate::DeviceError::Lost)?;
     unsafe {
         submit_deko_draw(queue, surface_queue, state, |cmdbuf, pipeline| {
             let (indirect_addr, _) = buffer.gpu_binding(offset, Some(indirect_size))?;
-            dk::dkCmdBufDrawIndirect(cmdbuf, pipeline.primitive, indirect_addr);
+            for draw_index in 0..draw_count {
+                let draw_offset = u64::from(draw_index)
+                    .checked_mul(indirect_stride)
+                    .ok_or(crate::DeviceError::Lost)?;
+                let draw_addr = indirect_addr
+                    .checked_add(draw_offset)
+                    .ok_or(crate::DeviceError::Lost)?;
+                dk::dkCmdBufDrawIndirect(cmdbuf, pipeline.primitive, draw_addr);
+            }
             Ok(())
         })
     }
@@ -978,14 +989,17 @@ unsafe fn submit_draw_indexed_indirect(
     offset: wgt::BufferAddress,
     draw_count: u32,
 ) -> DeviceResult<()> {
-    if draw_count != 1 {
-        return Err(crate::DeviceError::Lost);
+    if draw_count == 0 {
+        return Ok(());
     }
     let index_binding = state
         .index_buffer
         .as_ref()
         .ok_or(crate::DeviceError::Lost)?;
-    let indirect_size = wgt::BufferSize::new(size_of::<dk::DkDrawIndexedIndirectData>() as u64)
+    let indirect_stride = size_of::<dk::DkDrawIndexedIndirectData>() as u64;
+    let indirect_size = indirect_stride
+        .checked_mul(u64::from(draw_count))
+        .and_then(wgt::BufferSize::new)
         .ok_or(crate::DeviceError::Lost)?;
     unsafe {
         submit_deko_draw(queue, surface_queue, state, |cmdbuf, pipeline| {
@@ -994,7 +1008,15 @@ unsafe fn submit_draw_indexed_indirect(
                 .gpu_binding(index_binding.offset, index_binding.size)?;
             let (indirect_addr, _) = buffer.gpu_binding(offset, Some(indirect_size))?;
             dk::dkCmdBufBindIdxBuffer(cmdbuf, map_index_format(index_binding.format), index_addr);
-            dk::dkCmdBufDrawIndexedIndirect(cmdbuf, pipeline.primitive, indirect_addr);
+            for draw_index in 0..draw_count {
+                let draw_offset = u64::from(draw_index)
+                    .checked_mul(indirect_stride)
+                    .ok_or(crate::DeviceError::Lost)?;
+                let draw_addr = indirect_addr
+                    .checked_add(draw_offset)
+                    .ok_or(crate::DeviceError::Lost)?;
+                dk::dkCmdBufDrawIndexedIndirect(cmdbuf, pipeline.primitive, draw_addr);
+            }
             Ok(())
         })
     }

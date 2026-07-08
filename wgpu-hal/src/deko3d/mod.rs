@@ -1565,7 +1565,7 @@ pub fn capabilities() -> crate::Capabilities {
             ray_tracing_pipeline_data_offset_alignment: 0,
         },
         downlevel: wgt::DownlevelCapabilities {
-            flags: wgt::DownlevelFlags::empty(),
+            flags: wgt::DownlevelFlags::INDIRECT_EXECUTION,
             limits: wgt::DownlevelLimits {},
             shader_model: wgt::ShaderModel::Sm5,
         },
