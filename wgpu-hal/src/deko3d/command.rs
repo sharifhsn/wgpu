@@ -881,7 +881,7 @@ unsafe fn submit_deko_draw(
                 shaders.as_ptr(),
                 shaders.len() as u32,
             );
-            if let Some(Some(group)) = state.bind_groups.first() {
+            for group in state.bind_groups.iter().flatten() {
                 group.bind_descriptor_sets(cmdbuf)?;
             }
             dk::dkCmdBufBindRasterizerState(cmdbuf, &pipeline.rasterizer_state);

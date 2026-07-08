@@ -1205,6 +1205,49 @@ fn supported_bind_group_layout_kind(
     None
 }
 
+fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
+    if bind_group_layouts.len() > crate::MAX_BIND_GROUPS {
+        return false;
+    }
+
+    let mut has_texture_sampler = false;
+    let mut vertex_uniform_bindings = 0u32;
+    let mut fragment_uniform_bindings = 0u32;
+    for layout in bind_group_layouts.iter().flatten() {
+        match layout {
+            Resource::BindGroupLayout(BindGroupLayoutKind::TextureSampler) => {
+                if has_texture_sampler {
+                    return false;
+                }
+                has_texture_sampler = true;
+            }
+            Resource::BindGroupLayout(BindGroupLayoutKind::UniformBuffer {
+                binding,
+                visibility,
+            }) => {
+                let Some(binding_mask) = 1u32.checked_shl(*binding) else {
+                    return false;
+                };
+                if visibility.contains(wgt::ShaderStages::VERTEX) {
+                    if vertex_uniform_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    vertex_uniform_bindings |= binding_mask;
+                }
+                if visibility.contains(wgt::ShaderStages::FRAGMENT) {
+                    if fragment_uniform_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    fragment_uniform_bindings |= binding_mask;
+                }
+            }
+            _ => return false,
+        }
+    }
+
+    true
+}
+
 fn supported_texture_bind_group_layout_kind(
     entries: &[wgt::BindGroupLayoutEntry],
 ) -> Option<BindGroupLayoutKind> {
@@ -1818,13 +1861,8 @@ impl crate::Device for Device {
         &self,
         desc: &crate::PipelineLayoutDescriptor<Resource>,
     ) -> DeviceResult<Resource> {
-        if desc.immediate_size != 0 || desc.bind_group_layouts.len() > 1 {
+        if desc.immediate_size != 0 || !supported_pipeline_layout(desc.bind_group_layouts) {
             return Err(crate::DeviceError::Lost);
-        }
-        for layout in desc.bind_group_layouts.iter().flatten() {
-            if !matches!(layout, Resource::BindGroupLayout(_)) {
-                return Err(crate::DeviceError::Lost);
-            }
         }
         Ok(Resource::PipelineLayout)
     }
