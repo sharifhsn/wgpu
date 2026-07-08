@@ -951,11 +951,11 @@ fn map_primitive_topology(
     primitive: &wgt::PrimitiveState,
 ) -> Result<dk::DkPrimitive, crate::PipelineError> {
     match primitive.topology {
+        wgt::PrimitiveTopology::PointList => Ok(dk::DkPrimitive::DkPrimitive_Points),
         wgt::PrimitiveTopology::LineList => Ok(dk::DkPrimitive::DkPrimitive_Lines),
         wgt::PrimitiveTopology::LineStrip => Ok(dk::DkPrimitive::DkPrimitive_LineStrip),
         wgt::PrimitiveTopology::TriangleList => Ok(dk::DkPrimitive::DkPrimitive_Triangles),
         wgt::PrimitiveTopology::TriangleStrip => Ok(dk::DkPrimitive::DkPrimitive_TriangleStrip),
-        _ => Err(crate::PipelineError::Device(crate::DeviceError::Lost)),
     }
 }
 
