@@ -2882,6 +2882,7 @@ pub fn supported_features() -> wgt::Features {
     wgt::Features::PASSTHROUGH_SHADERS
         | wgt::Features::MAPPABLE_PRIMARY_BUFFERS
         | wgt::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+        | wgt::Features::MULTI_DRAW_INDIRECT_COUNT
 }
 
 /// Conservative capabilities for the first Deko3D adapter slice.

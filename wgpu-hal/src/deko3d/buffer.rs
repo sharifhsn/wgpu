@@ -272,6 +272,22 @@ impl Buffer {
     }
 
     #[cfg(target_os = "horizon")]
+    pub(super) fn read_u32(&self, offset: wgt::BufferAddress) -> Result<u32, crate::DeviceError> {
+        let offset = usize::try_from(offset).map_err(|_| crate::DeviceError::Lost)?;
+        let end = offset.checked_add(4).ok_or(crate::DeviceError::Lost)?;
+        if end > self.size {
+            return Err(crate::DeviceError::Lost);
+        }
+
+        let mut bytes = [0; 4];
+        unsafe {
+            let src = self.storage.get().cast::<u8>().add(offset);
+            ptr::copy_nonoverlapping(src, bytes.as_mut_ptr(), bytes.len());
+        }
+        Ok(u32::from_ne_bytes(bytes))
+    }
+
+    #[cfg(target_os = "horizon")]
     pub(super) unsafe fn upload_to_gpu(&self) -> Result<(), crate::DeviceError> {
         let gpu = self.gpu.as_ref().ok_or(crate::DeviceError::Lost)?;
         let dst = unsafe { dk::dkMemBlockGetCpuAddr(gpu.mem_block) };
