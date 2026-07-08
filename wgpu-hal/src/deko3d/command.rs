@@ -3,6 +3,9 @@ use core::mem;
 use core::ops::Range;
 
 #[cfg(target_os = "horizon")]
+use core::mem::size_of;
+
+#[cfg(target_os = "horizon")]
 use core::ptr;
 #[cfg(target_os = "horizon")]
 use deko3d_sys as dk;
@@ -113,6 +116,16 @@ enum Command {
         first_instance: u32,
         instance_count: u32,
     },
+    DrawIndirect {
+        buffer: Buffer,
+        offset: wgt::BufferAddress,
+        draw_count: u32,
+    },
+    DrawIndexedIndirect {
+        buffer: Buffer,
+        offset: wgt::BufferAddress,
+        draw_count: u32,
+    },
 }
 
 #[derive(Default)]
@@ -197,6 +210,8 @@ impl CommandBuffer {
                         Command::SetBlendConstants { .. } => "set_blend_constants",
                         Command::Draw { .. } => "draw",
                         Command::DrawIndexed { .. } => "draw_indexed",
+                        Command::DrawIndirect { .. } => "draw_indirect",
+                        Command::DrawIndexedIndirect { .. } => "draw_indexed_indirect",
                     }
                 );
                 #[cfg(target_os = "horizon")]
@@ -660,7 +675,11 @@ impl crate::CommandEncoder for CommandBuffer {
         offset: wgt::BufferAddress,
         draw_count: u32,
     ) {
-        self.record_unsupported();
+        self.commands.push(Command::DrawIndirect {
+            buffer: buffer.clone(),
+            offset,
+            draw_count,
+        });
     }
     unsafe fn draw_indexed_indirect(
         &mut self,
@@ -668,7 +687,11 @@ impl crate::CommandEncoder for CommandBuffer {
         offset: wgt::BufferAddress,
         draw_count: u32,
     ) {
-        self.record_unsupported();
+        self.commands.push(Command::DrawIndexedIndirect {
+            buffer: buffer.clone(),
+            offset,
+            draw_count,
+        });
     }
     unsafe fn draw_mesh_tasks_indirect(
         &mut self,
@@ -944,6 +967,27 @@ impl Command {
                     *base_vertex,
                     *first_instance,
                     *instance_count,
+                )
+            },
+            Command::DrawIndirect {
+                buffer,
+                offset,
+                draw_count,
+            } => unsafe {
+                submit_draw_indirect(queue, surface_queue, state, buffer, *offset, *draw_count)
+            },
+            Command::DrawIndexedIndirect {
+                buffer,
+                offset,
+                draw_count,
+            } => unsafe {
+                submit_draw_indexed_indirect(
+                    queue,
+                    surface_queue,
+                    state,
+                    buffer,
+                    *offset,
+                    *draw_count,
                 )
             },
         }
@@ -1818,6 +1862,60 @@ fn trace_draw(
 }
 
 #[cfg(target_os = "horizon")]
+unsafe fn submit_draw_indirect(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    state: &ExecutionState,
+    buffer: &Buffer,
+    offset: wgt::BufferAddress,
+    draw_count: u32,
+) -> DeviceResult<()> {
+    if draw_count != 1 {
+        return Err(crate::DeviceError::Lost);
+    }
+    let indirect_size = wgt::BufferSize::new(size_of::<dk::DkDrawIndirectData>() as u64)
+        .ok_or(crate::DeviceError::Lost)?;
+    unsafe {
+        submit_deko_draw(queue, surface_queue, state, |cmdbuf, pipeline| {
+            let (indirect_addr, _) = buffer.gpu_binding(offset, Some(indirect_size))?;
+            dk::dkCmdBufDrawIndirect(cmdbuf, pipeline.primitive, indirect_addr);
+            Ok(())
+        })
+    }
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_draw_indexed_indirect(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    state: &ExecutionState,
+    buffer: &Buffer,
+    offset: wgt::BufferAddress,
+    draw_count: u32,
+) -> DeviceResult<()> {
+    if draw_count != 1 {
+        return Err(crate::DeviceError::Lost);
+    }
+    let index_binding = state
+        .index_buffer
+        .as_ref()
+        .ok_or(crate::DeviceError::Lost)?;
+    let indirect_size = wgt::BufferSize::new(size_of::<dk::DkDrawIndexedIndirectData>() as u64)
+        .ok_or(crate::DeviceError::Lost)?;
+    unsafe {
+        submit_deko_draw(queue, surface_queue, state, |cmdbuf, pipeline| {
+            let (index_addr, _) = index_binding
+                .buffer
+                .gpu_binding(index_binding.offset, index_binding.size)?;
+            let (indirect_addr, _) = buffer.gpu_binding(offset, Some(indirect_size))?;
+            dk::dkCmdBufBindIdxBuffer(cmdbuf, map_index_format(index_binding.format), index_addr);
+            dk::dkCmdBufDrawIndexedIndirect(cmdbuf, pipeline.primitive, indirect_addr);
+            Ok(())
+        })
+    }
+}
+
+#[cfg(target_os = "horizon")]
 unsafe fn submit_deko_draw(
     queue: &Queue,
     surface_queue: Option<RawQueueHandle>,
@@ -2026,6 +2124,30 @@ unsafe fn submit_draw_indexed(
     _base_vertex: i32,
     _first_instance: u32,
     _instance_count: u32,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_draw_indirect(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _state: &ExecutionState,
+    _buffer: &Buffer,
+    _offset: wgt::BufferAddress,
+    _draw_count: u32,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_draw_indexed_indirect(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _state: &ExecutionState,
+    _buffer: &Buffer,
+    _offset: wgt::BufferAddress,
+    _draw_count: u32,
 ) -> DeviceResult<()> {
     Err(crate::DeviceError::Lost)
 }
