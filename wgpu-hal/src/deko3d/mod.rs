@@ -2902,7 +2902,8 @@ pub fn capabilities() -> crate::Capabilities {
         },
         downlevel: wgt::DownlevelCapabilities {
             flags: wgt::DownlevelFlags::SURFACE_VIEW_FORMATS
-                | wgt::DownlevelFlags::CUBE_ARRAY_TEXTURES,
+                | wgt::DownlevelFlags::CUBE_ARRAY_TEXTURES
+                | wgt::DownlevelFlags::INDIRECT_EXECUTION,
             limits: wgt::DownlevelLimits {},
             shader_model: wgt::ShaderModel::Sm5,
         },
