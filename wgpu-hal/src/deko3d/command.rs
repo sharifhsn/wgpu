@@ -63,6 +63,13 @@ enum Command {
         group: alloc::sync::Arc<BindGroupInner>,
         dynamic_offsets: Vec<wgt::DynamicOffset>,
     },
+    SetViewport {
+        rect: crate::Rect<f32>,
+        depth_range: Range<f32>,
+    },
+    SetScissorRect {
+        rect: crate::Rect<u32>,
+    },
     Draw {
         first_vertex: u32,
         vertex_count: u32,
@@ -95,6 +102,8 @@ struct ExecutionState {
     vertex_buffers: Vec<Option<VertexBinding>>,
     index_buffer: Option<IndexBinding>,
     bind_groups: Vec<Option<BoundBindGroup>>,
+    viewport: Option<ViewportState>,
+    scissor: Option<ScissorState>,
 }
 
 #[allow(dead_code)]
@@ -126,6 +135,19 @@ struct IndexBinding {
 struct BoundBindGroup {
     group: alloc::sync::Arc<BindGroupInner>,
     dynamic_offsets: Vec<wgt::DynamicOffset>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct ViewportState {
+    rect: crate::Rect<f32>,
+    depth_range: Range<f32>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct ScissorState {
+    rect: crate::Rect<u32>,
 }
 
 impl CommandBuffer {
@@ -369,8 +391,16 @@ impl crate::CommandEncoder for CommandBuffer {
             size: binding.size,
         });
     }
-    unsafe fn set_viewport(&mut self, rect: &crate::Rect<f32>, depth_range: Range<f32>) {}
-    unsafe fn set_scissor_rect(&mut self, rect: &crate::Rect<u32>) {}
+    unsafe fn set_viewport(&mut self, rect: &crate::Rect<f32>, depth_range: Range<f32>) {
+        self.commands.push(Command::SetViewport {
+            rect: rect.clone(),
+            depth_range,
+        });
+    }
+    unsafe fn set_scissor_rect(&mut self, rect: &crate::Rect<u32>) {
+        self.commands
+            .push(Command::SetScissorRect { rect: rect.clone() });
+    }
     unsafe fn set_stencil_reference(&mut self, value: u32) {}
     unsafe fn set_blend_constants(&mut self, color: &[f32; 4]) {}
 
@@ -581,6 +611,8 @@ impl Command {
                     image: *image,
                     extent: *extent,
                 });
+                state.viewport = None;
+                state.scissor = None;
                 unsafe {
                     submit_begin_render_pass(queue, surface_queue, *image, *extent, *clear_value)
                 }
@@ -633,6 +665,17 @@ impl Command {
                     group: group.clone(),
                     dynamic_offsets: dynamic_offsets.clone(),
                 });
+                Ok(())
+            }
+            Command::SetViewport { rect, depth_range } => {
+                state.viewport = Some(ViewportState {
+                    rect: rect.clone(),
+                    depth_range: depth_range.clone(),
+                });
+                Ok(())
+            }
+            Command::SetScissorRect { rect } => {
+                state.scissor = Some(ScissorState { rect: rect.clone() });
                 Ok(())
             }
             Command::Draw {
@@ -969,20 +1012,38 @@ unsafe fn submit_deko_draw(
     let pipeline = pipeline.raw();
     unsafe {
         submit_deko_commands(queue, surface_queue, |cmdbuf| {
-            let viewport = dk::DkViewport {
-                x: 0.0,
-                y: 0.0,
-                width: target.extent.width as f32,
-                height: target.extent.height as f32,
-                near: 0.0,
-                far: 1.0,
-            };
-            let scissor = dk::DkScissor {
-                x: 0,
-                y: 0,
-                width: target.extent.width,
-                height: target.extent.height,
-            };
+            let viewport = state.viewport.as_ref().map_or_else(
+                || dk::DkViewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: target.extent.width as f32,
+                    height: target.extent.height as f32,
+                    near: 0.0,
+                    far: 1.0,
+                },
+                |viewport| dk::DkViewport {
+                    x: viewport.rect.x,
+                    y: viewport.rect.y,
+                    width: viewport.rect.w,
+                    height: viewport.rect.h,
+                    near: viewport.depth_range.start,
+                    far: viewport.depth_range.end,
+                },
+            );
+            let scissor = state.scissor.as_ref().map_or_else(
+                || dk::DkScissor {
+                    x: 0,
+                    y: 0,
+                    width: target.extent.width,
+                    height: target.extent.height,
+                },
+                |scissor| dk::DkScissor {
+                    x: scissor.rect.x,
+                    y: scissor.rect.y,
+                    width: scissor.rect.w,
+                    height: scissor.rect.h,
+                },
+            );
             let shaders = [
                 pipeline.vertex_shader.raw_shader(),
                 pipeline.fragment_shader.raw_shader(),
