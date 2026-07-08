@@ -84,6 +84,7 @@ pub enum BindGroupLayoutKind {
     UniformBuffer {
         binding: u32,
         visibility: wgt::ShaderStages,
+        has_dynamic_offset: bool,
     },
 }
 
@@ -213,6 +214,7 @@ pub(super) enum BindGroupInnerRaw {
 pub(super) struct UniformBufferBinding {
     binding: u32,
     visibility: wgt::ShaderStages,
+    has_dynamic_offset: bool,
     buffer: Buffer,
     offset: wgt::BufferAddress,
     size: Option<wgt::BufferSize>,
@@ -457,7 +459,11 @@ impl TextureInner {
 
 impl BindGroupInner {
     #[cfg(target_os = "horizon")]
-    pub(super) unsafe fn bind_descriptor_sets(&self, cmdbuf: dk::DkCmdBuf) -> DeviceResult<()> {
+    pub(super) unsafe fn bind_descriptor_sets(
+        &self,
+        cmdbuf: dk::DkCmdBuf,
+        dynamic_offsets: &[wgt::DynamicOffset],
+    ) -> DeviceResult<()> {
         match &self.inner {
             BindGroupInnerRaw::TextureSampler {
                 image_descriptor_gpu_addr,
@@ -466,6 +472,9 @@ impl BindGroupInner {
                 sampler_descriptor,
                 ..
             } => unsafe {
+                if !dynamic_offsets.is_empty() {
+                    return Err(crate::DeviceError::Lost);
+                }
                 dk::dkCmdBufPushData(
                     cmdbuf,
                     *image_descriptor_gpu_addr,
@@ -488,8 +497,19 @@ impl BindGroupInner {
                 );
             },
             BindGroupInnerRaw::UniformBuffer(binding) => {
-                let (gpu_addr, gpu_size) =
-                    binding.buffer.gpu_binding(binding.offset, binding.size)?;
+                let dynamic_offset = match (binding.has_dynamic_offset, dynamic_offsets) {
+                    (true, [offset]) => u64::from(*offset),
+                    (false, []) => 0,
+                    _ => return Err(crate::DeviceError::Lost),
+                };
+                if dynamic_offset % u64::from(dk::DK_UNIFORM_BUF_ALIGNMENT) != 0 {
+                    return Err(crate::DeviceError::Lost);
+                }
+                let offset = binding
+                    .offset
+                    .checked_add(dynamic_offset)
+                    .ok_or(crate::DeviceError::Lost)?;
+                let (gpu_addr, gpu_size) = binding.buffer.gpu_binding(offset, binding.size)?;
                 if gpu_addr % u64::from(dk::DK_UNIFORM_BUF_ALIGNMENT) != 0
                     || gpu_size > dk::DK_UNIFORM_BUF_MAX_SIZE
                 {
@@ -1025,7 +1045,8 @@ impl BindGroupInner {
             BindGroupLayoutKind::UniformBuffer {
                 binding,
                 visibility,
-            } => Self::new_uniform_buffer(desc, binding, visibility),
+                has_dynamic_offset,
+            } => Self::new_uniform_buffer(desc, binding, visibility, has_dynamic_offset),
         }
     }
 
@@ -1109,6 +1130,7 @@ impl BindGroupInner {
         desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
         binding: u32,
         visibility: wgt::ShaderStages,
+        has_dynamic_offset: bool,
     ) -> DeviceResult<Self> {
         if desc.buffers.len() != 1
             || !desc.samplers.is_empty()
@@ -1140,6 +1162,7 @@ impl BindGroupInner {
             inner: BindGroupInnerRaw::UniformBuffer(UniformBufferBinding {
                 binding,
                 visibility,
+                has_dynamic_offset,
                 buffer: buffer.buffer.clone(),
                 offset: buffer.offset,
                 size: buffer.size,
@@ -1224,6 +1247,7 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
             Resource::BindGroupLayout(BindGroupLayoutKind::UniformBuffer {
                 binding,
                 visibility,
+                ..
             }) => {
                 let Some(binding_mask) = 1u32.checked_shl(*binding) else {
                     return false;
@@ -1292,7 +1316,7 @@ fn supported_uniform_bind_group_layout_kind(
     match entry.ty {
         wgt::BindingType::Buffer {
             ty: wgt::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
+            has_dynamic_offset,
             min_binding_size,
         } => {
             if min_binding_size.is_some_and(|size| size.get() > DEKO_UNIFORM_BUF_MAX_SIZE) {
@@ -1301,6 +1325,7 @@ fn supported_uniform_bind_group_layout_kind(
             Some(BindGroupLayoutKind::UniformBuffer {
                 binding: entry.binding,
                 visibility: entry.visibility,
+                has_dynamic_offset,
             })
         }
         _ => None,

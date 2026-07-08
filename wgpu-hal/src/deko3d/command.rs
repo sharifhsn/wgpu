@@ -58,6 +58,7 @@ enum Command {
     SetBindGroup {
         index: u32,
         group: alloc::sync::Arc<BindGroupInner>,
+        dynamic_offsets: Vec<wgt::DynamicOffset>,
     },
     Draw {
         first_vertex: u32,
@@ -80,7 +81,7 @@ struct ExecutionState {
     pipeline: Option<alloc::sync::Arc<RenderPipelineInner>>,
     vertex_buffers: Vec<Option<VertexBinding>>,
     index_buffer: Option<IndexBinding>,
-    bind_groups: Vec<Option<alloc::sync::Arc<BindGroupInner>>>,
+    bind_groups: Vec<Option<BoundBindGroup>>,
 }
 
 #[allow(dead_code)]
@@ -105,6 +106,13 @@ struct IndexBinding {
     offset: wgt::BufferAddress,
     size: Option<wgt::BufferSize>,
     format: wgt::IndexFormat,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct BoundBindGroup {
+    group: alloc::sync::Arc<BindGroupInner>,
+    dynamic_offsets: Vec<wgt::DynamicOffset>,
 }
 
 impl CommandBuffer {
@@ -306,6 +314,7 @@ impl crate::CommandEncoder for CommandBuffer {
             self.commands.push(Command::SetBindGroup {
                 index,
                 group: group.clone(),
+                dynamic_offsets: dynamic_offsets.to_vec(),
             });
         }
     }
@@ -588,12 +597,19 @@ impl Command {
                 });
                 Ok(())
             }
-            Command::SetBindGroup { index, group } => {
+            Command::SetBindGroup {
+                index,
+                group,
+                dynamic_offsets,
+            } => {
                 let index = usize::try_from(*index).map_err(|_| crate::DeviceError::Lost)?;
                 if state.bind_groups.len() <= index {
                     state.bind_groups.resize(index + 1, None);
                 }
-                state.bind_groups[index] = Some(group.clone());
+                state.bind_groups[index] = Some(BoundBindGroup {
+                    group: group.clone(),
+                    dynamic_offsets: dynamic_offsets.clone(),
+                });
                 Ok(())
             }
             Command::Draw {
@@ -882,7 +898,9 @@ unsafe fn submit_deko_draw(
                 shaders.len() as u32,
             );
             for group in state.bind_groups.iter().flatten() {
-                group.bind_descriptor_sets(cmdbuf)?;
+                group
+                    .group
+                    .bind_descriptor_sets(cmdbuf, &group.dynamic_offsets)?;
             }
             dk::dkCmdBufBindRasterizerState(cmdbuf, &pipeline.rasterizer_state);
             dk::dkCmdBufBindColorState(cmdbuf, &pipeline.color_state);
