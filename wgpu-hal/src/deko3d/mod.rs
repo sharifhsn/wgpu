@@ -861,8 +861,8 @@ impl RenderPipelineInner {
         {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         }
-        if desc.primitive.topology != wgt::PrimitiveTopology::TriangleList
-            || desc.primitive.strip_index_format.is_some()
+        let primitive = map_primitive_topology(&desc.primitive)?;
+        if desc.primitive.strip_index_format.is_some()
             || desc.primitive.unclipped_depth
             || desc.primitive.polygon_mode != wgt::PolygonMode::Fill
             || desc.primitive.conservative
@@ -935,7 +935,7 @@ impl RenderPipelineInner {
             inner: RenderPipelineInnerRaw {
                 vertex_shader: vertex_shader.clone(),
                 fragment_shader: fragment_shader.clone(),
-                primitive: dk::DkPrimitive::DkPrimitive_Triangles,
+                primitive,
                 vertex_buffers: vertex_buffer_states,
                 vertex_attributes,
                 rasterizer_state,
@@ -943,6 +943,17 @@ impl RenderPipelineInner {
                 color_write_state,
             },
         })
+    }
+}
+
+#[cfg(target_os = "horizon")]
+fn map_primitive_topology(
+    primitive: &wgt::PrimitiveState,
+) -> Result<dk::DkPrimitive, crate::PipelineError> {
+    match primitive.topology {
+        wgt::PrimitiveTopology::TriangleList => Ok(dk::DkPrimitive::DkPrimitive_Triangles),
+        wgt::PrimitiveTopology::TriangleStrip => Ok(dk::DkPrimitive::DkPrimitive_TriangleStrip),
+        _ => Err(crate::PipelineError::Device(crate::DeviceError::Lost)),
     }
 }
 
