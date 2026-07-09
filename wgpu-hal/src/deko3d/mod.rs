@@ -193,6 +193,7 @@ struct TextureInnerRaw {
     mem_block: dk::DkMemBlock,
     image: dk::DkImage,
     extent: wgt::Extent3d,
+    format: wgt::TextureFormat,
     sample_count: u32,
 }
 
@@ -462,6 +463,17 @@ impl TextureInner {
             height: 0,
             depth_or_array_layers: 1,
         }
+    }
+
+    #[cfg(target_os = "horizon")]
+    pub(super) fn format(&self) -> wgt::TextureFormat {
+        self.inner.format
+    }
+
+    #[cfg(not(target_os = "horizon"))]
+    #[allow(dead_code)]
+    pub(super) fn format(&self) -> wgt::TextureFormat {
+        wgt::TextureFormat::Rgba8Unorm
     }
 
     #[cfg(target_os = "horizon")]
@@ -1232,6 +1244,19 @@ impl TextureInner {
 
         let mut image_layout_maker = dk::DkImageLayoutMaker::defaults(raw_device);
         image_layout_maker.format = format_support.image_format;
+        if desc.usage.intersects(
+            wgt::TextureUses::COLOR_TARGET
+                | wgt::TextureUses::DEPTH_STENCIL_READ
+                | wgt::TextureUses::DEPTH_STENCIL_WRITE,
+        ) {
+            image_layout_maker.flags |= dk::DkImageFlags_UsageRender;
+        }
+        if desc
+            .usage
+            .intersects(wgt::TextureUses::COPY_SRC | wgt::TextureUses::COPY_DST)
+        {
+            image_layout_maker.flags |= dk::DkImageFlags_Usage2DEngine;
+        }
         image_layout_maker.msMode = ms_mode;
         image_layout_maker.dimensions[0] = desc.size.width;
         image_layout_maker.dimensions[1] = desc.size.height;
@@ -1260,6 +1285,7 @@ impl TextureInner {
                 mem_block,
                 image,
                 extent: desc.size,
+                format: desc.format,
                 sample_count: desc.sample_count,
             },
         })
@@ -2146,6 +2172,10 @@ impl crate::Device for Device {
         buffer: &Buffer,
         range: crate::MemoryRange,
     ) -> DeviceResult<crate::BufferMapping> {
+        #[cfg(target_os = "horizon")]
+        unsafe {
+            buffer.download_from_gpu()?;
+        }
         // Safety: the `wgpu-core` validation layer will prevent any user-accessible aliasing
         // mappings from being created, so we don’t need to perform any checks here, except for
         // bounds checks on the range which are built into `get_slice_ptr()`.

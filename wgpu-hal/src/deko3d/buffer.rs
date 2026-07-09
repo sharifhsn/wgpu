@@ -163,6 +163,21 @@ impl Buffer {
     }
 
     #[cfg(target_os = "horizon")]
+    pub(super) unsafe fn download_from_gpu(&self) -> Result<(), crate::DeviceError> {
+        if self.gpu.mem_block.is_null() {
+            return Err(crate::DeviceError::Lost);
+        }
+        let src = unsafe { dk::dkMemBlockGetCpuAddr(self.gpu.mem_block) };
+        if src.is_null() {
+            return Err(crate::DeviceError::Lost);
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(src.cast::<u8>(), self.storage.get().cast::<u8>(), self.size);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "horizon")]
     pub(super) fn gpu_binding(
         &self,
         offset: wgt::BufferAddress,
