@@ -62,6 +62,7 @@ pub enum Resource {
     Placeholder,
     BindGroupLayout(BindGroupLayoutKind),
     PipelineLayout,
+    PipelineCache,
     ShaderModule(Arc<ShaderModuleInner>),
     RenderPipeline(Arc<RenderPipelineInner>),
     ComputePipeline(Arc<ComputePipelineInner>),
@@ -1462,7 +1463,10 @@ impl RenderPipelineInner {
     fn new(
         desc: &crate::RenderPipelineDescriptor<Resource, Resource, Resource>,
     ) -> Result<Self, crate::PipelineError> {
-        if desc.multiview_mask.is_some() || desc.multisample.alpha_to_coverage_enabled {
+        if desc.multiview_mask.is_some()
+            || desc.multisample.alpha_to_coverage_enabled
+            || !matches!(desc.cache, None | Some(Resource::PipelineCache))
+        {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         }
         let ms_mode = map_sample_count(desc.multisample.count)
@@ -1566,7 +1570,9 @@ impl ComputePipelineInner {
     fn new(
         desc: &crate::ComputePipelineDescriptor<Resource, Resource, Resource>,
     ) -> Result<Self, crate::PipelineError> {
-        if !matches!(desc.layout, Resource::PipelineLayout) || desc.cache.is_some() {
+        if !matches!(desc.layout, Resource::PipelineLayout)
+            || !matches!(desc.cache, None | Some(Resource::PipelineCache))
+        {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         }
 
@@ -4052,12 +4058,15 @@ pub fn adapter_info() -> wgt::AdapterInfo {
 /// proof initialize a vertex buffer directly, matching the direct-HAL smoke app.
 /// `MULTI_DRAW_INDIRECT_COUNT` is currently CPU-side count-buffer emulation
 /// over this backend's CPU-addressable buffers, not native Deko3D count-buffer
-/// execution.
+/// execution. `PIPELINE_CACHE` is an in-memory cache token: Deko3D DKSH
+/// modules are already compiled, so it enables normal public cache creation and
+/// cached pipeline descriptors without claiming persistent cache data.
 pub fn supported_features() -> wgt::Features {
     wgt::Features::PASSTHROUGH_SHADERS
         | wgt::Features::MAPPABLE_PRIMARY_BUFFERS
         | wgt::Features::MULTI_DRAW_INDIRECT_COUNT
         | wgt::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+        | wgt::Features::PIPELINE_CACHE
 }
 
 /// Conservative capabilities for the first Deko3D adapter slice.
@@ -4563,11 +4572,11 @@ impl crate::Device for Device {
     }
     unsafe fn create_pipeline_cache(
         &self,
-        desc: &crate::PipelineCacheDescriptor<'_>,
+        _desc: &crate::PipelineCacheDescriptor<'_>,
     ) -> Result<Resource, crate::PipelineCacheError> {
-        Err(crate::PipelineCacheError::Device(crate::DeviceError::Lost))
+        Ok(Resource::PipelineCache)
     }
-    unsafe fn destroy_pipeline_cache(&self, cache: Resource) {}
+    unsafe fn destroy_pipeline_cache(&self, _cache: Resource) {}
 
     unsafe fn create_query_set(
         &self,
@@ -4634,5 +4643,15 @@ impl crate::Device for Device {
 
     fn check_if_oom(&self) -> DeviceResult<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advertises_pipeline_cache_support() {
+        assert!(supported_features().contains(wgt::Features::PIPELINE_CACHE));
     }
 }
