@@ -292,6 +292,10 @@ struct ScissorState {
 }
 
 impl CommandBuffer {
+    fn record_unsupported(&mut self) {
+        self.commands.push(Command::Error);
+    }
+
     /// # Safety
     ///
     /// Must be called with appropriate synchronization for the resources affected by the command,
@@ -449,24 +453,34 @@ impl crate::CommandEncoder for CommandBuffer {
         });
     }
 
-    unsafe fn begin_query(&mut self, set: &Resource, index: u32) {}
-    unsafe fn end_query(&mut self, set: &Resource, index: u32) {}
-    unsafe fn write_timestamp(&mut self, set: &Resource, index: u32) {}
+    unsafe fn begin_query(&mut self, _set: &Resource, _index: u32) {
+        self.record_unsupported();
+    }
+    unsafe fn end_query(&mut self, _set: &Resource, _index: u32) {
+        self.record_unsupported();
+    }
+    unsafe fn write_timestamp(&mut self, _set: &Resource, _index: u32) {
+        self.record_unsupported();
+    }
     unsafe fn read_acceleration_structure_compact_size(
         &mut self,
-        acceleration_structure: &Resource,
-        buf: &Buffer,
+        _acceleration_structure: &Resource,
+        _buf: &Buffer,
     ) {
+        self.record_unsupported();
     }
-    unsafe fn reset_queries(&mut self, set: &Resource, range: Range<u32>) {}
+    unsafe fn reset_queries(&mut self, _set: &Resource, _range: Range<u32>) {
+        self.record_unsupported();
+    }
     unsafe fn copy_query_results(
         &mut self,
-        set: &Resource,
-        range: Range<u32>,
-        buffer: &Buffer,
-        offset: wgt::BufferAddress,
-        stride: wgt::BufferSize,
+        _set: &Resource,
+        _range: Range<u32>,
+        _buffer: &Buffer,
+        _offset: wgt::BufferAddress,
+        _stride: wgt::BufferSize,
     ) {
+        self.record_unsupported();
     }
 
     // render
@@ -711,47 +725,50 @@ impl crate::CommandEncoder for CommandBuffer {
         });
     }
 
-    unsafe fn begin_ray_tracing_pass(&mut self, desc: &crate::RayTracingPassDescriptor) {
-        unimplemented!()
+    unsafe fn begin_ray_tracing_pass(&mut self, _desc: &crate::RayTracingPassDescriptor) {
+        self.record_unsupported();
     }
     unsafe fn end_ray_tracing_pass(&mut self) {
-        unimplemented!()
+        self.record_unsupported();
     }
-    unsafe fn set_ray_tracing_pipeline(&mut self, pipeline: &Resource) {
-        unimplemented!()
+    unsafe fn set_ray_tracing_pipeline(&mut self, _pipeline: &Resource) {
+        self.record_unsupported();
     }
     unsafe fn trace_rays(
         &mut self,
-        count: [u32; 3],
-        ray_generation_group_data: crate::PipelineGroupData<Buffer>,
-        miss_group_data: crate::PipelineGroupData<Buffer>,
-        intersection_group_data: crate::PipelineGroupData<Buffer>,
+        _count: [u32; 3],
+        _ray_generation_group_data: crate::PipelineGroupData<Buffer>,
+        _miss_group_data: crate::PipelineGroupData<Buffer>,
+        _intersection_group_data: crate::PipelineGroupData<Buffer>,
     ) {
-        unimplemented!()
+        self.record_unsupported();
     }
 
     unsafe fn build_acceleration_structures<'a, T>(
         &mut self,
         _descriptor_count: u32,
-        descriptors: T,
+        _descriptors: T,
     ) where
         Api: 'a,
         T: IntoIterator<Item = crate::BuildAccelerationStructureDescriptor<'a, Buffer, Resource>>,
     {
+        self.record_unsupported();
     }
 
     unsafe fn place_acceleration_structure_barrier(
         &mut self,
         _barriers: crate::AccelerationStructureBarrier,
     ) {
+        self.record_unsupported();
     }
 
     unsafe fn copy_acceleration_structure_to_acceleration_structure(
         &mut self,
-        src: &Resource,
-        dst: &Resource,
-        copy: wgt::AccelerationStructureCopy,
+        _src: &Resource,
+        _dst: &Resource,
+        _copy: wgt::AccelerationStructureCopy,
     ) {
+        self.record_unsupported();
     }
 
     unsafe fn set_acceleration_structure_dependencies(
@@ -2156,6 +2173,103 @@ mod tests {
             }
             ref command => panic!("expected resource barrier, got {command:?}"),
         }
+    }
+
+    fn assert_unsupported_commands(command_buffer: &CommandBuffer, count: usize) {
+        assert_eq!(command_buffer.commands.len(), count);
+        assert!(command_buffer
+            .commands
+            .iter()
+            .all(|command| matches!(command, Command::Error)));
+    }
+
+    #[test]
+    fn query_commands_record_deferred_errors() {
+        let resource = Resource::Placeholder;
+        let buffer = test_buffer();
+        let mut encoder = CommandBuffer::new();
+
+        unsafe {
+            encoder.begin_query(&resource, 0);
+            encoder.end_query(&resource, 0);
+            encoder.write_timestamp(&resource, 0);
+            encoder.reset_queries(&resource, 0..1);
+            encoder.copy_query_results(
+                &resource,
+                0..1,
+                &buffer,
+                0,
+                wgt::BufferSize::new(8).unwrap(),
+            );
+        }
+
+        assert_unsupported_commands(&encoder, 5);
+    }
+
+    #[test]
+    fn ray_tracing_commands_record_deferred_errors() {
+        let resource = Resource::Placeholder;
+        let buffer = test_buffer();
+        let mut encoder = CommandBuffer::new();
+
+        unsafe {
+            encoder.begin_ray_tracing_pass(&crate::RayTracingPassDescriptor { label: None });
+            encoder.end_ray_tracing_pass();
+            encoder.set_ray_tracing_pipeline(&resource);
+            encoder.trace_rays(
+                [1, 1, 1],
+                crate::PipelineGroupData {
+                    buffer: &buffer,
+                    offset: 0,
+                    stride: 0,
+                    count: 0,
+                },
+                crate::PipelineGroupData {
+                    buffer: &buffer,
+                    offset: 0,
+                    stride: 0,
+                    count: 0,
+                },
+                crate::PipelineGroupData {
+                    buffer: &buffer,
+                    offset: 0,
+                    stride: 0,
+                    count: 0,
+                },
+            );
+        }
+
+        assert_unsupported_commands(&encoder, 4);
+    }
+
+    #[test]
+    fn acceleration_structure_commands_record_deferred_errors() {
+        let resource = Resource::Placeholder;
+        let buffer = test_buffer();
+        let mut encoder = CommandBuffer::new();
+
+        unsafe {
+            encoder.read_acceleration_structure_compact_size(&resource, &buffer);
+            encoder.build_acceleration_structures(
+                0,
+                core::iter::empty::<
+                    crate::BuildAccelerationStructureDescriptor<'_, Buffer, Resource>,
+                >(),
+            );
+            encoder.place_acceleration_structure_barrier(crate::AccelerationStructureBarrier {
+                usage: crate::StateTransition {
+                    from: crate::AccelerationStructureUses::BUILD_OUTPUT,
+                    to: crate::AccelerationStructureUses::SHADER_INPUT,
+                },
+            });
+            encoder.copy_acceleration_structure_to_acceleration_structure(
+                &resource,
+                &resource,
+                wgt::AccelerationStructureCopy::Clone,
+            );
+        }
+
+        assert_unsupported_commands(&encoder, 4);
     }
 
     #[test]
