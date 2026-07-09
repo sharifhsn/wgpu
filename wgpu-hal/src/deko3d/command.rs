@@ -42,8 +42,9 @@ enum Command {
         image: RawImage,
         extent: wgt::Extent3d,
         color_clear_value: Option<wgt::Color>,
-        depth_image: Option<RawImage>,
+        depth_stencil_image: Option<RawImage>,
         depth_clear_value: Option<f32>,
+        stencil_clear_value: Option<u8>,
     },
     SetRenderPipeline {
         pipeline: alloc::sync::Arc<RenderPipelineInner>,
@@ -71,6 +72,9 @@ enum Command {
     },
     SetScissorRect {
         rect: crate::Rect<u32>,
+    },
+    SetStencilReference {
+        reference: u8,
     },
     SetBlendConstants {
         color: [f32; 4],
@@ -123,6 +127,7 @@ struct ExecutionState {
     bind_groups: Vec<Option<BoundBindGroup>>,
     viewport: Option<ViewportState>,
     scissor: Option<ScissorState>,
+    stencil_reference: u8,
     blend_constants: [f32; 4],
 }
 
@@ -347,14 +352,15 @@ impl crate::CommandEncoder for CommandBuffer {
             } else {
                 return Err(crate::DeviceError::Lost);
             };
-            let (depth_image, depth_clear_value) =
-                depth_attachment(desc.depth_stencil_attachment.as_ref(), *extent)?;
+            let (depth_stencil_image, depth_clear_value, stencil_clear_value) =
+                depth_stencil_attachment(desc.depth_stencil_attachment.as_ref(), *extent)?;
             self.commands.push(Command::BeginRenderPass {
                 image: *image,
                 extent: *extent,
                 color_clear_value: clear_value,
-                depth_image,
+                depth_stencil_image,
                 depth_clear_value,
+                stencil_clear_value,
             });
         }
         Ok(())
@@ -424,7 +430,11 @@ impl crate::CommandEncoder for CommandBuffer {
         self.commands
             .push(Command::SetScissorRect { rect: rect.clone() });
     }
-    unsafe fn set_stencil_reference(&mut self, value: u32) {}
+    unsafe fn set_stencil_reference(&mut self, value: u32) {
+        self.commands.push(Command::SetStencilReference {
+            reference: value as u8,
+        });
+    }
     unsafe fn set_blend_constants(&mut self, color: &[f32; 4]) {
         self.commands
             .push(Command::SetBlendConstants { color: *color });
@@ -646,8 +656,9 @@ impl Command {
                 image,
                 extent,
                 color_clear_value,
-                depth_image,
+                depth_stencil_image,
                 depth_clear_value,
+                stencil_clear_value,
             } => {
                 state.target = Some(RenderTarget {
                     image: *image,
@@ -655,6 +666,7 @@ impl Command {
                 });
                 state.viewport = None;
                 state.scissor = None;
+                state.stencil_reference = 0;
                 state.blend_constants = [0.0; 4];
                 unsafe {
                     submit_begin_render_pass(
@@ -663,8 +675,9 @@ impl Command {
                         *image,
                         *extent,
                         *color_clear_value,
-                        *depth_image,
+                        *depth_stencil_image,
                         *depth_clear_value,
+                        *stencil_clear_value,
                     )
                 }
             }
@@ -727,6 +740,10 @@ impl Command {
             }
             Command::SetScissorRect { rect } => {
                 state.scissor = Some(ScissorState { rect: rect.clone() });
+                Ok(())
+            }
+            Command::SetStencilReference { reference } => {
+                state.stencil_reference = *reference;
                 Ok(())
             }
             Command::SetBlendConstants { color } => {
@@ -828,19 +845,14 @@ impl Command {
     }
 }
 
-fn depth_attachment(
+fn depth_stencil_attachment(
     attachment: Option<&crate::DepthStencilAttachment<'_, Resource>>,
     expected_extent: wgt::Extent3d,
-) -> DeviceResult<(Option<RawImage>, Option<f32>)> {
+) -> DeviceResult<(Option<RawImage>, Option<f32>, Option<u8>)> {
     let Some(attachment) = attachment else {
-        return Ok((None, None));
+        return Ok((None, None, None));
     };
-    if !attachment.stencil_ops.is_empty()
-        || attachment
-            .depth_ops
-            .contains(crate::AttachmentOps::STORE_DISCARD)
-        || !attachment.depth_ops.contains(crate::AttachmentOps::STORE)
-    {
+    if attachment.depth_ops.is_empty() && attachment.stencil_ops.is_empty() {
         return Err(crate::DeviceError::Lost);
     }
     if !attachment
@@ -856,21 +868,54 @@ fn depth_attachment(
     if *extent != expected_extent {
         return Err(crate::DeviceError::Lost);
     }
-    let clear_value = if attachment
-        .depth_ops
-        .contains(crate::AttachmentOps::LOAD_CLEAR)
-    {
-        Some(attachment.clear_value.0)
-    } else if attachment.depth_ops.contains(crate::AttachmentOps::LOAD)
-        || attachment
-            .depth_ops
-            .contains(crate::AttachmentOps::LOAD_DONT_CARE)
-    {
+
+    let depth_clear_value = if attachment.depth_ops.is_empty() {
         None
     } else {
-        return Err(crate::DeviceError::Lost);
+        validate_attachment_store(attachment.depth_ops)?;
+        if attachment
+            .depth_ops
+            .contains(crate::AttachmentOps::LOAD_CLEAR)
+        {
+            Some(attachment.clear_value.0)
+        } else {
+            validate_attachment_load(attachment.depth_ops)?;
+            None
+        }
     };
-    Ok((Some(*image), clear_value))
+    let stencil_clear_value = if attachment.stencil_ops.is_empty() {
+        None
+    } else {
+        validate_attachment_store(attachment.stencil_ops)?;
+        if attachment
+            .stencil_ops
+            .contains(crate::AttachmentOps::LOAD_CLEAR)
+        {
+            Some(attachment.clear_value.1 as u8)
+        } else {
+            validate_attachment_load(attachment.stencil_ops)?;
+            None
+        }
+    };
+    Ok((Some(*image), depth_clear_value, stencil_clear_value))
+}
+
+fn validate_attachment_store(ops: crate::AttachmentOps) -> DeviceResult<()> {
+    if ops.contains(crate::AttachmentOps::STORE_DISCARD)
+        || !ops.contains(crate::AttachmentOps::STORE)
+    {
+        return Err(crate::DeviceError::Lost);
+    }
+    Ok(())
+}
+
+fn validate_attachment_load(ops: crate::AttachmentOps) -> DeviceResult<()> {
+    if ops.contains(crate::AttachmentOps::LOAD)
+        || ops.contains(crate::AttachmentOps::LOAD_DONT_CARE)
+    {
+        return Ok(());
+    }
+    Err(crate::DeviceError::Lost)
 }
 
 #[cfg(target_os = "horizon")]
@@ -974,18 +1019,19 @@ unsafe fn submit_begin_render_pass(
     image: RawImage,
     extent: wgt::Extent3d,
     clear_value: Option<wgt::Color>,
-    depth_image: Option<RawImage>,
+    depth_stencil_image: Option<RawImage>,
     depth_clear_value: Option<f32>,
+    stencil_clear_value: Option<u8>,
 ) -> DeviceResult<()> {
     unsafe {
         submit_deko_commands(queue, surface_queue, |cmdbuf| {
             let image_view = dk::DkImageView::defaults(image.0);
-            let depth_image_view =
-                depth_image.map(|depth_image| dk::DkImageView::defaults(depth_image.0));
-            let depth_image_view_ptr = depth_image_view
+            let depth_stencil_image_view =
+                depth_stencil_image.map(|image| dk::DkImageView::defaults(image.0));
+            let depth_stencil_image_view_ptr = depth_stencil_image_view
                 .as_ref()
                 .map_or(ptr::null(), |view| ptr::from_ref(view));
-            dk::dkCmdBufBindRenderTarget(cmdbuf, &image_view, depth_image_view_ptr);
+            dk::dkCmdBufBindRenderTarget(cmdbuf, &image_view, depth_stencil_image_view_ptr);
             let viewport = dk::DkViewport {
                 x: 0.0,
                 y: 0.0,
@@ -1013,8 +1059,18 @@ unsafe fn submit_begin_render_pass(
                     clear_value.a as f32,
                 );
             }
-            if let Some(depth_clear_value) = depth_clear_value {
-                dk::dkCmdBufClearDepthStencil(cmdbuf, true, depth_clear_value, 0, 0);
+            if depth_clear_value.is_some() || stencil_clear_value.is_some() {
+                dk::dkCmdBufClearDepthStencil(
+                    cmdbuf,
+                    depth_clear_value.is_some(),
+                    depth_clear_value.unwrap_or(1.0),
+                    if stencil_clear_value.is_some() {
+                        0xFF
+                    } else {
+                        0
+                    },
+                    stencil_clear_value.unwrap_or(0),
+                );
             }
             Ok(())
         })
@@ -1028,8 +1084,9 @@ unsafe fn submit_begin_render_pass(
     _image: RawImage,
     _extent: wgt::Extent3d,
     _clear_value: Option<wgt::Color>,
-    _depth_image: Option<RawImage>,
+    _depth_stencil_image: Option<RawImage>,
     _depth_clear_value: Option<f32>,
+    _stencil_clear_value: Option<u8>,
 ) -> DeviceResult<()> {
     Err(crate::DeviceError::Lost)
 }
@@ -1297,6 +1354,13 @@ unsafe fn submit_deko_draw(
             dk::dkCmdBufBindColorWriteState(cmdbuf, &pipeline.color_write_state);
             dk::dkCmdBufBindBlendStates(cmdbuf, 0, &pipeline.blend_state, 1);
             dk::dkCmdBufBindDepthStencilState(cmdbuf, &pipeline.depth_stencil_state);
+            dk::dkCmdBufSetStencil(
+                cmdbuf,
+                dk::DkFace_FrontAndBack,
+                pipeline.stencil_write_mask,
+                state.stencil_reference,
+                pipeline.stencil_read_mask,
+            );
             dk::dkCmdBufSetBlendConst(
                 cmdbuf,
                 state.blend_constants[0],

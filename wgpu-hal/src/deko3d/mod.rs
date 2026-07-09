@@ -181,6 +181,8 @@ pub(super) struct RenderPipelineInnerRaw {
     color_write_state: dk::DkColorWriteState,
     blend_state: dk::DkBlendState,
     depth_stencil_state: dk::DkDepthStencilState,
+    stencil_read_mask: u8,
+    stencil_write_mask: u8,
 }
 
 #[cfg(target_os = "horizon")]
@@ -946,6 +948,14 @@ impl RenderPipelineInner {
                 color_write_state,
                 blend_state,
                 depth_stencil_state,
+                stencil_read_mask: desc
+                    .depth_stencil
+                    .as_ref()
+                    .map_or(0xFF, |depth_stencil| depth_stencil.stencil.read_mask as u8),
+                stencil_write_mask: desc
+                    .depth_stencil
+                    .as_ref()
+                    .map_or(0xFF, |depth_stencil| depth_stencil.stencil.write_mask as u8),
             },
         })
     }
@@ -995,9 +1005,21 @@ fn map_depth_stencil_state(
         return Ok(state);
     };
 
-    if depth_stencil.format != wgt::TextureFormat::Depth32Float
-        || depth_stencil.stencil.is_enabled()
-        || depth_stencil.bias.is_enabled()
+    if depth_stencil.bias.is_enabled()
+        || (depth_stencil.format != wgt::TextureFormat::Depth32Float
+            && depth_stencil.format != wgt::TextureFormat::Stencil8)
+    {
+        return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+    }
+
+    if depth_stencil.format == wgt::TextureFormat::Stencil8
+        && (depth_stencil.depth_compare.is_some()
+            || depth_stencil.depth_write_enabled.unwrap_or(false))
+    {
+        return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+    }
+    if depth_stencil.format == wgt::TextureFormat::Depth32Float
+        && depth_stencil.stencil.is_enabled()
     {
         return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
     }
@@ -1007,8 +1029,45 @@ fn map_depth_stencil_state(
         state.set_depth_compare_op(map_compare_function(compare));
     }
     state.set_depth_write_enable(depth_stencil.depth_write_enabled.unwrap_or(false));
+    if depth_stencil.stencil.is_enabled() {
+        state.set_stencil_test_enable(true);
+        map_stencil_face_state(&mut state, true, depth_stencil.stencil.front)?;
+        map_stencil_face_state(&mut state, false, depth_stencil.stencil.back)?;
+    }
 
     Ok(state)
+}
+
+#[cfg(target_os = "horizon")]
+fn map_stencil_face_state(
+    state: &mut dk::DkDepthStencilState,
+    front: bool,
+    face: wgt::StencilFaceState,
+) -> Result<(), crate::PipelineError> {
+    let fail = map_stencil_operation(face.fail_op);
+    let pass = map_stencil_operation(face.pass_op);
+    let depth_fail = map_stencil_operation(face.depth_fail_op);
+    let compare = map_compare_function(face.compare);
+    if front {
+        state.set_stencil_front(fail, pass, depth_fail, compare);
+    } else {
+        state.set_stencil_back(fail, pass, depth_fail, compare);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "horizon")]
+fn map_stencil_operation(operation: wgt::StencilOperation) -> dk::DkStencilOp {
+    match operation {
+        wgt::StencilOperation::Keep => dk::DkStencilOp::DkStencilOp_Keep,
+        wgt::StencilOperation::Zero => dk::DkStencilOp::DkStencilOp_Zero,
+        wgt::StencilOperation::Replace => dk::DkStencilOp::DkStencilOp_Replace,
+        wgt::StencilOperation::Invert => dk::DkStencilOp::DkStencilOp_Invert,
+        wgt::StencilOperation::IncrementClamp => dk::DkStencilOp::DkStencilOp_Incr,
+        wgt::StencilOperation::DecrementClamp => dk::DkStencilOp::DkStencilOp_Decr,
+        wgt::StencilOperation::IncrementWrap => dk::DkStencilOp::DkStencilOp_IncrWrap,
+        wgt::StencilOperation::DecrementWrap => dk::DkStencilOp::DkStencilOp_DecrWrap,
+    }
 }
 
 #[cfg(target_os = "horizon")]
@@ -1114,6 +1173,9 @@ impl TextureInner {
             wgt::TextureFormat::Depth32Float => desc.usage.intersects(
                 wgt::TextureUses::DEPTH_STENCIL_READ | wgt::TextureUses::DEPTH_STENCIL_WRITE,
             ),
+            wgt::TextureFormat::Stencil8 => desc.usage.intersects(
+                wgt::TextureUses::DEPTH_STENCIL_READ | wgt::TextureUses::DEPTH_STENCIL_WRITE,
+            ),
             _ => false,
         };
         if desc.dimension != wgt::TextureDimension::D2
@@ -1166,6 +1228,7 @@ fn map_texture_format(format: wgt::TextureFormat) -> DeviceResult<dk::DkImageFor
     match format {
         wgt::TextureFormat::Rgba8Unorm => Ok(dk::DkImageFormat::DkImageFormat_RGBA8_Unorm),
         wgt::TextureFormat::Depth32Float => Ok(dk::DkImageFormat::DkImageFormat_ZF32),
+        wgt::TextureFormat::Stencil8 => Ok(dk::DkImageFormat::DkImageFormat_S8),
         _ => Err(crate::DeviceError::Lost),
     }
 }
@@ -1852,6 +1915,9 @@ impl crate::Adapter for Adapter {
                     | crate::TextureFormatCapabilities::COPY_DST
             }
             wgt::TextureFormat::Depth32Float => {
+                crate::TextureFormatCapabilities::DEPTH_STENCIL_ATTACHMENT
+            }
+            wgt::TextureFormat::Stencil8 => {
                 crate::TextureFormatCapabilities::DEPTH_STENCIL_ATTACHMENT
             }
             _ => crate::TextureFormatCapabilities::empty(),
