@@ -2128,11 +2128,11 @@ unsafe fn submit_dispatch_workgroups_indirect(
 #[cfg(target_os = "horizon")]
 unsafe fn submit_deko_commands(
     queue: &Queue,
-    surface_queue: Option<RawQueueHandle>,
+    _surface_queue: Option<RawQueueHandle>,
     record: impl FnOnce(dk::DkCmdBuf) -> DeviceResult<()>,
 ) -> DeviceResult<()> {
-    let raw_queue = surface_queue.unwrap_or_else(|| queue.raw_queue()).0;
-    unsafe { queue.record_and_submit(raw_queue, record) }
+    let cmdbuf = unsafe { queue.active_cmdbuf() }?;
+    record(cmdbuf)
 }
 
 #[cfg(all(test, not(target_os = "horizon")))]

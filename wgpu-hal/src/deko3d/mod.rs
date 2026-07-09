@@ -1,5 +1,7 @@
 #![allow(unused_variables)]
 
+#[cfg(target_os = "horizon")]
+use alloc::collections::VecDeque;
 use alloc::{string::String, vec, vec::Vec};
 use core::{cell::UnsafeCell, ptr, sync::atomic::Ordering, time::Duration};
 
@@ -7,11 +9,11 @@ use core::fmt;
 #[cfg(target_os = "horizon")]
 use core::mem::size_of;
 #[cfg(target_os = "horizon")]
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicBool, AtomicU32};
 
-#[cfg(supports_64bit_atomics)]
+#[cfg(all(not(target_os = "horizon"), supports_64bit_atomics))]
 use core::sync::atomic::AtomicU64;
-#[cfg(not(supports_64bit_atomics))]
+#[cfg(all(not(target_os = "horizon"), not(supports_64bit_atomics)))]
 use portable_atomic::AtomicU64;
 
 use crate::TlasInstance;
@@ -53,7 +55,7 @@ pub struct Queue {
     #[allow(dead_code)]
     raw: RawQueue,
     #[cfg(target_os = "horizon")]
-    command_recorder: UnsafeCell<CommandRecorder>,
+    active_cmdbuf: UnsafeCell<Option<dk::DkCmdBuf>>,
 }
 #[derive(Debug)]
 pub struct Encoder;
@@ -173,8 +175,12 @@ impl BufferBindGroupLayoutKind {
     }
 }
 
-#[derive(Debug)]
 pub struct Fence {
+    #[cfg(target_os = "horizon")]
+    locked: AtomicBool,
+    #[cfg(target_os = "horizon")]
+    state: UnsafeCell<FenceState>,
+    #[cfg(not(target_os = "horizon"))]
     value: AtomicU64,
 }
 
@@ -234,6 +240,44 @@ struct CommandRecorder {
     mem_block: dk::DkMemBlock,
     cmdbuf: dk::DkCmdBuf,
 }
+
+#[cfg(target_os = "horizon")]
+struct PendingFence {
+    value: crate::FenceValue,
+    queue: dk::DkQueue,
+    raw: dk::DkFence,
+    _recorder: Option<CommandRecorder>,
+}
+
+#[cfg(target_os = "horizon")]
+struct FenceState {
+    completed: crate::FenceValue,
+    pending: VecDeque<PendingFence>,
+}
+
+#[cfg(target_os = "horizon")]
+struct FenceGuard<'a> {
+    fence: &'a Fence,
+}
+
+#[cfg(target_os = "horizon")]
+impl FenceGuard<'_> {
+    fn state(&mut self) -> &mut FenceState {
+        unsafe { &mut *self.fence.state.get() }
+    }
+}
+
+#[cfg(target_os = "horizon")]
+impl Drop for FenceGuard<'_> {
+    fn drop(&mut self) {
+        self.fence.locked.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "horizon")]
+unsafe impl Send for Fence {}
+#[cfg(target_os = "horizon")]
+unsafe impl Sync for Fence {}
 
 #[cfg(target_os = "horizon")]
 #[derive(Clone, Copy)]
@@ -491,6 +535,12 @@ impl fmt::Debug for Surface {
 impl fmt::Debug for SurfaceState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SurfaceState").finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for Fence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Fence").finish_non_exhaustive()
     }
 }
 
@@ -1166,18 +1216,24 @@ impl StorageTextureBinding {
 
 impl Queue {
     #[cfg(target_os = "horizon")]
-    pub(super) fn raw_queue(&self) -> RawQueueHandle {
-        RawQueueHandle(self.raw.0)
+    unsafe fn begin_recording(&self, cmdbuf: dk::DkCmdBuf) -> DeviceResult<()> {
+        let active = unsafe { &mut *self.active_cmdbuf.get() };
+        if active.is_some() {
+            return Err(crate::DeviceError::Lost);
+        }
+        *active = Some(cmdbuf);
+        Ok(())
     }
 
     #[cfg(target_os = "horizon")]
-    pub(super) unsafe fn record_and_submit(
-        &self,
-        raw_queue: dk::DkQueue,
-        record: impl FnOnce(dk::DkCmdBuf) -> DeviceResult<()>,
-    ) -> DeviceResult<()> {
-        let command_recorder = unsafe { &mut *self.command_recorder.get() };
-        unsafe { command_recorder.record_and_submit(raw_queue, record) }
+    unsafe fn end_recording(&self) {
+        let active = unsafe { &mut *self.active_cmdbuf.get() };
+        *active = None;
+    }
+
+    #[cfg(target_os = "horizon")]
+    pub(super) unsafe fn active_cmdbuf(&self) -> DeviceResult<dk::DkCmdBuf> {
+        unsafe { *self.active_cmdbuf.get() }.ok_or(crate::DeviceError::Lost)
     }
 }
 
@@ -1202,22 +1258,150 @@ impl CommandRecorder {
         Ok(Self { mem_block, cmdbuf })
     }
 
-    unsafe fn record_and_submit(
-        &mut self,
-        raw_queue: dk::DkQueue,
-        record: impl FnOnce(dk::DkCmdBuf) -> DeviceResult<()>,
+    unsafe fn submit(&mut self, raw_queue: dk::DkQueue, fence: &mut dk::DkFence) {
+        let cmds = unsafe { dk::dkCmdBufFinishList(self.cmdbuf) };
+        unsafe {
+            dk::dkQueueSubmitCommands(raw_queue, cmds);
+            dk::dkQueueSignalFence(raw_queue, fence, false);
+            dk::dkQueueFlush(raw_queue);
+        }
+    }
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn poll_fence_state(state: &mut FenceState) -> DeviceResult<()> {
+    loop {
+        let Some(pending) = state.pending.front_mut() else {
+            return Ok(());
+        };
+        match unsafe { dk::dkFenceWait(&mut pending.raw, 0) } {
+            dk::DkResult::DkResult_Success => {
+                let value = pending.value;
+                state.pending.pop_front();
+                state.completed = state.completed.max(value);
+            }
+            dk::DkResult::DkResult_Timeout => return Ok(()),
+            _ => return Err(crate::DeviceError::Lost),
+        }
+    }
+}
+
+impl Fence {
+    #[cfg(target_os = "horizon")]
+    fn new() -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            state: UnsafeCell::new(FenceState {
+                completed: 0,
+                pending: VecDeque::new(),
+            }),
+        }
+    }
+
+    #[cfg(not(target_os = "horizon"))]
+    fn new() -> Self {
+        Self {
+            value: AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(target_os = "horizon")]
+    fn lock(&self) -> FenceGuard<'_> {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        FenceGuard { fence: self }
+    }
+
+    #[cfg(target_os = "horizon")]
+    unsafe fn push_submission(
+        &self,
+        value: crate::FenceValue,
+        queue: dk::DkQueue,
+        raw: dk::DkFence,
+        recorder: Option<CommandRecorder>,
     ) -> DeviceResult<()> {
-        unsafe { dk::dkCmdBufClear(self.cmdbuf) };
-        let result = record(self.cmdbuf);
-        if result.is_ok() {
+        let mut guard = self.lock();
+        guard.state().pending.push_back(PendingFence {
+            value,
+            queue,
+            raw,
+            _recorder: recorder,
+        });
+        Ok(())
+    }
+
+    #[cfg(target_os = "horizon")]
+    unsafe fn wait_on_previous_queue(&self, queue: dk::DkQueue) {
+        let mut guard = self.lock();
+        let Some(previous) = guard.state().pending.back_mut() else {
+            return;
+        };
+        if previous.queue != queue {
+            unsafe { dk::dkQueueWaitFence(queue, &mut previous.raw) };
+        }
+    }
+
+    #[cfg(target_os = "horizon")]
+    unsafe fn completed_value(&self) -> DeviceResult<crate::FenceValue> {
+        let mut guard = self.lock();
+        unsafe { poll_fence_state(guard.state()) }?;
+        Ok(guard.state().completed)
+    }
+
+    #[cfg(target_os = "horizon")]
+    unsafe fn wait_for(
+        &self,
+        value: crate::FenceValue,
+        timeout: Option<Duration>,
+    ) -> DeviceResult<bool> {
+        let mut guard = self.lock();
+        let state = guard.state();
+        unsafe { poll_fence_state(state) }?;
+        if state.completed >= value {
+            return Ok(true);
+        }
+
+        let Some(index) = state
+            .pending
+            .iter()
+            .position(|pending| pending.value >= value)
+        else {
+            return Ok(false);
+        };
+        let timeout_ns = match timeout {
+            None => -1,
+            Some(duration) => i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX),
+        };
+        let result = unsafe { dk::dkFenceWait(&mut state.pending[index].raw, timeout_ns) };
+        match result {
+            dk::DkResult::DkResult_Success => {
+                let completed = state.pending[index].value;
+                for _ in 0..=index {
+                    state.pending.pop_front();
+                }
+                state.completed = state.completed.max(completed);
+                Ok(state.completed >= value)
+            }
+            dk::DkResult::DkResult_Timeout => Ok(false),
+            _ => Err(crate::DeviceError::Lost),
+        }
+    }
+}
+
+#[cfg(target_os = "horizon")]
+impl Drop for Fence {
+    fn drop(&mut self) {
+        let mut guard = self.lock();
+        for pending in &mut guard.state().pending {
             unsafe {
-                let cmds = dk::dkCmdBufFinishList(self.cmdbuf);
-                dk::dkQueueSubmitCommands(raw_queue, cmds);
-                dk::dkQueueWaitIdle(raw_queue);
+                let _ = dk::dkFenceWait(&mut pending.raw, -1);
             }
         }
-        unsafe { dk::dkCmdBufClear(self.cmdbuf) };
-        result
     }
 }
 
@@ -3899,20 +4083,9 @@ impl Adapter {
             unsafe { dk::dkDeviceDestroy(raw_device) };
             return Err(crate::DeviceError::Lost);
         }
-        let command_recorder = match unsafe { CommandRecorder::new(raw_device) } {
-            Ok(command_recorder) => command_recorder,
-            Err(error) => {
-                unsafe {
-                    dk::dkQueueDestroy(raw_queue);
-                    dk::dkDeviceDestroy(raw_device);
-                }
-                return Err(error);
-            }
-        };
         let texture_descriptor_heap = match unsafe { TextureDescriptorHeap::new(raw_device) } {
             Ok(heap) => heap,
             Err(error) => {
-                drop(command_recorder);
                 unsafe {
                     dk::dkQueueDestroy(raw_queue);
                     dk::dkDeviceDestroy(raw_device);
@@ -3933,7 +4106,7 @@ impl Adapter {
             queue: Queue {
                 device: inner,
                 raw: RawQueue(raw_queue),
-                command_recorder: UnsafeCell::new(command_recorder),
+                active_cmdbuf: UnsafeCell::new(None),
             },
         })
     }
@@ -4265,22 +4438,42 @@ impl crate::Queue for Queue {
         (fence, fence_value): (&Fence, crate::FenceValue),
     ) -> DeviceResult<()> {
         #[cfg(target_os = "horizon")]
-        let surface_queue = surface_textures.iter().find_map(|texture| match texture {
-            Resource::SurfaceTexture { queue, .. } => Some(*queue),
-            _ => None,
-        });
-        #[cfg(not(target_os = "horizon"))]
-        let surface_queue = None;
-        // All commands are executed synchronously.
-        for cb in command_buffers {
-            // SAFETY: Caller is responsible for ensuring synchronization between commands and
-            // other mutations.
-            unsafe {
-                cb.execute(self, surface_queue)?;
-            }
+        {
+            let surface_queue = surface_textures.iter().find_map(|texture| match texture {
+                Resource::SurfaceTexture { queue, .. } => Some(*queue),
+                _ => None,
+            });
+            let raw_queue = surface_queue.unwrap_or(RawQueueHandle(self.raw.0)).0;
+            unsafe { fence.wait_on_previous_queue(raw_queue) };
+            let mut recorder = unsafe { CommandRecorder::new(self.device.raw.0) }?;
+            unsafe { dk::dkCmdBufClear(recorder.cmdbuf) };
+            unsafe { self.begin_recording(recorder.cmdbuf) }?;
+            let record_result = (|| {
+                for cb in command_buffers {
+                    unsafe { cb.execute(self, surface_queue) }?;
+                }
+                Ok(())
+            })();
+            unsafe { self.end_recording() };
+            record_result?;
+            let mut raw_fence = dk::DkFence::new();
+            unsafe { recorder.submit(raw_queue, &mut raw_fence) };
+            unsafe { fence.push_submission(fence_value, raw_queue, raw_fence, Some(recorder)) }?;
+            return Ok(());
         }
-        fence.value.store(fence_value, Ordering::Release);
-        Ok(())
+        #[cfg(not(target_os = "horizon"))]
+        {
+            let surface_queue = None;
+            for cb in command_buffers {
+                // SAFETY: Caller is responsible for ensuring synchronization between commands
+                // and other mutations.
+                unsafe {
+                    cb.execute(self, surface_queue)?;
+                }
+            }
+            fence.value.store(fence_value, Ordering::Release);
+            Ok(())
+        }
     }
     unsafe fn present(
         &self,
@@ -4608,12 +4801,15 @@ impl crate::Device for Device {
     }
     unsafe fn destroy_query_set(&self, set: Resource) {}
     unsafe fn create_fence(&self) -> DeviceResult<Fence> {
-        Ok(Fence {
-            value: AtomicU64::new(0),
-        })
+        Ok(Fence::new())
     }
     unsafe fn destroy_fence(&self, fence: Fence) {}
     unsafe fn get_fence_value(&self, fence: &Fence) -> DeviceResult<crate::FenceValue> {
+        #[cfg(target_os = "horizon")]
+        {
+            return unsafe { fence.completed_value() };
+        }
+        #[cfg(not(target_os = "horizon"))]
         Ok(fence.value.load(Ordering::Acquire))
     }
     unsafe fn wait(
@@ -4622,13 +4818,15 @@ impl crate::Device for Device {
         value: crate::FenceValue,
         timeout: Option<Duration>,
     ) -> DeviceResult<bool> {
-        // This method is inherited from the temporary skeleton. Real Deko3D
-        // fence semantics must replace it before any adapter is exposed.
-        assert!(
-            fence.value.load(Ordering::Acquire) >= value,
-            "submission must have already been done"
-        );
-        Ok(true)
+        #[cfg(target_os = "horizon")]
+        {
+            return unsafe { fence.wait_for(value, timeout) };
+        }
+        #[cfg(not(target_os = "horizon"))]
+        {
+            let _ = timeout;
+            Ok(fence.value.load(Ordering::Acquire) >= value)
+        }
     }
 
     unsafe fn start_graphics_debugger_capture(&self) -> bool {
