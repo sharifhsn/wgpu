@@ -153,17 +153,17 @@ enum Command {
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 struct ColorAttachmentState {
-    image: RawImage,
+    view: AttachmentViewState,
     extent: wgt::Extent3d,
     sample_count: u32,
     clear_value: Option<wgt::Color>,
-    resolve_image: Option<RawImage>,
+    resolve_view: Option<AttachmentViewState>,
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default)]
 struct DepthStencilAttachmentState {
-    image: Option<RawImage>,
+    view: Option<AttachmentViewState>,
     depth_clear_value: Option<f32>,
     stencil_clear_value: Option<u8>,
 }
@@ -172,6 +172,56 @@ impl DepthStencilAttachmentState {
     #[allow(dead_code)]
     fn has_clear(self) -> bool {
         self.depth_clear_value.is_some() || self.stencil_clear_value.is_some()
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+struct AttachmentViewState {
+    image: RawImage,
+    base_mip_level: u8,
+    base_array_layer: u16,
+}
+
+impl AttachmentViewState {
+    fn from_single_subresource(view: &Resource) -> DeviceResult<(Self, wgt::Extent3d, u32)> {
+        let Resource::TextureView {
+            image,
+            extent,
+            sample_count,
+            base_mip_level,
+            mip_level_count,
+            base_array_layer,
+            array_layer_count,
+            ..
+        } = view
+        else {
+            return Err(crate::DeviceError::Lost);
+        };
+
+        if *mip_level_count != 1 || *array_layer_count != 1 {
+            return Err(crate::DeviceError::Lost);
+        }
+
+        Ok((
+            Self {
+                image: *image,
+                base_mip_level: *base_mip_level,
+                base_array_layer: *base_array_layer,
+            },
+            *extent,
+            *sample_count,
+        ))
+    }
+
+    #[cfg(target_os = "horizon")]
+    fn deko_view(self) -> dk::DkImageView {
+        let mut view = dk::DkImageView::defaults(self.image.0);
+        view.mipLevelOffset = self.base_mip_level;
+        view.mipLevelCount = 1;
+        view.layerOffset = self.base_array_layer;
+        view.layerCount = 1;
+        view
     }
 }
 
@@ -200,8 +250,8 @@ struct RenderTarget {
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 struct RenderTargetColor {
-    image: RawImage,
-    resolve_image: Option<RawImage>,
+    view: AttachmentViewState,
+    resolve_view: Option<AttachmentViewState>,
 }
 
 #[allow(dead_code)]
@@ -776,8 +826,8 @@ impl Command {
                     colors: colors
                         .iter()
                         .map(|color| RenderTargetColor {
-                            image: color.image,
-                            resolve_image: color.resolve_image,
+                            view: color.view,
+                            resolve_view: color.resolve_view,
                         })
                         .collect(),
                 });
@@ -1023,54 +1073,40 @@ fn color_attachment(
     if attachment.depth_slice.is_some() {
         return Err(crate::DeviceError::Lost);
     }
-    let Resource::TextureView {
-        image,
-        extent,
-        sample_count: target_sample_count,
-        ..
-    } = attachment.target.view
-    else {
-        return Err(crate::DeviceError::Lost);
-    };
-    if *target_sample_count != sample_count {
+    let (view, extent, target_sample_count) =
+        AttachmentViewState::from_single_subresource(attachment.target.view)?;
+    if target_sample_count != sample_count {
         return Err(crate::DeviceError::Lost);
     }
-    let resolve_image = resolve_attachment(attachment.resolve_target.as_ref(), *extent)?;
-    if sample_count == 1 && resolve_image.is_some() {
+    let resolve_view = resolve_attachment(attachment.resolve_target.as_ref(), extent)?;
+    if sample_count == 1 && resolve_view.is_some() {
         return Err(crate::DeviceError::Lost);
     }
     Ok(ColorAttachmentState {
-        image: *image,
-        extent: *extent,
+        view,
+        extent,
         sample_count,
         clear_value: attachment_clear_value(attachment.ops, attachment.clear_value)?,
-        resolve_image,
+        resolve_view,
     })
 }
 
 fn resolve_attachment(
     attachment: Option<&crate::Attachment<'_, Resource>>,
     expected_extent: wgt::Extent3d,
-) -> DeviceResult<Option<RawImage>> {
+) -> DeviceResult<Option<AttachmentViewState>> {
     let Some(attachment) = attachment else {
         return Ok(None);
     };
     if !attachment.usage.contains(wgt::TextureUses::COLOR_TARGET) {
         return Err(crate::DeviceError::Lost);
     }
-    let Resource::TextureView {
-        image,
-        extent,
-        sample_count,
-        ..
-    } = attachment.view
-    else {
-        return Err(crate::DeviceError::Lost);
-    };
-    if *extent != expected_extent || *sample_count != 1 {
+    let (view, extent, sample_count) =
+        AttachmentViewState::from_single_subresource(attachment.view)?;
+    if extent != expected_extent || sample_count != 1 {
         return Err(crate::DeviceError::Lost);
     }
-    Ok(Some(*image))
+    Ok(Some(view))
 }
 
 fn depth_stencil_attachment(
@@ -1090,10 +1126,8 @@ fn depth_stencil_attachment(
     {
         return Err(crate::DeviceError::Lost);
     }
-    let Resource::TextureView { image, extent, .. } = attachment.target.view else {
-        return Err(crate::DeviceError::Lost);
-    };
-    if *extent != expected_extent {
+    let (view, extent, _) = AttachmentViewState::from_single_subresource(attachment.target.view)?;
+    if extent != expected_extent {
         return Err(crate::DeviceError::Lost);
     }
 
@@ -1110,7 +1144,7 @@ fn depth_stencil_attachment(
         attachment_clear_value(attachment.stencil_ops, attachment.clear_value.1 as u8)?
     };
     Ok(DepthStencilAttachmentState {
-        image: Some(*image),
+        view: Some(view),
         depth_clear_value,
         stencil_clear_value,
     })
@@ -1407,12 +1441,10 @@ unsafe fn submit_begin_render_pass(
         submit_deko_commands(queue, surface_queue, |cmdbuf| {
             let image_views = colors
                 .iter()
-                .map(|color| dk::DkImageView::defaults(color.image.0))
+                .map(|color| color.view.deko_view())
                 .collect::<Vec<_>>();
             let image_view_ptrs = image_views.iter().map(ptr::from_ref).collect::<Vec<_>>();
-            let depth_stencil_image_view = depth_stencil
-                .image
-                .map(|image| dk::DkImageView::defaults(image.0));
+            let depth_stencil_image_view = depth_stencil.view.map(AttachmentViewState::deko_view);
             let depth_stencil_image_view_ptr = depth_stencil_image_view
                 .as_ref()
                 .map_or(ptr::null(), |view| ptr::from_ref(view));
@@ -1491,16 +1523,16 @@ unsafe fn submit_end_render_pass(
     if !target
         .colors
         .iter()
-        .any(|color| color.resolve_image.is_some())
+        .any(|color| color.resolve_view.is_some())
     {
         return Ok(());
     }
     unsafe {
         submit_deko_commands(queue, surface_queue, |cmdbuf| {
             for color in target.colors {
-                if let Some(resolve_image) = color.resolve_image {
-                    let src_view = dk::DkImageView::defaults(color.image.0);
-                    let dst_view = dk::DkImageView::defaults(resolve_image.0);
+                if let Some(resolve_view) = color.resolve_view {
+                    let src_view = color.view.deko_view();
+                    let dst_view = resolve_view.deko_view();
                     dk::dkCmdBufResolveImage(cmdbuf, &src_view, &dst_view);
                 }
             }
