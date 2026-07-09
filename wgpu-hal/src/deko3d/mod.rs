@@ -1164,33 +1164,20 @@ fn map_blend_factor(factor: wgt::BlendFactor) -> Result<dk::DkBlendFactor, crate
 #[cfg(target_os = "horizon")]
 impl TextureInner {
     unsafe fn new(raw_device: dk::DkDevice, desc: &crate::TextureDescriptor) -> DeviceResult<Self> {
-        let format = map_texture_format(desc.format)?;
-        let valid_usage = match desc.format {
-            wgt::TextureFormat::Rgba8Unorm => {
-                desc.usage.contains(wgt::TextureUses::RESOURCE)
-                    && desc.usage.contains(wgt::TextureUses::COPY_DST)
-            }
-            wgt::TextureFormat::Depth32Float => desc.usage.intersects(
-                wgt::TextureUses::DEPTH_STENCIL_READ | wgt::TextureUses::DEPTH_STENCIL_WRITE,
-            ),
-            wgt::TextureFormat::Stencil8 => desc.usage.intersects(
-                wgt::TextureUses::DEPTH_STENCIL_READ | wgt::TextureUses::DEPTH_STENCIL_WRITE,
-            ),
-            _ => false,
-        };
+        let format_support = texture_format_support(desc.format).ok_or(crate::DeviceError::Lost)?;
         if desc.dimension != wgt::TextureDimension::D2
             || desc.mip_level_count != 1
             || desc.sample_count != 1
             || desc.size.width == 0
             || desc.size.height == 0
             || desc.size.depth_or_array_layers != 1
-            || !valid_usage
+            || !format_support.supports_usage(desc.usage)
         {
             return Err(crate::DeviceError::Lost);
         }
 
         let mut image_layout_maker = dk::DkImageLayoutMaker::defaults(raw_device);
-        image_layout_maker.format = format;
+        image_layout_maker.format = format_support.image_format;
         image_layout_maker.dimensions[0] = desc.size.width;
         image_layout_maker.dimensions[1] = desc.size.height;
         image_layout_maker.mipLevels = 1;
@@ -1224,12 +1211,69 @@ impl TextureInner {
 }
 
 #[cfg(target_os = "horizon")]
-fn map_texture_format(format: wgt::TextureFormat) -> DeviceResult<dk::DkImageFormat> {
+#[derive(Clone, Copy)]
+struct TextureFormatSupport {
+    image_format: dk::DkImageFormat,
+    usage: TextureUsageRequirement,
+}
+
+#[cfg(target_os = "horizon")]
+impl TextureFormatSupport {
+    fn supports_usage(self, usage: wgt::TextureUses) -> bool {
+        match self.usage {
+            TextureUsageRequirement::ContainsAll(required) => usage.contains(required),
+            TextureUsageRequirement::Intersects(any) => usage.intersects(any),
+        }
+    }
+}
+
+#[cfg(target_os = "horizon")]
+#[derive(Clone, Copy)]
+enum TextureUsageRequirement {
+    ContainsAll(wgt::TextureUses),
+    Intersects(wgt::TextureUses),
+}
+
+#[cfg(target_os = "horizon")]
+fn texture_format_support(format: wgt::TextureFormat) -> Option<TextureFormatSupport> {
     match format {
-        wgt::TextureFormat::Rgba8Unorm => Ok(dk::DkImageFormat::DkImageFormat_RGBA8_Unorm),
-        wgt::TextureFormat::Depth32Float => Ok(dk::DkImageFormat::DkImageFormat_ZF32),
-        wgt::TextureFormat::Stencil8 => Ok(dk::DkImageFormat::DkImageFormat_S8),
-        _ => Err(crate::DeviceError::Lost),
+        wgt::TextureFormat::Rgba8Unorm => Some(TextureFormatSupport {
+            image_format: dk::DkImageFormat::DkImageFormat_RGBA8_Unorm,
+            usage: TextureUsageRequirement::ContainsAll(
+                wgt::TextureUses::RESOURCE | wgt::TextureUses::COPY_DST,
+            ),
+        }),
+        wgt::TextureFormat::Depth32Float => Some(TextureFormatSupport {
+            image_format: dk::DkImageFormat::DkImageFormat_ZF32,
+            usage: TextureUsageRequirement::Intersects(
+                wgt::TextureUses::DEPTH_STENCIL_READ | wgt::TextureUses::DEPTH_STENCIL_WRITE,
+            ),
+        }),
+        wgt::TextureFormat::Stencil8 => Some(TextureFormatSupport {
+            image_format: dk::DkImageFormat::DkImageFormat_S8,
+            usage: TextureUsageRequirement::Intersects(
+                wgt::TextureUses::DEPTH_STENCIL_READ | wgt::TextureUses::DEPTH_STENCIL_WRITE,
+            ),
+        }),
+        _ => None,
+    }
+}
+
+fn deko3d_texture_format_capabilities(
+    format: wgt::TextureFormat,
+) -> crate::TextureFormatCapabilities {
+    match format {
+        wgt::TextureFormat::Rgba8Unorm => {
+            crate::TextureFormatCapabilities::SAMPLED
+                | crate::TextureFormatCapabilities::COLOR_ATTACHMENT
+                | crate::TextureFormatCapabilities::COLOR_ATTACHMENT_BLEND
+                | crate::TextureFormatCapabilities::COPY_SRC
+                | crate::TextureFormatCapabilities::COPY_DST
+        }
+        wgt::TextureFormat::Depth32Float | wgt::TextureFormat::Stencil8 => {
+            crate::TextureFormatCapabilities::DEPTH_STENCIL_ATTACHMENT
+        }
+        _ => crate::TextureFormatCapabilities::empty(),
     }
 }
 
@@ -1906,22 +1950,7 @@ impl crate::Adapter for Adapter {
         &self,
         format: wgt::TextureFormat,
     ) -> crate::TextureFormatCapabilities {
-        match format {
-            wgt::TextureFormat::Rgba8Unorm => {
-                crate::TextureFormatCapabilities::SAMPLED
-                    | crate::TextureFormatCapabilities::COLOR_ATTACHMENT
-                    | crate::TextureFormatCapabilities::COLOR_ATTACHMENT_BLEND
-                    | crate::TextureFormatCapabilities::COPY_SRC
-                    | crate::TextureFormatCapabilities::COPY_DST
-            }
-            wgt::TextureFormat::Depth32Float => {
-                crate::TextureFormatCapabilities::DEPTH_STENCIL_ATTACHMENT
-            }
-            wgt::TextureFormat::Stencil8 => {
-                crate::TextureFormatCapabilities::DEPTH_STENCIL_ATTACHMENT
-            }
-            _ => crate::TextureFormatCapabilities::empty(),
-        }
+        deko3d_texture_format_capabilities(format)
     }
 
     unsafe fn surface_capabilities(&self, surface: &Surface) -> Option<crate::SurfaceCapabilities> {
