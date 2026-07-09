@@ -16,6 +16,15 @@ use super::{
     RawQueueHandle, RenderPipelineInner, Resource, TextureInner,
 };
 
+const DEKO_INVALIDATE_IMAGE: u32 = 1 << 0;
+const DEKO_INVALIDATE_SHADER: u32 = 1 << 1;
+const DEKO_INVALIDATE_DESCRIPTORS: u32 = 1 << 2;
+const DEKO_INVALIDATE_L2_CACHE: u32 = 1 << 4;
+const DEKO_RESOURCE_TRANSITION_INVALIDATE_FLAGS: u32 = DEKO_INVALIDATE_IMAGE
+    | DEKO_INVALIDATE_SHADER
+    | DEKO_INVALIDATE_DESCRIPTORS
+    | DEKO_INVALIDATE_L2_CACHE;
+
 /// Command buffer type, which performs double duty as the command encoder type too.
 #[derive(Debug)]
 pub struct CommandBuffer {
@@ -47,6 +56,9 @@ enum Command {
         src: Option<alloc::sync::Arc<TextureInner>>,
         dst: Buffer,
         regions: Vec<crate::BufferTextureCopy>,
+    },
+    ResourceBarrier {
+        invalidate_flags: u32,
     },
     BeginRenderPass {
         colors: Vec<ColorAttachmentState>,
@@ -274,12 +286,28 @@ impl crate::CommandEncoder for CommandBuffer {
     where
         T: Iterator<Item = crate::BufferBarrier<'a, Buffer>>,
     {
+        if barriers
+            .into_iter()
+            .any(|barrier| barrier.usage.from != barrier.usage.to)
+        {
+            self.commands.push(Command::ResourceBarrier {
+                invalidate_flags: DEKO_RESOURCE_TRANSITION_INVALIDATE_FLAGS,
+            });
+        }
     }
 
     unsafe fn transition_textures<'a, T>(&mut self, barriers: T)
     where
         T: Iterator<Item = crate::TextureBarrier<'a, Resource>>,
     {
+        if barriers
+            .into_iter()
+            .any(|barrier| barrier.usage.from != barrier.usage.to)
+        {
+            self.commands.push(Command::ResourceBarrier {
+                invalidate_flags: DEKO_RESOURCE_TRANSITION_INVALIDATE_FLAGS,
+            });
+        }
     }
 
     unsafe fn clear_buffer(&mut self, buffer: &Buffer, range: crate::MemoryRange) {
@@ -735,6 +763,9 @@ impl Command {
                 let src = src.as_ref().ok_or(crate::DeviceError::Lost)?;
                 unsafe { submit_copy_texture_to_buffer(queue, surface_queue, src, dst, regions) }
             }
+            Command::ResourceBarrier { invalidate_flags } => unsafe {
+                submit_resource_barrier(queue, surface_queue, *invalidate_flags)
+            },
             Command::BeginRenderPass {
                 colors,
                 depth_stencil,
@@ -1113,6 +1144,29 @@ fn validate_attachment_load(ops: crate::AttachmentOps) -> DeviceResult<()> {
 
 fn supports_sample_count(sample_count: u32) -> bool {
     matches!(sample_count, 1 | 4)
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_resource_barrier(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    invalidate_flags: u32,
+) -> DeviceResult<()> {
+    unsafe {
+        submit_deko_commands(queue, surface_queue, |cmdbuf| {
+            dk::dkCmdBufBarrier(cmdbuf, dk::DkBarrier::DkBarrier_Full, invalidate_flags);
+            Ok(())
+        })
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_resource_barrier(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _invalidate_flags: u32,
+) -> DeviceResult<()> {
+    Ok(())
 }
 
 #[cfg(target_os = "horizon")]
