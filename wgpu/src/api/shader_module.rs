@@ -251,3 +251,27 @@ pub struct Deko3dDkshShaderModuleDescriptor<'a> {
     pub dksh: Cow<'a, [u8]>,
 }
 static_assertions::assert_impl_all!(Deko3dDkshShaderModuleDescriptor<'_>: Send, Sync);
+
+impl<'a> Deko3dDkshShaderModuleDescriptor<'a> {
+    /// Creates a Deko3D DKSH shader descriptor for a single entry point.
+    ///
+    /// This is a convenience wrapper for the common offline-WGSL artifact path:
+    /// callers can verify and resolve their DKSH bytes externally, then pass
+    /// the verified payload here without hand-building the passthrough entry
+    /// point list.
+    pub fn single_entry(
+        label: Label<'a>,
+        entry_point: &'a str,
+        workgroup_size: (u32, u32, u32),
+        dksh: Cow<'a, [u8]>,
+    ) -> Self {
+        Self {
+            label,
+            entry_points: Cow::Owned(alloc::vec![PassthroughShaderEntryPoint {
+                name: Cow::Borrowed(entry_point),
+                workgroup_size,
+            }]),
+            dksh,
+        }
+    }
+}
