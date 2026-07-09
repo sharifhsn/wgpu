@@ -62,6 +62,7 @@ pub enum Resource {
     PipelineLayout,
     ShaderModule(Arc<ShaderModuleInner>),
     RenderPipeline(Arc<RenderPipelineInner>),
+    ComputePipeline(Arc<ComputePipelineInner>),
     Texture(Arc<TextureInner>),
     Sampler(Arc<SamplerInner>),
     BindGroup(Arc<BindGroupInner>),
@@ -124,6 +125,11 @@ pub struct ShaderModuleInner {
 pub struct RenderPipelineInner {
     #[allow(dead_code)]
     inner: RenderPipelineInnerRaw,
+}
+
+pub struct ComputePipelineInner {
+    #[allow(dead_code)]
+    inner: ComputePipelineInnerRaw,
 }
 
 pub struct TextureInner {
@@ -195,6 +201,11 @@ pub(super) struct RenderPipelineInnerRaw {
     sample_mask: u32,
     stencil_read_mask: u8,
     stencil_write_mask: u8,
+}
+
+#[cfg(target_os = "horizon")]
+pub(super) struct ComputePipelineInnerRaw {
+    compute_shader: Arc<ShaderModuleInner>,
 }
 
 #[cfg(target_os = "horizon")]
@@ -293,6 +304,10 @@ pub(super) struct RenderPipelineInnerRaw;
 
 #[cfg(not(target_os = "horizon"))]
 #[derive(Debug)]
+pub(super) struct ComputePipelineInnerRaw;
+
+#[cfg(not(target_os = "horizon"))]
+#[derive(Debug)]
 struct TextureInnerRaw;
 
 #[cfg(not(target_os = "horizon"))]
@@ -334,6 +349,13 @@ impl fmt::Debug for ShaderModuleInner {
 impl fmt::Debug for RenderPipelineInner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RenderPipelineInner")
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for ComputePipelineInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ComputePipelineInner")
             .finish_non_exhaustive()
     }
 }
@@ -406,6 +428,8 @@ unsafe impl Send for ShaderModuleInner {}
 unsafe impl Sync for ShaderModuleInner {}
 unsafe impl Send for RenderPipelineInner {}
 unsafe impl Sync for RenderPipelineInner {}
+unsafe impl Send for ComputePipelineInner {}
+unsafe impl Sync for ComputePipelineInner {}
 unsafe impl Send for TextureInner {}
 unsafe impl Sync for TextureInner {}
 unsafe impl Send for SamplerInner {}
@@ -459,6 +483,13 @@ impl ShaderModuleInner {
 impl RenderPipelineInner {
     #[cfg(target_os = "horizon")]
     pub(super) fn raw(&self) -> &RenderPipelineInnerRaw {
+        &self.inner
+    }
+}
+
+impl ComputePipelineInner {
+    #[cfg(target_os = "horizon")]
+    pub(super) fn raw(&self) -> &ComputePipelineInnerRaw {
         &self.inner
     }
 }
@@ -607,9 +638,10 @@ impl BindGroupInner {
                 }
             }
             BindGroupInnerRaw::StorageBuffer(binding) => {
-                if !dynamic_offsets.is_empty() || !binding.read_only {
+                if !dynamic_offsets.is_empty() {
                     return Err(crate::DeviceError::Lost);
                 }
+                let _storage_is_read_only = binding.read_only;
                 let (gpu_addr, gpu_size) =
                     binding.buffer.gpu_binding(binding.offset, binding.size)?;
                 unsafe {
@@ -626,6 +658,15 @@ impl BindGroupInner {
                         dk::dkCmdBufBindStorageBuffer(
                             cmdbuf,
                             dk::DkStage::DkStage_Fragment,
+                            binding.binding,
+                            gpu_addr,
+                            gpu_size,
+                        );
+                    }
+                    if binding.visibility.contains(wgt::ShaderStages::COMPUTE) {
+                        dk::dkCmdBufBindStorageBuffer(
+                            cmdbuf,
+                            dk::DkStage::DkStage_Compute,
                             binding.binding,
                             gpu_addr,
                             gpu_size,
@@ -1045,6 +1086,27 @@ impl RenderPipelineInner {
                     .depth_stencil
                     .as_ref()
                     .map_or(0xFF, |depth_stencil| depth_stencil.stencil.write_mask as u8),
+            },
+        })
+    }
+}
+
+#[cfg(target_os = "horizon")]
+impl ComputePipelineInner {
+    fn new(
+        desc: &crate::ComputePipelineDescriptor<Resource, Resource, Resource>,
+    ) -> Result<Self, crate::PipelineError> {
+        if !matches!(desc.layout, Resource::PipelineLayout) || desc.cache.is_some() {
+            return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+        }
+
+        let Resource::ShaderModule(compute_shader) = desc.stage.module else {
+            return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+        };
+
+        Ok(Self {
+            inner: ComputePipelineInnerRaw {
+                compute_shader: compute_shader.clone(),
             },
         })
     }
@@ -1729,6 +1791,7 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
     let mut fragment_uniform_bindings = 0u32;
     let mut vertex_storage_bindings = 0u32;
     let mut fragment_storage_bindings = 0u32;
+    let mut compute_storage_bindings = 0u32;
     for layout in bind_group_layouts.iter().flatten() {
         match layout {
             Resource::BindGroupLayout(BindGroupLayoutKind::TextureSampler) => {
@@ -1778,6 +1841,12 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
                     }
                     fragment_storage_bindings |= binding_mask;
                 }
+                if visibility.contains(wgt::ShaderStages::COMPUTE) {
+                    if compute_storage_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    compute_storage_bindings |= binding_mask;
+                }
             }
             _ => return false,
         }
@@ -1819,10 +1888,7 @@ fn supported_texture_bind_group_layout_kind(
 fn supported_buffer_bind_group_layout_kind(
     entry: wgt::BindGroupLayoutEntry,
 ) -> Option<BindGroupLayoutKind> {
-    if entry.count.is_some()
-        || entry.visibility.is_empty()
-        || !wgt::ShaderStages::VERTEX_FRAGMENT.contains(entry.visibility)
-    {
+    if entry.count.is_some() || entry.visibility.is_empty() {
         return None;
     }
 
@@ -1831,7 +1897,9 @@ fn supported_buffer_bind_group_layout_kind(
             ty: wgt::BufferBindingType::Uniform,
             has_dynamic_offset,
             min_binding_size,
-        } if entry.binding < DEKO_UNIFORM_BUFFER_COUNT => {
+        } if entry.binding < DEKO_UNIFORM_BUFFER_COUNT
+            && wgt::ShaderStages::VERTEX_FRAGMENT.contains(entry.visibility) =>
+        {
             if min_binding_size.is_some_and(|size| size.get() > DEKO_UNIFORM_BUF_MAX_SIZE) {
                 return None;
             }
@@ -1842,14 +1910,17 @@ fn supported_buffer_bind_group_layout_kind(
             })
         }
         wgt::BindingType::Buffer {
-            ty: wgt::BufferBindingType::Storage { read_only: true },
+            ty: wgt::BufferBindingType::Storage { read_only },
             has_dynamic_offset: false,
             min_binding_size: _,
-        } if entry.binding < DEKO_STORAGE_BUFFER_COUNT => {
+        } if entry.binding < DEKO_STORAGE_BUFFER_COUNT
+            && (wgt::ShaderStages::VERTEX_FRAGMENT | wgt::ShaderStages::COMPUTE)
+                .contains(entry.visibility) =>
+        {
             Some(BindGroupLayoutKind::StorageBuffer {
                 binding: entry.binding,
                 visibility: entry.visibility,
-                read_only: true,
+                read_only,
             })
         }
         _ => None,
@@ -2521,7 +2592,16 @@ impl crate::Device for Device {
         &self,
         desc: &crate::ComputePipelineDescriptor<Resource, Resource, Resource>,
     ) -> Result<Resource, crate::PipelineError> {
-        Err(crate::PipelineError::Device(crate::DeviceError::Lost))
+        #[cfg(target_os = "horizon")]
+        {
+            Ok(Resource::ComputePipeline(Arc::new(
+                ComputePipelineInner::new(desc)?,
+            )))
+        }
+        #[cfg(not(target_os = "horizon"))]
+        {
+            Err(crate::PipelineError::Device(crate::DeviceError::Lost))
+        }
     }
     unsafe fn destroy_compute_pipeline(&self, pipeline: Resource) {}
     unsafe fn create_ray_tracing_pipeline(
