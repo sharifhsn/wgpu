@@ -1253,6 +1253,7 @@ fn copy_format_aspect(format: wgt::TextureFormat) -> DeviceResult<crate::FormatA
             Ok(crate::FormatAspects::COLOR)
         }
         wgt::TextureFormat::Depth32Float => Ok(crate::FormatAspects::DEPTH),
+        wgt::TextureFormat::Stencil8 => Ok(crate::FormatAspects::STENCIL),
         _ => Err(crate::DeviceError::Lost),
     }
 }
@@ -1275,6 +1276,9 @@ fn texture_copy_view(
     view.mipLevelCount = 1;
     view.layerOffset = u16::try_from(base.array_layer).map_err(|_| crate::DeviceError::Lost)?;
     view.layerCount = u16::try_from(layer_count).map_err(|_| crate::DeviceError::Lost)?;
+    if texture.format() == wgt::TextureFormat::Stencil8 {
+        view.dsSource = dk::DkDsSource::DkDsSource_Stencil;
+    }
     Ok(view)
 }
 
@@ -1283,6 +1287,7 @@ fn copy_texel_size(format: wgt::TextureFormat) -> DeviceResult<u32> {
     match format {
         wgt::TextureFormat::Rgba8Unorm | wgt::TextureFormat::Rgba8UnormSrgb => Ok(4),
         wgt::TextureFormat::Depth32Float => Ok(4),
+        wgt::TextureFormat::Stencil8 => Ok(1),
         _ => Err(crate::DeviceError::Lost),
     }
 }
