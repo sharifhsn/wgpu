@@ -2115,3 +2115,122 @@ unsafe fn submit_deko_commands(
     let raw_queue = surface_queue.unwrap_or_else(|| queue.raw_queue()).0;
     unsafe { queue.record_and_submit(raw_queue, record) }
 }
+
+#[cfg(all(test, not(target_os = "horizon")))]
+mod tests {
+    use super::*;
+    use crate::CommandEncoder as _;
+    use alloc::sync::Arc;
+
+    fn test_buffer() -> Buffer {
+        Buffer::new(&crate::BufferDescriptor {
+            label: None,
+            size: 4,
+            usage: wgt::BufferUses::COPY_SRC | wgt::BufferUses::COPY_DST,
+            memory_flags: crate::MemoryFlags::empty(),
+        })
+        .expect("host Deko3D test buffer")
+    }
+
+    fn test_texture() -> Resource {
+        Resource::Texture(Arc::new(TextureInner {
+            inner: super::super::TextureInnerRaw,
+        }))
+    }
+
+    fn test_texture_range() -> wgt::ImageSubresourceRange {
+        wgt::ImageSubresourceRange {
+            aspect: wgt::TextureAspect::All,
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            base_array_layer: 0,
+            array_layer_count: Some(1),
+        }
+    }
+
+    fn assert_single_resource_barrier(command_buffer: &CommandBuffer) {
+        assert_eq!(command_buffer.commands.len(), 1);
+        match command_buffer.commands[0] {
+            Command::ResourceBarrier { invalidate_flags } => {
+                assert_eq!(invalidate_flags, DEKO_RESOURCE_TRANSITION_INVALIDATE_FLAGS);
+            }
+            ref command => panic!("expected resource barrier, got {command:?}"),
+        }
+    }
+
+    #[test]
+    fn transition_buffers_records_full_resource_barrier_for_usage_change() {
+        let buffer = test_buffer();
+        let mut encoder = CommandBuffer::new();
+
+        unsafe {
+            encoder.transition_buffers(
+                [crate::BufferBarrier {
+                    buffer: &buffer,
+                    usage: crate::StateTransition {
+                        from: wgt::BufferUses::COPY_DST,
+                        to: wgt::BufferUses::VERTEX,
+                    },
+                }]
+                .into_iter(),
+            );
+        }
+
+        assert_single_resource_barrier(&encoder);
+    }
+
+    #[test]
+    fn transition_textures_records_full_resource_barrier_for_usage_change() {
+        let texture = test_texture();
+        let mut encoder = CommandBuffer::new();
+
+        unsafe {
+            encoder.transition_textures(
+                [crate::TextureBarrier {
+                    texture: &texture,
+                    range: test_texture_range(),
+                    usage: crate::StateTransition {
+                        from: wgt::TextureUses::COPY_DST,
+                        to: wgt::TextureUses::RESOURCE,
+                    },
+                }]
+                .into_iter(),
+            );
+        }
+
+        assert_single_resource_barrier(&encoder);
+    }
+
+    #[test]
+    fn unchanged_resource_usages_do_not_record_barriers() {
+        let buffer = test_buffer();
+        let texture = test_texture();
+        let mut encoder = CommandBuffer::new();
+
+        unsafe {
+            encoder.transition_buffers(
+                [crate::BufferBarrier {
+                    buffer: &buffer,
+                    usage: crate::StateTransition {
+                        from: wgt::BufferUses::COPY_DST,
+                        to: wgt::BufferUses::COPY_DST,
+                    },
+                }]
+                .into_iter(),
+            );
+            encoder.transition_textures(
+                [crate::TextureBarrier {
+                    texture: &texture,
+                    range: test_texture_range(),
+                    usage: crate::StateTransition {
+                        from: wgt::TextureUses::COPY_DST,
+                        to: wgt::TextureUses::COPY_DST,
+                    },
+                }]
+                .into_iter(),
+            );
+        }
+
+        assert!(encoder.commands.is_empty());
+    }
+}
