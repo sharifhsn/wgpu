@@ -1849,9 +1849,7 @@ impl TextureInner {
             && desc.usage.intersects(
                 wgt::TextureUses::COLOR_TARGET
                     | wgt::TextureUses::DEPTH_STENCIL_READ
-                    | wgt::TextureUses::DEPTH_STENCIL_WRITE
-                    | wgt::TextureUses::STORAGE_READ_ONLY
-                    | wgt::TextureUses::STORAGE_READ_WRITE,
+                    | wgt::TextureUses::DEPTH_STENCIL_WRITE,
             )
         {
             return Err(crate::DeviceError::Lost);
@@ -3515,7 +3513,9 @@ fn supported_storage_texture_binding_layout_kind(
             (access, view_dimension),
             (
                 wgt::StorageTextureAccess::ReadOnly | wgt::StorageTextureAccess::ReadWrite,
-                wgt::TextureViewDimension::D2 | wgt::TextureViewDimension::D2Array,
+                wgt::TextureViewDimension::D2
+                    | wgt::TextureViewDimension::D2Array
+                    | wgt::TextureViewDimension::D3,
             ) | (
                 wgt::StorageTextureAccess::WriteOnly,
                 wgt::TextureViewDimension::D2
