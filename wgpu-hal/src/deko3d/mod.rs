@@ -84,7 +84,7 @@ pub enum Resource {
     },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum BindGroupLayoutKind {
     TextureSampler,
     UniformBuffer {
@@ -98,6 +98,36 @@ pub enum BindGroupLayoutKind {
         read_only: bool,
         has_dynamic_offset: bool,
     },
+    BufferGroup(Vec<BufferBindGroupLayoutKind>),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BufferBindGroupLayoutKind {
+    Uniform {
+        binding: u32,
+        visibility: wgt::ShaderStages,
+        has_dynamic_offset: bool,
+    },
+    Storage {
+        binding: u32,
+        visibility: wgt::ShaderStages,
+        read_only: bool,
+        has_dynamic_offset: bool,
+    },
+}
+
+impl BufferBindGroupLayoutKind {
+    fn binding(self) -> u32 {
+        match self {
+            Self::Uniform { binding, .. } | Self::Storage { binding, .. } => binding,
+        }
+    }
+
+    fn visibility(self) -> wgt::ShaderStages {
+        match self {
+            Self::Uniform { visibility, .. } | Self::Storage { visibility, .. } => visibility,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -239,6 +269,7 @@ pub(super) enum BindGroupInnerRaw {
     },
     UniformBuffer(UniformBufferBinding),
     StorageBuffer(StorageBufferBinding),
+    BufferGroup(Vec<BufferBinding>),
 }
 
 #[cfg(target_os = "horizon")]
@@ -250,6 +281,13 @@ pub(super) struct UniformBufferBinding {
     buffer: Buffer,
     offset: wgt::BufferAddress,
     size: Option<wgt::BufferSize>,
+}
+
+#[cfg(target_os = "horizon")]
+#[derive(Clone, Debug)]
+pub(super) enum BufferBinding {
+    Uniform(UniformBufferBinding),
+    Storage(StorageBufferBinding),
 }
 
 #[cfg(target_os = "horizon")]
@@ -599,90 +637,132 @@ impl BindGroupInner {
                     dk::dkMakeTextureHandle(0, 0),
                 );
             },
-            BindGroupInnerRaw::UniformBuffer(binding) => {
-                let dynamic_offset = match (binding.has_dynamic_offset, dynamic_offsets) {
-                    (true, [offset]) => u64::from(*offset),
-                    (false, []) => 0,
-                    _ => return Err(crate::DeviceError::Lost),
-                };
-                if dynamic_offset % u64::from(dk::DK_UNIFORM_BUF_ALIGNMENT) != 0 {
+            BindGroupInnerRaw::UniformBuffer(binding) => unsafe {
+                binding.bind(cmdbuf, dynamic_offsets)?;
+            },
+            BindGroupInnerRaw::StorageBuffer(binding) => unsafe {
+                binding.bind(cmdbuf, dynamic_offsets)?;
+            },
+            BindGroupInnerRaw::BufferGroup(bindings) => {
+                if !dynamic_offsets.is_empty() {
                     return Err(crate::DeviceError::Lost);
                 }
-                let offset = binding
-                    .offset
-                    .checked_add(dynamic_offset)
-                    .ok_or(crate::DeviceError::Lost)?;
-                let (gpu_addr, gpu_size) = binding.buffer.gpu_binding(offset, binding.size)?;
-                if gpu_addr % u64::from(dk::DK_UNIFORM_BUF_ALIGNMENT) != 0
-                    || gpu_size > dk::DK_UNIFORM_BUF_MAX_SIZE
-                {
-                    return Err(crate::DeviceError::Lost);
-                }
-                unsafe {
-                    if binding.visibility.contains(wgt::ShaderStages::VERTEX) {
-                        dk::dkCmdBufBindUniformBuffer(
-                            cmdbuf,
-                            dk::DkStage::DkStage_Vertex,
-                            binding.binding,
-                            gpu_addr,
-                            gpu_size,
-                        );
-                    }
-                    if binding.visibility.contains(wgt::ShaderStages::FRAGMENT) {
-                        dk::dkCmdBufBindUniformBuffer(
-                            cmdbuf,
-                            dk::DkStage::DkStage_Fragment,
-                            binding.binding,
-                            gpu_addr,
-                            gpu_size,
-                        );
-                    }
+                for binding in bindings {
+                    unsafe { binding.bind(cmdbuf)? };
                 }
             }
-            BindGroupInnerRaw::StorageBuffer(binding) => {
-                let dynamic_offset = match (binding.has_dynamic_offset, dynamic_offsets) {
-                    (true, [offset]) => u64::from(*offset),
-                    (false, []) => 0,
-                    _ => return Err(crate::DeviceError::Lost),
-                };
-                if dynamic_offset % u64::from(wgt::STORAGE_BINDING_SIZE_ALIGNMENT) != 0 {
-                    return Err(crate::DeviceError::Lost);
-                }
-                let _storage_is_read_only = binding.read_only;
-                let offset = binding
-                    .offset
-                    .checked_add(dynamic_offset)
-                    .ok_or(crate::DeviceError::Lost)?;
-                let (gpu_addr, gpu_size) = binding.buffer.gpu_binding(offset, binding.size)?;
-                unsafe {
-                    if binding.visibility.contains(wgt::ShaderStages::VERTEX) {
-                        dk::dkCmdBufBindStorageBuffer(
-                            cmdbuf,
-                            dk::DkStage::DkStage_Vertex,
-                            binding.binding,
-                            gpu_addr,
-                            gpu_size,
-                        );
-                    }
-                    if binding.visibility.contains(wgt::ShaderStages::FRAGMENT) {
-                        dk::dkCmdBufBindStorageBuffer(
-                            cmdbuf,
-                            dk::DkStage::DkStage_Fragment,
-                            binding.binding,
-                            gpu_addr,
-                            gpu_size,
-                        );
-                    }
-                    if binding.visibility.contains(wgt::ShaderStages::COMPUTE) {
-                        dk::dkCmdBufBindStorageBuffer(
-                            cmdbuf,
-                            dk::DkStage::DkStage_Compute,
-                            binding.binding,
-                            gpu_addr,
-                            gpu_size,
-                        );
-                    }
-                }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "horizon")]
+impl UniformBufferBinding {
+    unsafe fn bind(
+        &self,
+        cmdbuf: dk::DkCmdBuf,
+        dynamic_offsets: &[wgt::DynamicOffset],
+    ) -> DeviceResult<()> {
+        let dynamic_offset = match (self.has_dynamic_offset, dynamic_offsets) {
+            (true, [offset]) => u64::from(*offset),
+            (false, []) => 0,
+            _ => return Err(crate::DeviceError::Lost),
+        };
+        if dynamic_offset % u64::from(dk::DK_UNIFORM_BUF_ALIGNMENT) != 0 {
+            return Err(crate::DeviceError::Lost);
+        }
+        let offset = self
+            .offset
+            .checked_add(dynamic_offset)
+            .ok_or(crate::DeviceError::Lost)?;
+        let (gpu_addr, gpu_size) = self.buffer.gpu_binding(offset, self.size)?;
+        if gpu_addr % u64::from(dk::DK_UNIFORM_BUF_ALIGNMENT) != 0
+            || gpu_size > dk::DK_UNIFORM_BUF_MAX_SIZE
+        {
+            return Err(crate::DeviceError::Lost);
+        }
+        unsafe {
+            if self.visibility.contains(wgt::ShaderStages::VERTEX) {
+                dk::dkCmdBufBindUniformBuffer(
+                    cmdbuf,
+                    dk::DkStage::DkStage_Vertex,
+                    self.binding,
+                    gpu_addr,
+                    gpu_size,
+                );
+            }
+            if self.visibility.contains(wgt::ShaderStages::FRAGMENT) {
+                dk::dkCmdBufBindUniformBuffer(
+                    cmdbuf,
+                    dk::DkStage::DkStage_Fragment,
+                    self.binding,
+                    gpu_addr,
+                    gpu_size,
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "horizon")]
+impl BufferBinding {
+    unsafe fn bind(&self, cmdbuf: dk::DkCmdBuf) -> DeviceResult<()> {
+        match self {
+            Self::Uniform(binding) => unsafe { binding.bind(cmdbuf, &[]) },
+            Self::Storage(binding) => unsafe { binding.bind(cmdbuf, &[]) },
+        }
+    }
+}
+
+#[cfg(target_os = "horizon")]
+impl StorageBufferBinding {
+    unsafe fn bind(
+        &self,
+        cmdbuf: dk::DkCmdBuf,
+        dynamic_offsets: &[wgt::DynamicOffset],
+    ) -> DeviceResult<()> {
+        let dynamic_offset = match (self.has_dynamic_offset, dynamic_offsets) {
+            (true, [offset]) => u64::from(*offset),
+            (false, []) => 0,
+            _ => return Err(crate::DeviceError::Lost),
+        };
+        if dynamic_offset % u64::from(wgt::STORAGE_BINDING_SIZE_ALIGNMENT) != 0 {
+            return Err(crate::DeviceError::Lost);
+        }
+        let _storage_is_read_only = self.read_only;
+        let offset = self
+            .offset
+            .checked_add(dynamic_offset)
+            .ok_or(crate::DeviceError::Lost)?;
+        let (gpu_addr, gpu_size) = self.buffer.gpu_binding(offset, self.size)?;
+        unsafe {
+            if self.visibility.contains(wgt::ShaderStages::VERTEX) {
+                dk::dkCmdBufBindStorageBuffer(
+                    cmdbuf,
+                    dk::DkStage::DkStage_Vertex,
+                    self.binding,
+                    gpu_addr,
+                    gpu_size,
+                );
+            }
+            if self.visibility.contains(wgt::ShaderStages::FRAGMENT) {
+                dk::dkCmdBufBindStorageBuffer(
+                    cmdbuf,
+                    dk::DkStage::DkStage_Fragment,
+                    self.binding,
+                    gpu_addr,
+                    gpu_size,
+                );
+            }
+            if self.visibility.contains(wgt::ShaderStages::COMPUTE) {
+                dk::dkCmdBufBindStorageBuffer(
+                    cmdbuf,
+                    dk::DkStage::DkStage_Compute,
+                    self.binding,
+                    gpu_addr,
+                    gpu_size,
+                );
             }
         }
         Ok(())
@@ -1550,7 +1630,7 @@ impl BindGroupInner {
         let Resource::BindGroupLayout(kind) = desc.layout else {
             return Err(crate::DeviceError::Lost);
         };
-        match *kind {
+        match kind {
             BindGroupLayoutKind::TextureSampler => unsafe {
                 Self::new_texture_sampler(raw_device, desc)
             },
@@ -1558,13 +1638,20 @@ impl BindGroupInner {
                 binding,
                 visibility,
                 has_dynamic_offset,
-            } => Self::new_uniform_buffer(desc, binding, visibility, has_dynamic_offset),
+            } => Self::new_uniform_buffer(desc, *binding, *visibility, *has_dynamic_offset),
             BindGroupLayoutKind::StorageBuffer {
                 binding,
                 visibility,
                 read_only,
                 has_dynamic_offset,
-            } => Self::new_storage_buffer(desc, binding, visibility, read_only, has_dynamic_offset),
+            } => Self::new_storage_buffer(
+                desc,
+                *binding,
+                *visibility,
+                *read_only,
+                *has_dynamic_offset,
+            ),
+            BindGroupLayoutKind::BufferGroup(entries) => Self::new_buffer_group(desc, entries),
         }
     }
 
@@ -1673,26 +1760,13 @@ impl BindGroupInner {
             return Err(crate::DeviceError::Lost);
         }
 
-        let buffer = &desc.buffers[0];
-        if buffer.offset % u64::from(dk::DK_UNIFORM_BUF_ALIGNMENT) != 0 {
-            return Err(crate::DeviceError::Lost);
-        }
-        if buffer
-            .size
-            .is_some_and(|size| size.get() > u64::from(dk::DK_UNIFORM_BUF_MAX_SIZE))
-        {
-            return Err(crate::DeviceError::Lost);
-        }
-
         Ok(Self {
-            inner: BindGroupInnerRaw::UniformBuffer(UniformBufferBinding {
+            inner: BindGroupInnerRaw::UniformBuffer(Self::make_uniform_buffer_binding(
                 binding,
                 visibility,
                 has_dynamic_offset,
-                buffer: buffer.buffer.clone(),
-                offset: buffer.offset,
-                size: buffer.size,
-            }),
+                &desc.buffers[0],
+            )?),
         })
     }
 
@@ -1718,21 +1792,133 @@ impl BindGroupInner {
             return Err(crate::DeviceError::Lost);
         }
 
-        let buffer = &desc.buffers[0];
-        if buffer.offset % u64::from(wgt::STORAGE_BINDING_SIZE_ALIGNMENT) != 0 {
-            return Err(crate::DeviceError::Lost);
-        }
-
         Ok(Self {
-            inner: BindGroupInnerRaw::StorageBuffer(StorageBufferBinding {
+            inner: BindGroupInnerRaw::StorageBuffer(Self::make_storage_buffer_binding(
                 binding,
                 visibility,
                 read_only,
                 has_dynamic_offset,
-                buffer: buffer.buffer.clone(),
-                offset: buffer.offset,
-                size: buffer.size,
-            }),
+                &desc.buffers[0],
+            )?),
+        })
+    }
+
+    fn new_buffer_group(
+        desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
+        layout_entries: &[BufferBindGroupLayoutKind],
+    ) -> DeviceResult<Self> {
+        if desc.buffers.len() != layout_entries.len()
+            || !desc.samplers.is_empty()
+            || !desc.textures.is_empty()
+            || !desc.acceleration_structures.is_empty()
+            || !desc.external_textures.is_empty()
+            || desc.entries.len() != layout_entries.len()
+        {
+            return Err(crate::DeviceError::Lost);
+        }
+
+        let mut bindings = Vec::with_capacity(layout_entries.len());
+        for layout_entry in layout_entries {
+            let Some(entry) = desc
+                .entries
+                .iter()
+                .find(|entry| entry.binding == layout_entry.binding())
+            else {
+                return Err(crate::DeviceError::Lost);
+            };
+            if entry.count != 1 {
+                return Err(crate::DeviceError::Lost);
+            }
+            let Some(buffer) = desc.buffers.get(entry.resource_index as usize) else {
+                return Err(crate::DeviceError::Lost);
+            };
+
+            match *layout_entry {
+                BufferBindGroupLayoutKind::Uniform {
+                    binding,
+                    visibility,
+                    has_dynamic_offset,
+                } => {
+                    if has_dynamic_offset {
+                        return Err(crate::DeviceError::Lost);
+                    }
+                    bindings.push(BufferBinding::Uniform(Self::make_uniform_buffer_binding(
+                        binding,
+                        visibility,
+                        has_dynamic_offset,
+                        buffer,
+                    )?));
+                }
+                BufferBindGroupLayoutKind::Storage {
+                    binding,
+                    visibility,
+                    read_only,
+                    has_dynamic_offset,
+                } => {
+                    if has_dynamic_offset {
+                        return Err(crate::DeviceError::Lost);
+                    }
+                    bindings.push(BufferBinding::Storage(Self::make_storage_buffer_binding(
+                        binding,
+                        visibility,
+                        read_only,
+                        has_dynamic_offset,
+                        buffer,
+                    )?));
+                }
+            }
+        }
+
+        Ok(Self {
+            inner: BindGroupInnerRaw::BufferGroup(bindings),
+        })
+    }
+
+    fn make_uniform_buffer_binding(
+        binding: u32,
+        visibility: wgt::ShaderStages,
+        has_dynamic_offset: bool,
+        buffer: &crate::BufferBinding<'_, Buffer>,
+    ) -> DeviceResult<UniformBufferBinding> {
+        if buffer.offset % u64::from(dk::DK_UNIFORM_BUF_ALIGNMENT) != 0 {
+            return Err(crate::DeviceError::Lost);
+        }
+        if buffer
+            .size
+            .is_some_and(|size| size.get() > u64::from(dk::DK_UNIFORM_BUF_MAX_SIZE))
+        {
+            return Err(crate::DeviceError::Lost);
+        }
+
+        Ok(UniformBufferBinding {
+            binding,
+            visibility,
+            has_dynamic_offset,
+            buffer: buffer.buffer.clone(),
+            offset: buffer.offset,
+            size: buffer.size,
+        })
+    }
+
+    fn make_storage_buffer_binding(
+        binding: u32,
+        visibility: wgt::ShaderStages,
+        read_only: bool,
+        has_dynamic_offset: bool,
+        buffer: &crate::BufferBinding<'_, Buffer>,
+    ) -> DeviceResult<StorageBufferBinding> {
+        if buffer.offset % u64::from(wgt::STORAGE_BINDING_SIZE_ALIGNMENT) != 0 {
+            return Err(crate::DeviceError::Lost);
+        }
+
+        Ok(StorageBufferBinding {
+            binding,
+            visibility,
+            read_only,
+            has_dynamic_offset,
+            buffer: buffer.buffer.clone(),
+            offset: buffer.offset,
+            size: buffer.size,
         })
     }
 }
@@ -1783,12 +1969,18 @@ fn map_address_mode(address: wgt::AddressMode) -> DeviceResult<dk::DkWrapMode> {
 fn supported_bind_group_layout_kind(
     entries: &[wgt::BindGroupLayoutEntry],
 ) -> Option<BindGroupLayoutKind> {
-    if entries.len() == 2 {
-        return supported_texture_bind_group_layout_kind(entries);
-    }
-
     if entries.len() == 1 {
         return supported_buffer_bind_group_layout_kind(entries[0]);
+    }
+
+    if entries.len() == 2 {
+        if let Some(kind) = supported_texture_bind_group_layout_kind(entries) {
+            return Some(kind);
+        }
+    }
+
+    if entries.len() > 1 {
+        return supported_buffer_bind_group_layout_kind_group(entries);
     }
 
     None
@@ -1861,6 +2053,51 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
                     compute_storage_bindings |= binding_mask;
                 }
             }
+            Resource::BindGroupLayout(BindGroupLayoutKind::BufferGroup(entries)) => {
+                for entry in entries {
+                    let binding = entry.binding();
+                    let visibility = entry.visibility();
+                    let Some(binding_mask) = 1u32.checked_shl(binding) else {
+                        return false;
+                    };
+                    match entry {
+                        BufferBindGroupLayoutKind::Uniform { .. } => {
+                            if visibility.contains(wgt::ShaderStages::VERTEX) {
+                                if vertex_uniform_bindings & binding_mask != 0 {
+                                    return false;
+                                }
+                                vertex_uniform_bindings |= binding_mask;
+                            }
+                            if visibility.contains(wgt::ShaderStages::FRAGMENT) {
+                                if fragment_uniform_bindings & binding_mask != 0 {
+                                    return false;
+                                }
+                                fragment_uniform_bindings |= binding_mask;
+                            }
+                        }
+                        BufferBindGroupLayoutKind::Storage { .. } => {
+                            if visibility.contains(wgt::ShaderStages::VERTEX) {
+                                if vertex_storage_bindings & binding_mask != 0 {
+                                    return false;
+                                }
+                                vertex_storage_bindings |= binding_mask;
+                            }
+                            if visibility.contains(wgt::ShaderStages::FRAGMENT) {
+                                if fragment_storage_bindings & binding_mask != 0 {
+                                    return false;
+                                }
+                                fragment_storage_bindings |= binding_mask;
+                            }
+                            if visibility.contains(wgt::ShaderStages::COMPUTE) {
+                                if compute_storage_bindings & binding_mask != 0 {
+                                    return false;
+                                }
+                                compute_storage_bindings |= binding_mask;
+                            }
+                        }
+                    }
+                }
+            }
             _ => return false,
         }
     }
@@ -1901,6 +2138,64 @@ fn supported_texture_bind_group_layout_kind(
 fn supported_buffer_bind_group_layout_kind(
     entry: wgt::BindGroupLayoutEntry,
 ) -> Option<BindGroupLayoutKind> {
+    let entry = supported_buffer_binding_layout_kind(entry)?;
+    match entry {
+        BufferBindGroupLayoutKind::Uniform {
+            binding,
+            visibility,
+            has_dynamic_offset,
+        } => Some(BindGroupLayoutKind::UniformBuffer {
+            binding,
+            visibility,
+            has_dynamic_offset,
+        }),
+        BufferBindGroupLayoutKind::Storage {
+            binding,
+            visibility,
+            read_only,
+            has_dynamic_offset,
+        } => Some(BindGroupLayoutKind::StorageBuffer {
+            binding,
+            visibility,
+            read_only,
+            has_dynamic_offset,
+        }),
+    }
+}
+
+fn supported_buffer_bind_group_layout_kind_group(
+    entries: &[wgt::BindGroupLayoutEntry],
+) -> Option<BindGroupLayoutKind> {
+    let mut group_entries = Vec::with_capacity(entries.len());
+    let mut bindings = 0u32;
+    for entry in entries {
+        let kind = supported_buffer_binding_layout_kind(*entry)?;
+        let has_dynamic_offset = match kind {
+            BufferBindGroupLayoutKind::Uniform {
+                has_dynamic_offset, ..
+            }
+            | BufferBindGroupLayoutKind::Storage {
+                has_dynamic_offset, ..
+            } => has_dynamic_offset,
+        };
+        if has_dynamic_offset {
+            return None;
+        }
+        let binding = kind.binding();
+        let binding_mask = 1u32.checked_shl(binding)?;
+        if bindings & binding_mask != 0 {
+            return None;
+        }
+        bindings |= binding_mask;
+        group_entries.push(kind);
+    }
+
+    Some(BindGroupLayoutKind::BufferGroup(group_entries))
+}
+
+fn supported_buffer_binding_layout_kind(
+    entry: wgt::BindGroupLayoutEntry,
+) -> Option<BufferBindGroupLayoutKind> {
     if entry.count.is_some() || entry.visibility.is_empty() {
         return None;
     }
@@ -1916,7 +2211,7 @@ fn supported_buffer_bind_group_layout_kind(
             if min_binding_size.is_some_and(|size| size.get() > DEKO_UNIFORM_BUF_MAX_SIZE) {
                 return None;
             }
-            Some(BindGroupLayoutKind::UniformBuffer {
+            Some(BufferBindGroupLayoutKind::Uniform {
                 binding: entry.binding,
                 visibility: entry.visibility,
                 has_dynamic_offset,
@@ -1930,7 +2225,7 @@ fn supported_buffer_bind_group_layout_kind(
             && (wgt::ShaderStages::VERTEX_FRAGMENT | wgt::ShaderStages::COMPUTE)
                 .contains(entry.visibility) =>
         {
-            Some(BindGroupLayoutKind::StorageBuffer {
+            Some(BufferBindGroupLayoutKind::Storage {
                 binding: entry.binding,
                 visibility: entry.visibility,
                 read_only,
