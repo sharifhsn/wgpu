@@ -1851,7 +1851,6 @@ impl TextureInner {
                     | wgt::TextureUses::DEPTH_STENCIL_READ
                     | wgt::TextureUses::DEPTH_STENCIL_WRITE
                     | wgt::TextureUses::STORAGE_READ_ONLY
-                    | wgt::TextureUses::STORAGE_WRITE_ONLY
                     | wgt::TextureUses::STORAGE_READ_WRITE,
             )
         {
@@ -3504,7 +3503,10 @@ fn supported_storage_texture_binding_layout_kind(
         wgt::BindingType::StorageTexture {
             access: wgt::StorageTextureAccess::WriteOnly,
             format: wgt::TextureFormat::Rgba8Unorm,
-            view_dimension: wgt::TextureViewDimension::D2 | wgt::TextureViewDimension::D2Array,
+            view_dimension:
+                wgt::TextureViewDimension::D2
+                | wgt::TextureViewDimension::D2Array
+                | wgt::TextureViewDimension::D3,
         } if (wgt::ShaderStages::VERTEX_FRAGMENT | wgt::ShaderStages::COMPUTE)
             .contains(entry.visibility) =>
         {
