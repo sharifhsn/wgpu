@@ -1,10 +1,14 @@
 #![allow(unused_variables)]
 
 #[cfg(target_os = "horizon")]
+use alloc::boxed::Box;
+#[cfg(target_os = "horizon")]
 use alloc::collections::VecDeque;
 use alloc::{string::String, vec, vec::Vec};
 use core::{cell::UnsafeCell, ptr, sync::atomic::Ordering, time::Duration};
 
+#[cfg(target_os = "horizon")]
+use core::ffi::c_void;
 use core::fmt;
 #[cfg(target_os = "horizon")]
 use core::mem::size_of;
@@ -237,8 +241,16 @@ struct RawQueue(dk::DkQueue);
 
 #[cfg(target_os = "horizon")]
 struct CommandRecorder {
-    mem_block: dk::DkMemBlock,
+    memory: Box<CommandMemory>,
     cmdbuf: dk::DkCmdBuf,
+}
+
+#[cfg(target_os = "horizon")]
+struct CommandMemory {
+    raw_device: dk::DkDevice,
+    blocks: Vec<dk::DkMemBlock>,
+    next_block_size: u32,
+    allocation_failed: bool,
 }
 
 #[cfg(target_os = "horizon")]
@@ -517,7 +529,7 @@ pub(super) struct BindGroupInnerRaw;
 const FRAMEBUFFER_COUNT: usize = 2;
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
-#[cfg(target_os = "horizon")]
+#[cfg(any(target_os = "horizon", test))]
 const CMDMEMSIZE: u32 = 16 * 1024;
 const DEKO_UNIFORM_BUFFER_COUNT: u32 = 16;
 const DEKO_UNIFORM_BUF_MAX_SIZE: u64 = 0x10000;
@@ -600,7 +612,7 @@ impl fmt::Debug for RawQueue {
 impl fmt::Debug for CommandRecorder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CommandRecorder")
-            .field("mem_block", &self.mem_block)
+            .field("memory_block_count", &self.memory.blocks.len())
             .field("cmdbuf", &self.cmdbuf)
             .finish()
     }
@@ -1240,22 +1252,29 @@ impl Queue {
 #[cfg(target_os = "horizon")]
 impl CommandRecorder {
     unsafe fn new(raw_device: dk::DkDevice) -> DeviceResult<Self> {
-        let mut mem_block_maker = dk::DkMemBlockMaker::defaults(raw_device, CMDMEMSIZE);
-        mem_block_maker.flags = dk::DkMemBlockFlags_CpuUncached | dk::DkMemBlockFlags_GpuCached;
-        let mem_block = unsafe { dk::dkMemBlockCreate(&mem_block_maker) };
-        if mem_block.is_null() {
-            return Err(crate::DeviceError::OutOfMemory);
-        }
-
-        let cmdbuf_maker = dk::DkCmdBufMaker::defaults(raw_device);
+        let mut memory = Box::new(CommandMemory::new(raw_device));
+        let mut cmdbuf_maker = dk::DkCmdBufMaker::defaults(raw_device);
+        let user_data: *mut CommandMemory = &mut *memory;
+        cmdbuf_maker.userData = user_data.cast::<c_void>();
+        cmdbuf_maker.cbAddMem = Some(command_recorder_add_memory);
         let cmdbuf = unsafe { dk::dkCmdBufCreate(&cmdbuf_maker) };
         if cmdbuf.is_null() {
-            unsafe { dk::dkMemBlockDestroy(mem_block) };
             return Err(crate::DeviceError::Lost);
         }
 
-        unsafe { dk::dkCmdBufAddMemory(cmdbuf, mem_block, 0, CMDMEMSIZE) };
-        Ok(Self { mem_block, cmdbuf })
+        let mut recorder = Self { memory, cmdbuf };
+        if !unsafe { recorder.memory.add_block(cmdbuf, CMDMEMSIZE as usize) } {
+            return Err(crate::DeviceError::OutOfMemory);
+        }
+        Ok(recorder)
+    }
+
+    fn check_memory(&self) -> DeviceResult<()> {
+        if self.memory.allocation_failed {
+            Err(crate::DeviceError::OutOfMemory)
+        } else {
+            Ok(())
+        }
     }
 
     unsafe fn submit(&mut self, raw_queue: dk::DkQueue, fence: &mut dk::DkFence) {
@@ -1266,6 +1285,82 @@ impl CommandRecorder {
             dk::dkQueueFlush(raw_queue);
         }
     }
+}
+
+#[cfg(target_os = "horizon")]
+impl CommandMemory {
+    fn new(raw_device: dk::DkDevice) -> Self {
+        Self {
+            raw_device,
+            blocks: Vec::new(),
+            next_block_size: CMDMEMSIZE,
+            allocation_failed: false,
+        }
+    }
+
+    unsafe fn add_block(&mut self, cmdbuf: dk::DkCmdBuf, min_req_size: usize) -> bool {
+        let Some(allocation_size) =
+            command_memory_block_size(min_req_size, self.next_block_size, dk::DK_CMDMEM_ALIGNMENT)
+        else {
+            self.allocation_failed = true;
+            return false;
+        };
+        if self.blocks.try_reserve(1).is_err() {
+            self.allocation_failed = true;
+            return false;
+        }
+
+        let mut maker = dk::DkMemBlockMaker::defaults(self.raw_device, allocation_size);
+        maker.flags = dk::DkMemBlockFlags_CpuUncached | dk::DkMemBlockFlags_GpuCached;
+        let block = unsafe { dk::dkMemBlockCreate(&maker) };
+        if block.is_null() {
+            self.allocation_failed = true;
+            return false;
+        }
+
+        unsafe { dk::dkCmdBufAddMemory(cmdbuf, block, 0, allocation_size) };
+        self.blocks.push(block);
+        self.next_block_size = allocation_size.checked_mul(2).unwrap_or(allocation_size);
+        true
+    }
+}
+
+#[cfg(target_os = "horizon")]
+impl Drop for CommandMemory {
+    fn drop(&mut self) {
+        for block in self.blocks.drain(..) {
+            if !block.is_null() {
+                unsafe { dk::dkMemBlockDestroy(block) };
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "horizon")]
+unsafe extern "C" fn command_recorder_add_memory(
+    user_data: *mut c_void,
+    cmdbuf: dk::DkCmdBuf,
+    min_req_size: usize,
+) {
+    let Some(memory) = (unsafe { (user_data as *mut CommandMemory).as_mut() }) else {
+        return;
+    };
+    let _ = unsafe { memory.add_block(cmdbuf, min_req_size) };
+}
+
+#[cfg(any(target_os = "horizon", test))]
+fn command_memory_block_size(
+    min_req_size: usize,
+    next_block_size: u32,
+    alignment: u32,
+) -> Option<u32> {
+    if alignment == 0 {
+        return None;
+    }
+    let min_req_size = u32::try_from(min_req_size).ok()?;
+    let requested = min_req_size.max(next_block_size).max(CMDMEMSIZE);
+    let rounded = requested.checked_add(alignment - 1)? / alignment * alignment;
+    Some(rounded)
 }
 
 #[cfg(target_os = "horizon")]
@@ -1433,9 +1528,6 @@ impl Drop for CommandRecorder {
         unsafe {
             if !self.cmdbuf.is_null() {
                 dk::dkCmdBufDestroy(self.cmdbuf);
-            }
-            if !self.mem_block.is_null() {
-                dk::dkMemBlockDestroy(self.mem_block);
             }
         }
     }
@@ -4456,6 +4548,7 @@ impl crate::Queue for Queue {
             })();
             unsafe { self.end_recording() };
             record_result?;
+            recorder.check_memory()?;
             let mut raw_fence = dk::DkFence::new();
             unsafe { recorder.submit(raw_queue, &mut raw_fence) };
             unsafe { fence.push_submission(fence_value, raw_queue, raw_fence, Some(recorder)) }?;
@@ -4885,5 +4978,16 @@ mod tests {
             assert!(!capabilities.contains(crate::TextureFormatCapabilities::COLOR_ATTACHMENT));
             assert!(!capabilities.contains(crate::TextureFormatCapabilities::STORAGE_READ_ONLY));
         }
+    }
+
+    #[test]
+    fn command_memory_blocks_grow_and_honor_deko3d_alignment() {
+        assert_eq!(command_memory_block_size(1, 16 * 1024, 4), Some(16 * 1024));
+        assert_eq!(
+            command_memory_block_size(16 * 1024 + 1, 16 * 1024, 4),
+            Some(16 * 1024 + 4)
+        );
+        assert_eq!(command_memory_block_size(1, 32 * 1024, 4), Some(32 * 1024));
+        assert_eq!(command_memory_block_size(1, 16 * 1024, 0), None);
     }
 }
