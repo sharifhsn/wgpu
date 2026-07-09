@@ -644,11 +644,17 @@ impl BindGroupInner {
                 binding.bind(cmdbuf, dynamic_offsets)?;
             },
             BindGroupInnerRaw::BufferGroup(bindings) => {
-                if !dynamic_offsets.is_empty() {
-                    return Err(crate::DeviceError::Lost);
-                }
+                let mut dynamic_offsets = dynamic_offsets.iter();
                 for binding in bindings {
-                    unsafe { binding.bind(cmdbuf)? };
+                    let dynamic_offset = if binding.has_dynamic_offset() {
+                        Some(*dynamic_offsets.next().ok_or(crate::DeviceError::Lost)?)
+                    } else {
+                        None
+                    };
+                    unsafe { binding.bind(cmdbuf, dynamic_offset)? };
+                }
+                if dynamic_offsets.next().is_some() {
+                    return Err(crate::DeviceError::Lost);
                 }
             }
         }
@@ -707,10 +713,27 @@ impl UniformBufferBinding {
 
 #[cfg(target_os = "horizon")]
 impl BufferBinding {
-    unsafe fn bind(&self, cmdbuf: dk::DkCmdBuf) -> DeviceResult<()> {
+    fn has_dynamic_offset(&self) -> bool {
         match self {
-            Self::Uniform(binding) => unsafe { binding.bind(cmdbuf, &[]) },
-            Self::Storage(binding) => unsafe { binding.bind(cmdbuf, &[]) },
+            Self::Uniform(binding) => binding.has_dynamic_offset,
+            Self::Storage(binding) => binding.has_dynamic_offset,
+        }
+    }
+
+    unsafe fn bind(
+        &self,
+        cmdbuf: dk::DkCmdBuf,
+        dynamic_offset: Option<wgt::DynamicOffset>,
+    ) -> DeviceResult<()> {
+        match self {
+            Self::Uniform(binding) => match dynamic_offset {
+                Some(offset) => unsafe { binding.bind(cmdbuf, &[offset]) },
+                None => unsafe { binding.bind(cmdbuf, &[]) },
+            },
+            Self::Storage(binding) => match dynamic_offset {
+                Some(offset) => unsafe { binding.bind(cmdbuf, &[offset]) },
+                None => unsafe { binding.bind(cmdbuf, &[]) },
+            },
         }
     }
 }
@@ -1839,9 +1862,6 @@ impl BindGroupInner {
                     visibility,
                     has_dynamic_offset,
                 } => {
-                    if has_dynamic_offset {
-                        return Err(crate::DeviceError::Lost);
-                    }
                     bindings.push(BufferBinding::Uniform(Self::make_uniform_buffer_binding(
                         binding,
                         visibility,
@@ -1855,9 +1875,6 @@ impl BindGroupInner {
                     read_only,
                     has_dynamic_offset,
                 } => {
-                    if has_dynamic_offset {
-                        return Err(crate::DeviceError::Lost);
-                    }
                     bindings.push(BufferBinding::Storage(Self::make_storage_buffer_binding(
                         binding,
                         visibility,
@@ -2170,17 +2187,6 @@ fn supported_buffer_bind_group_layout_kind_group(
     let mut bindings = 0u32;
     for entry in entries {
         let kind = supported_buffer_binding_layout_kind(*entry)?;
-        let has_dynamic_offset = match kind {
-            BufferBindGroupLayoutKind::Uniform {
-                has_dynamic_offset, ..
-            }
-            | BufferBindGroupLayoutKind::Storage {
-                has_dynamic_offset, ..
-            } => has_dynamic_offset,
-        };
-        if has_dynamic_offset {
-            return None;
-        }
         let binding = kind.binding();
         let binding_mask = 1u32.checked_shl(binding)?;
         if bindings & binding_mask != 0 {
