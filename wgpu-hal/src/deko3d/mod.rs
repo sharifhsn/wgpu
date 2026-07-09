@@ -121,7 +121,7 @@ pub enum BindGroupLayoutKind {
     },
     BufferTextureSamplerStorageTextureGroup {
         buffers: Vec<BufferBindGroupLayoutKind>,
-        texture_sampler: TextureSamplerBindGroupLayoutKind,
+        texture_samplers: Vec<TextureSamplerBindGroupLayoutKind>,
         storage_textures: Vec<StorageTextureBindGroupLayoutKind>,
     },
 }
@@ -314,7 +314,7 @@ pub(super) enum BindGroupInnerRaw {
     },
     BufferTextureSamplerStorageTextureGroup {
         buffers: Vec<BufferBinding>,
-        texture_sampler: TextureSamplerBinding,
+        texture_samplers: Vec<TextureSamplerBinding>,
         storage_textures: Vec<StorageTextureBinding>,
     },
 }
@@ -877,7 +877,7 @@ impl BindGroupInner {
             }
             BindGroupInnerRaw::BufferTextureSamplerStorageTextureGroup {
                 buffers,
-                texture_sampler,
+                texture_samplers,
                 storage_textures,
             } => {
                 let mut dynamic_offsets = dynamic_offsets.iter();
@@ -893,7 +893,9 @@ impl BindGroupInner {
                     return Err(crate::DeviceError::Lost);
                 }
                 unsafe {
-                    texture_sampler.bind(cmdbuf, &[])?;
+                    for texture_sampler in texture_samplers {
+                        texture_sampler.bind(cmdbuf, &[])?;
+                    }
                     for storage_texture in storage_textures {
                         storage_texture.bind(cmdbuf, &[])?;
                     }
@@ -2076,14 +2078,14 @@ impl BindGroupInner {
             },
             BindGroupLayoutKind::BufferTextureSamplerStorageTextureGroup {
                 buffers,
-                texture_sampler,
+                texture_samplers,
                 storage_textures,
             } => unsafe {
                 Self::new_buffer_texture_sampler_storage_texture_group(
                     texture_descriptor_heap,
                     desc,
                     buffers,
-                    *texture_sampler,
+                    texture_samplers,
                     storage_textures,
                 )
             },
@@ -2623,15 +2625,18 @@ impl BindGroupInner {
         texture_descriptor_heap: &TextureDescriptorHeap,
         desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
         buffer_layouts: &[BufferBindGroupLayoutKind],
-        texture_sampler_layout: TextureSamplerBindGroupLayoutKind,
+        texture_sampler_layouts: &[TextureSamplerBindGroupLayoutKind],
         storage_texture_layouts: &[StorageTextureBindGroupLayoutKind],
     ) -> DeviceResult<Self> {
         if desc.buffers.len() != buffer_layouts.len()
-            || desc.samplers.len() != 1
-            || desc.textures.len() != 1 + storage_texture_layouts.len()
+            || desc.samplers.len() != texture_sampler_layouts.len()
+            || desc.textures.len() != texture_sampler_layouts.len() + storage_texture_layouts.len()
             || !desc.acceleration_structures.is_empty()
             || !desc.external_textures.is_empty()
-            || desc.entries.len() != buffer_layouts.len() + 2 + storage_texture_layouts.len()
+            || desc.entries.len()
+                != buffer_layouts.len()
+                    + texture_sampler_layouts.len() * 2
+                    + storage_texture_layouts.len()
         {
             return Err(crate::DeviceError::Lost);
         }
@@ -2682,15 +2687,18 @@ impl BindGroupInner {
             }
         }
 
-        let texture_sampler = unsafe {
-            Self::make_texture_sampler_binding(
-                texture_descriptor_heap,
-                desc,
-                texture_sampler_layout.texture_binding,
-                texture_sampler_layout.sampler_binding,
-                texture_sampler_layout.visibility,
-            )?
-        };
+        let mut texture_samplers = Vec::with_capacity(texture_sampler_layouts.len());
+        for layout in texture_sampler_layouts {
+            texture_samplers.push(unsafe {
+                Self::make_texture_sampler_binding(
+                    texture_descriptor_heap,
+                    desc,
+                    layout.texture_binding,
+                    layout.sampler_binding,
+                    layout.visibility,
+                )?
+            });
+        }
 
         let mut storage_textures = Vec::with_capacity(storage_texture_layouts.len());
         for storage_texture_layout in storage_texture_layouts {
@@ -2722,7 +2730,7 @@ impl BindGroupInner {
         Ok(Self {
             inner: BindGroupInnerRaw::BufferTextureSamplerStorageTextureGroup {
                 buffers,
-                texture_sampler,
+                texture_samplers,
                 storage_textures,
             },
         })
@@ -3205,39 +3213,42 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
             Resource::BindGroupLayout(
                 BindGroupLayoutKind::BufferTextureSamplerStorageTextureGroup {
                     buffers,
-                    texture_sampler,
+                    texture_samplers,
                     storage_textures,
                 },
             ) => {
-                let Some(binding_mask) = 1u32.checked_shl(texture_sampler.texture_binding) else {
-                    return false;
-                };
-                if texture_sampler
-                    .visibility
-                    .contains(wgt::ShaderStages::VERTEX)
-                {
-                    if vertex_image_bindings & binding_mask != 0 {
+                for texture_sampler in texture_samplers {
+                    let Some(binding_mask) = 1u32.checked_shl(texture_sampler.texture_binding)
+                    else {
                         return false;
+                    };
+                    if texture_sampler
+                        .visibility
+                        .contains(wgt::ShaderStages::VERTEX)
+                    {
+                        if vertex_image_bindings & binding_mask != 0 {
+                            return false;
+                        }
+                        vertex_image_bindings |= binding_mask;
                     }
-                    vertex_image_bindings |= binding_mask;
-                }
-                if texture_sampler
-                    .visibility
-                    .contains(wgt::ShaderStages::FRAGMENT)
-                {
-                    if fragment_image_bindings & binding_mask != 0 {
-                        return false;
+                    if texture_sampler
+                        .visibility
+                        .contains(wgt::ShaderStages::FRAGMENT)
+                    {
+                        if fragment_image_bindings & binding_mask != 0 {
+                            return false;
+                        }
+                        fragment_image_bindings |= binding_mask;
                     }
-                    fragment_image_bindings |= binding_mask;
-                }
-                if texture_sampler
-                    .visibility
-                    .contains(wgt::ShaderStages::COMPUTE)
-                {
-                    if compute_image_bindings & binding_mask != 0 {
-                        return false;
+                    if texture_sampler
+                        .visibility
+                        .contains(wgt::ShaderStages::COMPUTE)
+                    {
+                        if compute_image_bindings & binding_mask != 0 {
+                            return false;
+                        }
+                        compute_image_bindings |= binding_mask;
                     }
-                    compute_image_bindings |= binding_mask;
                 }
 
                 for storage_texture in storage_textures {
@@ -3420,9 +3431,8 @@ fn supported_buffer_texture_sampler_storage_texture_bind_group_layout_kind_group
     entries: &[wgt::BindGroupLayoutEntry],
 ) -> Option<BindGroupLayoutKind> {
     let mut buffer_entries = Vec::with_capacity(entries.len().saturating_sub(3));
-    let mut texture_binding = None;
-    let mut sampler_binding = None;
-    let mut texture_sampler_visibility = wgt::ShaderStages::empty();
+    let mut textures = Vec::new();
+    let mut samplers = Vec::new();
     let mut storage_textures = Vec::new();
     let mut bindings = 0u32;
 
@@ -3457,35 +3467,42 @@ fn supported_buffer_texture_sampler_storage_texture_bind_group_layout_kind_group
                 view_dimension: wgt::TextureViewDimension::D2,
                 multisampled: false,
             } if entry.binding < DEKO_IMAGE_BINDING_COUNT => {
-                if texture_binding.replace(entry.binding).is_some() {
-                    return None;
-                }
-                texture_sampler_visibility |= entry.visibility;
+                textures.push((entry.binding, entry.visibility));
             }
             wgt::BindingType::Sampler(
                 wgt::SamplerBindingType::Filtering | wgt::SamplerBindingType::NonFiltering,
             ) => {
-                if sampler_binding.replace(entry.binding).is_some() {
-                    return None;
-                }
-                texture_sampler_visibility |= entry.visibility;
+                samplers.push((entry.binding, entry.visibility));
             }
             _ => return None,
         }
     }
 
-    if storage_textures.is_empty() {
+    if textures.is_empty() || textures.len() != samplers.len() || storage_textures.is_empty() {
+        return None;
+    }
+
+    let mut texture_samplers = Vec::with_capacity(textures.len());
+    for (texture_binding, texture_visibility) in textures {
+        let sampler_binding = texture_binding.checked_add(1)?;
+        let sampler_index = samplers
+            .iter()
+            .position(|(binding, _)| *binding == sampler_binding)?;
+        let (_, sampler_visibility) = samplers.swap_remove(sampler_index);
+        texture_samplers.push(TextureSamplerBindGroupLayoutKind {
+            texture_binding,
+            sampler_binding,
+            visibility: texture_visibility | sampler_visibility,
+        });
+    }
+    if !samplers.is_empty() {
         return None;
     }
 
     Some(
         BindGroupLayoutKind::BufferTextureSamplerStorageTextureGroup {
             buffers: buffer_entries,
-            texture_sampler: TextureSamplerBindGroupLayoutKind {
-                texture_binding: texture_binding?,
-                sampler_binding: sampler_binding?,
-                visibility: texture_sampler_visibility,
-            },
+            texture_samplers,
             storage_textures,
         },
     )
