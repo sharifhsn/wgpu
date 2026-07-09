@@ -706,6 +706,15 @@ impl UniformBufferBinding {
                     gpu_size,
                 );
             }
+            if self.visibility.contains(wgt::ShaderStages::COMPUTE) {
+                dk::dkCmdBufBindUniformBuffer(
+                    cmdbuf,
+                    dk::DkStage::DkStage_Compute,
+                    self.binding,
+                    gpu_addr,
+                    gpu_size,
+                );
+            }
         }
         Ok(())
     }
@@ -2011,6 +2020,7 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
     let mut has_texture_sampler = false;
     let mut vertex_uniform_bindings = 0u32;
     let mut fragment_uniform_bindings = 0u32;
+    let mut compute_uniform_bindings = 0u32;
     let mut vertex_storage_bindings = 0u32;
     let mut fragment_storage_bindings = 0u32;
     let mut compute_storage_bindings = 0u32;
@@ -2041,6 +2051,12 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
                         return false;
                     }
                     fragment_uniform_bindings |= binding_mask;
+                }
+                if visibility.contains(wgt::ShaderStages::COMPUTE) {
+                    if compute_uniform_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    compute_uniform_bindings |= binding_mask;
                 }
             }
             Resource::BindGroupLayout(BindGroupLayoutKind::StorageBuffer {
@@ -2090,6 +2106,12 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
                                     return false;
                                 }
                                 fragment_uniform_bindings |= binding_mask;
+                            }
+                            if visibility.contains(wgt::ShaderStages::COMPUTE) {
+                                if compute_uniform_bindings & binding_mask != 0 {
+                                    return false;
+                                }
+                                compute_uniform_bindings |= binding_mask;
                             }
                         }
                         BufferBindGroupLayoutKind::Storage { .. } => {
@@ -2212,7 +2234,8 @@ fn supported_buffer_binding_layout_kind(
             has_dynamic_offset,
             min_binding_size,
         } if entry.binding < DEKO_UNIFORM_BUFFER_COUNT
-            && wgt::ShaderStages::VERTEX_FRAGMENT.contains(entry.visibility) =>
+            && (wgt::ShaderStages::VERTEX_FRAGMENT | wgt::ShaderStages::COMPUTE)
+                .contains(entry.visibility) =>
         {
             if min_binding_size.is_some_and(|size| size.get() > DEKO_UNIFORM_BUF_MAX_SIZE) {
                 return None;
