@@ -74,6 +74,7 @@ pub enum Resource {
     TextureView {
         image: RawImage,
         extent: wgt::Extent3d,
+        sample_count: u32,
         owner: Option<Arc<TextureInner>>,
     },
 }
@@ -181,6 +182,8 @@ pub(super) struct RenderPipelineInnerRaw {
     color_write_state: dk::DkColorWriteState,
     blend_state: dk::DkBlendState,
     depth_stencil_state: dk::DkDepthStencilState,
+    multisample_state: dk::DkMultisampleState,
+    sample_mask: u32,
     stencil_read_mask: u8,
     stencil_write_mask: u8,
 }
@@ -190,6 +193,7 @@ struct TextureInnerRaw {
     mem_block: dk::DkMemBlock,
     image: dk::DkImage,
     extent: wgt::Extent3d,
+    sample_count: u32,
 }
 
 #[cfg(target_os = "horizon")]
@@ -458,6 +462,16 @@ impl TextureInner {
             height: 0,
             depth_or_array_layers: 1,
         }
+    }
+
+    #[cfg(target_os = "horizon")]
+    pub(super) fn sample_count(&self) -> u32 {
+        self.inner.sample_count
+    }
+
+    #[cfg(not(target_os = "horizon"))]
+    pub(super) fn sample_count(&self) -> u32 {
+        1
     }
 }
 
@@ -858,12 +872,13 @@ impl RenderPipelineInner {
     fn new(
         desc: &crate::RenderPipelineDescriptor<Resource, Resource, Resource>,
     ) -> Result<Self, crate::PipelineError> {
-        if desc.multiview_mask.is_some()
-            || desc.multisample.count != 1
-            || desc.multisample.alpha_to_coverage_enabled
-        {
+        if desc.multiview_mask.is_some() || desc.multisample.alpha_to_coverage_enabled {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         }
+        let ms_mode = map_sample_count(desc.multisample.count)
+            .map_err(|_| crate::PipelineError::Device(crate::DeviceError::Lost))?;
+        let sample_mask = u32::try_from(desc.multisample.mask)
+            .map_err(|_| crate::PipelineError::Device(crate::DeviceError::Lost))?;
         let primitive = map_primitive_topology(&desc.primitive)?;
         if desc.primitive.strip_index_format.is_some()
             || desc.primitive.unclipped_depth
@@ -885,6 +900,9 @@ impl RenderPipelineInner {
         let color_write_state = map_color_write_state(color_target.write_mask);
         let rasterizer_state = map_rasterizer_state(&desc.primitive);
         let depth_stencil_state = map_depth_stencil_state(desc.depth_stencil.as_ref())?;
+        let mut multisample_state = dk::DkMultisampleState::defaults();
+        multisample_state.set_mode(ms_mode);
+        multisample_state.set_rasterizer_mode(ms_mode);
 
         let crate::VertexProcessor::Standard {
             vertex_buffers,
@@ -948,6 +966,8 @@ impl RenderPipelineInner {
                 color_write_state,
                 blend_state,
                 depth_stencil_state,
+                multisample_state,
+                sample_mask,
                 stencil_read_mask: desc
                     .depth_stencil
                     .as_ref()
@@ -971,6 +991,15 @@ fn map_primitive_topology(
         wgt::PrimitiveTopology::LineStrip => Ok(dk::DkPrimitive::DkPrimitive_LineStrip),
         wgt::PrimitiveTopology::TriangleList => Ok(dk::DkPrimitive::DkPrimitive_Triangles),
         wgt::PrimitiveTopology::TriangleStrip => Ok(dk::DkPrimitive::DkPrimitive_TriangleStrip),
+    }
+}
+
+#[cfg(target_os = "horizon")]
+fn map_sample_count(sample_count: u32) -> DeviceResult<dk::DkMsMode> {
+    match sample_count {
+        1 => Ok(dk::DkMsMode::DkMsMode_1x),
+        4 => Ok(dk::DkMsMode::DkMsMode_4x),
+        _ => Err(crate::DeviceError::Lost),
     }
 }
 
@@ -1165,9 +1194,9 @@ fn map_blend_factor(factor: wgt::BlendFactor) -> Result<dk::DkBlendFactor, crate
 impl TextureInner {
     unsafe fn new(raw_device: dk::DkDevice, desc: &crate::TextureDescriptor) -> DeviceResult<Self> {
         let format_support = texture_format_support(desc.format).ok_or(crate::DeviceError::Lost)?;
+        let ms_mode = map_sample_count(desc.sample_count)?;
         if desc.dimension != wgt::TextureDimension::D2
             || desc.mip_level_count != 1
-            || desc.sample_count != 1
             || desc.size.width == 0
             || desc.size.height == 0
             || desc.size.depth_or_array_layers != 1
@@ -1178,6 +1207,7 @@ impl TextureInner {
 
         let mut image_layout_maker = dk::DkImageLayoutMaker::defaults(raw_device);
         image_layout_maker.format = format_support.image_format;
+        image_layout_maker.msMode = ms_mode;
         image_layout_maker.dimensions[0] = desc.size.width;
         image_layout_maker.dimensions[1] = desc.size.height;
         image_layout_maker.mipLevels = 1;
@@ -1205,6 +1235,7 @@ impl TextureInner {
                 mem_block,
                 image,
                 extent: desc.size,
+                sample_count: desc.sample_count,
             },
         })
     }
@@ -1221,7 +1252,6 @@ struct TextureFormatSupport {
 impl TextureFormatSupport {
     fn supports_usage(self, usage: wgt::TextureUses) -> bool {
         match self.usage {
-            TextureUsageRequirement::ContainsAll(required) => usage.contains(required),
             TextureUsageRequirement::Intersects(any) => usage.intersects(any),
         }
     }
@@ -1230,7 +1260,6 @@ impl TextureFormatSupport {
 #[cfg(target_os = "horizon")]
 #[derive(Clone, Copy)]
 enum TextureUsageRequirement {
-    ContainsAll(wgt::TextureUses),
     Intersects(wgt::TextureUses),
 }
 
@@ -1239,8 +1268,10 @@ fn texture_format_support(format: wgt::TextureFormat) -> Option<TextureFormatSup
     match format {
         wgt::TextureFormat::Rgba8Unorm => Some(TextureFormatSupport {
             image_format: dk::DkImageFormat::DkImageFormat_RGBA8_Unorm,
-            usage: TextureUsageRequirement::ContainsAll(
-                wgt::TextureUses::RESOURCE | wgt::TextureUses::COPY_DST,
+            usage: TextureUsageRequirement::Intersects(
+                wgt::TextureUses::RESOURCE
+                    | wgt::TextureUses::COPY_DST
+                    | wgt::TextureUses::COLOR_TARGET,
             ),
         }),
         wgt::TextureFormat::Depth32Float => Some(TextureFormatSupport {
@@ -2112,11 +2143,13 @@ impl crate::Device for Device {
             Resource::SurfaceTexture { image, extent, .. } => Ok(Resource::TextureView {
                 image: *image,
                 extent: *extent,
+                sample_count: 1,
                 owner: None,
             }),
             Resource::Texture(texture) => Ok(Resource::TextureView {
                 image: texture.raw_image(),
                 extent: texture.extent(),
+                sample_count: texture.sample_count(),
                 owner: Some(texture.clone()),
             }),
             _ => Err(crate::DeviceError::Lost),

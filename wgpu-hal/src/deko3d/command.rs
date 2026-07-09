@@ -42,6 +42,7 @@ enum Command {
         color: ColorAttachmentState,
         depth_stencil: DepthStencilAttachmentState,
     },
+    EndRenderPass,
     SetRenderPipeline {
         pipeline: alloc::sync::Arc<RenderPipelineInner>,
     },
@@ -119,7 +120,9 @@ enum Command {
 struct ColorAttachmentState {
     image: RawImage,
     extent: wgt::Extent3d,
+    sample_count: u32,
     clear_value: Option<wgt::Color>,
+    resolve_image: Option<RawImage>,
 }
 
 #[allow(dead_code)]
@@ -155,6 +158,7 @@ struct ExecutionState {
 struct RenderTarget {
     image: RawImage,
     extent: wgt::Extent3d,
+    resolve_image: Option<RawImage>,
 }
 
 #[allow(dead_code)]
@@ -341,12 +345,12 @@ impl crate::CommandEncoder for CommandBuffer {
         if desc.multiview_mask.is_some()
             || desc.timestamp_writes.is_some()
             || desc.occlusion_query_set.is_some()
-            || desc.sample_count != 1
+            || !supports_sample_count(desc.sample_count)
         {
             return Err(crate::DeviceError::Lost);
         }
 
-        let color = color_attachment(desc.color_attachments)?;
+        let color = color_attachment(desc.color_attachments, desc.sample_count)?;
         let depth_stencil =
             depth_stencil_attachment(desc.depth_stencil_attachment.as_ref(), color.extent)?;
         self.commands.push(Command::BeginRenderPass {
@@ -355,7 +359,9 @@ impl crate::CommandEncoder for CommandBuffer {
         });
         Ok(())
     }
-    unsafe fn end_render_pass(&mut self) {}
+    unsafe fn end_render_pass(&mut self) {
+        self.commands.push(Command::EndRenderPass);
+    }
 
     unsafe fn set_bind_group(
         &mut self,
@@ -649,6 +655,7 @@ impl Command {
                 state.target = Some(RenderTarget {
                     image: color.image,
                     extent: color.extent,
+                    resolve_image: color.resolve_image,
                 });
                 state.viewport = None;
                 state.scissor = None;
@@ -656,6 +663,9 @@ impl Command {
                 state.blend_constants = [0.0; 4];
                 unsafe { submit_begin_render_pass(queue, surface_queue, *color, *depth_stencil) }
             }
+            Command::EndRenderPass => unsafe {
+                submit_end_render_pass(queue, surface_queue, state)
+            },
             Command::SetRenderPipeline { pipeline } => {
                 state.pipeline = Some(pipeline.clone());
                 Ok(())
@@ -822,25 +832,63 @@ impl Command {
 
 fn color_attachment(
     color_attachments: &[Option<crate::ColorAttachment<'_, Resource>>],
+    sample_count: u32,
 ) -> DeviceResult<ColorAttachmentState> {
     let mut attachments = color_attachments.iter().flatten();
     let Some(attachment) = attachments.next() else {
         return Err(crate::DeviceError::Lost);
     };
-    if attachments.next().is_some()
-        || attachment.resolve_target.is_some()
-        || attachment.depth_slice.is_some()
-    {
+    if attachments.next().is_some() || attachment.depth_slice.is_some() {
         return Err(crate::DeviceError::Lost);
     }
-    let Resource::TextureView { image, extent, .. } = attachment.target.view else {
+    let Resource::TextureView {
+        image,
+        extent,
+        sample_count: target_sample_count,
+        ..
+    } = attachment.target.view
+    else {
         return Err(crate::DeviceError::Lost);
     };
+    if *target_sample_count != sample_count {
+        return Err(crate::DeviceError::Lost);
+    }
+    let resolve_image = resolve_attachment(attachment.resolve_target.as_ref(), *extent)?;
+    if sample_count == 1 && resolve_image.is_some() {
+        return Err(crate::DeviceError::Lost);
+    }
     Ok(ColorAttachmentState {
         image: *image,
         extent: *extent,
+        sample_count,
         clear_value: attachment_clear_value(attachment.ops, attachment.clear_value)?,
+        resolve_image,
     })
+}
+
+fn resolve_attachment(
+    attachment: Option<&crate::Attachment<'_, Resource>>,
+    expected_extent: wgt::Extent3d,
+) -> DeviceResult<Option<RawImage>> {
+    let Some(attachment) = attachment else {
+        return Ok(None);
+    };
+    if !attachment.usage.contains(wgt::TextureUses::COLOR_TARGET) {
+        return Err(crate::DeviceError::Lost);
+    }
+    let Resource::TextureView {
+        image,
+        extent,
+        sample_count,
+        ..
+    } = attachment.view
+    else {
+        return Err(crate::DeviceError::Lost);
+    };
+    if *extent != expected_extent || *sample_count != 1 {
+        return Err(crate::DeviceError::Lost);
+    }
+    Ok(Some(*image))
 }
 
 fn depth_stencil_attachment(
@@ -910,6 +958,10 @@ fn validate_attachment_load(ops: crate::AttachmentOps) -> DeviceResult<()> {
         return Ok(());
     }
     Err(crate::DeviceError::Lost)
+}
+
+fn supports_sample_count(sample_count: u32) -> bool {
+    matches!(sample_count, 1 | 4)
 }
 
 #[cfg(target_os = "horizon")]
@@ -1074,6 +1126,37 @@ unsafe fn submit_begin_render_pass(
     _surface_queue: Option<RawQueueHandle>,
     _color: ColorAttachmentState,
     _depth_stencil: DepthStencilAttachmentState,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_end_render_pass(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    state: &mut ExecutionState,
+) -> DeviceResult<()> {
+    let Some(target) = state.target.take() else {
+        return Err(crate::DeviceError::Lost);
+    };
+    let Some(resolve_image) = target.resolve_image else {
+        return Ok(());
+    };
+    unsafe {
+        submit_deko_commands(queue, surface_queue, |cmdbuf| {
+            let src_view = dk::DkImageView::defaults(target.image.0);
+            let dst_view = dk::DkImageView::defaults(resolve_image.0);
+            dk::dkCmdBufResolveImage(cmdbuf, &src_view, &dst_view);
+            Ok(())
+        })
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_end_render_pass(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _state: &mut ExecutionState,
 ) -> DeviceResult<()> {
     Err(crate::DeviceError::Lost)
 }
@@ -1341,6 +1424,8 @@ unsafe fn submit_deko_draw(
             dk::dkCmdBufBindColorWriteState(cmdbuf, &pipeline.color_write_state);
             dk::dkCmdBufBindBlendStates(cmdbuf, 0, &pipeline.blend_state, 1);
             dk::dkCmdBufBindDepthStencilState(cmdbuf, &pipeline.depth_stencil_state);
+            dk::dkCmdBufBindMultisampleState(cmdbuf, &pipeline.multisample_state);
+            dk::dkCmdBufSetSampleMask(cmdbuf, pipeline.sample_mask);
             dk::dkCmdBufSetStencil(
                 cmdbuf,
                 dk::DkFace_FrontAndBack,
