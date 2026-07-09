@@ -121,6 +121,13 @@ pub enum BindGroupLayoutKind {
         sampler_binding: u32,
         visibility: wgt::ShaderStages,
     },
+    BufferTextureSamplerStorageTextureGroup {
+        buffers: Vec<BufferBindGroupLayoutKind>,
+        texture_binding: u32,
+        sampler_binding: u32,
+        texture_visibility: wgt::ShaderStages,
+        storage_texture: StorageTextureBindGroupLayoutKind,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -299,6 +306,11 @@ pub(super) enum BindGroupInnerRaw {
     },
     BufferStorageTextureGroup {
         buffers: Vec<BufferBinding>,
+        storage_texture: StorageTextureBinding,
+    },
+    BufferTextureSamplerStorageTextureGroup {
+        buffers: Vec<BufferBinding>,
+        texture_sampler: TextureSamplerBinding,
         storage_texture: StorageTextureBinding,
     },
 }
@@ -854,6 +866,28 @@ impl BindGroupInner {
                     return Err(crate::DeviceError::Lost);
                 }
                 unsafe { storage_texture.bind(cmdbuf, &[])? };
+            }
+            BindGroupInnerRaw::BufferTextureSamplerStorageTextureGroup {
+                buffers,
+                texture_sampler,
+                storage_texture,
+            } => {
+                let mut dynamic_offsets = dynamic_offsets.iter();
+                for binding in buffers {
+                    let dynamic_offset = if binding.has_dynamic_offset() {
+                        Some(*dynamic_offsets.next().ok_or(crate::DeviceError::Lost)?)
+                    } else {
+                        None
+                    };
+                    unsafe { binding.bind(cmdbuf, dynamic_offset)? };
+                }
+                if dynamic_offsets.next().is_some() {
+                    return Err(crate::DeviceError::Lost);
+                }
+                unsafe {
+                    texture_sampler.bind(cmdbuf, &[])?;
+                    storage_texture.bind(cmdbuf, &[])?;
+                }
             }
         }
         Ok(())
@@ -2034,6 +2068,23 @@ impl BindGroupInner {
                     *storage_texture,
                 )
             },
+            BindGroupLayoutKind::BufferTextureSamplerStorageTextureGroup {
+                buffers,
+                texture_binding,
+                sampler_binding,
+                texture_visibility,
+                storage_texture,
+            } => unsafe {
+                Self::new_buffer_texture_sampler_storage_texture_group(
+                    texture_descriptor_heap,
+                    desc,
+                    buffers,
+                    *texture_binding,
+                    *sampler_binding,
+                    *texture_visibility,
+                    *storage_texture,
+                )
+            },
         }
     }
 
@@ -2562,6 +2613,114 @@ impl BindGroupInner {
         })
     }
 
+    unsafe fn new_buffer_texture_sampler_storage_texture_group(
+        texture_descriptor_heap: &TextureDescriptorHeap,
+        desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
+        buffer_layouts: &[BufferBindGroupLayoutKind],
+        texture_binding: u32,
+        sampler_binding: u32,
+        texture_visibility: wgt::ShaderStages,
+        storage_texture_layout: StorageTextureBindGroupLayoutKind,
+    ) -> DeviceResult<Self> {
+        if desc.buffers.len() != buffer_layouts.len()
+            || desc.samplers.len() != 1
+            || desc.textures.len() != 2
+            || !desc.acceleration_structures.is_empty()
+            || !desc.external_textures.is_empty()
+            || desc.entries.len() != buffer_layouts.len() + 3
+        {
+            return Err(crate::DeviceError::Lost);
+        }
+
+        let mut buffers = Vec::with_capacity(buffer_layouts.len());
+        for layout_entry in buffer_layouts {
+            let Some(entry) = desc
+                .entries
+                .iter()
+                .find(|entry| entry.binding == layout_entry.binding())
+            else {
+                return Err(crate::DeviceError::Lost);
+            };
+            if entry.count != 1 {
+                return Err(crate::DeviceError::Lost);
+            }
+            let Some(buffer) = desc.buffers.get(entry.resource_index as usize) else {
+                return Err(crate::DeviceError::Lost);
+            };
+
+            match *layout_entry {
+                BufferBindGroupLayoutKind::Uniform {
+                    binding,
+                    visibility,
+                    has_dynamic_offset,
+                } => {
+                    buffers.push(BufferBinding::Uniform(Self::make_uniform_buffer_binding(
+                        binding,
+                        visibility,
+                        has_dynamic_offset,
+                        buffer,
+                    )?));
+                }
+                BufferBindGroupLayoutKind::Storage {
+                    binding,
+                    visibility,
+                    read_only,
+                    has_dynamic_offset,
+                } => {
+                    buffers.push(BufferBinding::Storage(Self::make_storage_buffer_binding(
+                        binding,
+                        visibility,
+                        read_only,
+                        has_dynamic_offset,
+                        buffer,
+                    )?));
+                }
+            }
+        }
+
+        let texture_sampler = unsafe {
+            Self::make_texture_sampler_binding(
+                texture_descriptor_heap,
+                desc,
+                texture_binding,
+                sampler_binding,
+                texture_visibility,
+            )?
+        };
+
+        let Some(entry) = desc
+            .entries
+            .iter()
+            .find(|entry| entry.binding == storage_texture_layout.binding)
+        else {
+            return Err(crate::DeviceError::Lost);
+        };
+        if entry.count != 1 {
+            return Err(crate::DeviceError::Lost);
+        }
+        let Some(texture_binding) = desc.textures.get(entry.resource_index as usize) else {
+            return Err(crate::DeviceError::Lost);
+        };
+        let storage_texture = unsafe {
+            Self::make_storage_texture_binding(
+                texture_descriptor_heap,
+                storage_texture_layout.binding,
+                storage_texture_layout.visibility,
+                storage_texture_layout.access,
+                storage_texture_layout.format,
+                texture_binding,
+            )?
+        };
+
+        Ok(Self {
+            inner: BindGroupInnerRaw::BufferTextureSamplerStorageTextureGroup {
+                buffers,
+                texture_sampler,
+                storage_texture,
+            },
+        })
+    }
+
     fn make_uniform_buffer_binding(
         binding: u32,
         visibility: wgt::ShaderStages,
@@ -2671,6 +2830,11 @@ fn supported_bind_group_layout_kind(
     }
 
     if entries.len() > 1 {
+        if let Some(kind) =
+            supported_buffer_texture_sampler_storage_texture_bind_group_layout_kind_group(entries)
+        {
+            return Some(kind);
+        }
         if let Some(kind) = supported_buffer_texture_sampler_bind_group_layout_kind_group(entries) {
             return Some(kind);
         }
@@ -3019,6 +3183,118 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
                     }
                 }
             }
+            Resource::BindGroupLayout(
+                BindGroupLayoutKind::BufferTextureSamplerStorageTextureGroup {
+                    buffers,
+                    texture_binding,
+                    texture_visibility,
+                    storage_texture,
+                    ..
+                },
+            ) => {
+                let Some(binding_mask) = 1u32.checked_shl(*texture_binding) else {
+                    return false;
+                };
+                if texture_visibility.contains(wgt::ShaderStages::VERTEX) {
+                    if vertex_image_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    vertex_image_bindings |= binding_mask;
+                }
+                if texture_visibility.contains(wgt::ShaderStages::FRAGMENT) {
+                    if fragment_image_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    fragment_image_bindings |= binding_mask;
+                }
+                if texture_visibility.contains(wgt::ShaderStages::COMPUTE) {
+                    if compute_image_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    compute_image_bindings |= binding_mask;
+                }
+
+                let Some(binding_mask) = 1u32.checked_shl(storage_texture.binding) else {
+                    return false;
+                };
+                if storage_texture
+                    .visibility
+                    .contains(wgt::ShaderStages::VERTEX)
+                {
+                    if vertex_image_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    vertex_image_bindings |= binding_mask;
+                }
+                if storage_texture
+                    .visibility
+                    .contains(wgt::ShaderStages::FRAGMENT)
+                {
+                    if fragment_image_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    fragment_image_bindings |= binding_mask;
+                }
+                if storage_texture
+                    .visibility
+                    .contains(wgt::ShaderStages::COMPUTE)
+                {
+                    if compute_image_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    compute_image_bindings |= binding_mask;
+                }
+
+                for entry in buffers {
+                    let binding = entry.binding();
+                    let visibility = entry.visibility();
+                    let Some(binding_mask) = 1u32.checked_shl(binding) else {
+                        return false;
+                    };
+                    match entry {
+                        BufferBindGroupLayoutKind::Uniform { .. } => {
+                            if visibility.contains(wgt::ShaderStages::VERTEX) {
+                                if vertex_uniform_bindings & binding_mask != 0 {
+                                    return false;
+                                }
+                                vertex_uniform_bindings |= binding_mask;
+                            }
+                            if visibility.contains(wgt::ShaderStages::FRAGMENT) {
+                                if fragment_uniform_bindings & binding_mask != 0 {
+                                    return false;
+                                }
+                                fragment_uniform_bindings |= binding_mask;
+                            }
+                            if visibility.contains(wgt::ShaderStages::COMPUTE) {
+                                if compute_uniform_bindings & binding_mask != 0 {
+                                    return false;
+                                }
+                                compute_uniform_bindings |= binding_mask;
+                            }
+                        }
+                        BufferBindGroupLayoutKind::Storage { .. } => {
+                            if visibility.contains(wgt::ShaderStages::VERTEX) {
+                                if vertex_storage_bindings & binding_mask != 0 {
+                                    return false;
+                                }
+                                vertex_storage_bindings |= binding_mask;
+                            }
+                            if visibility.contains(wgt::ShaderStages::FRAGMENT) {
+                                if fragment_storage_bindings & binding_mask != 0 {
+                                    return false;
+                                }
+                                fragment_storage_bindings |= binding_mask;
+                            }
+                            if visibility.contains(wgt::ShaderStages::COMPUTE) {
+                                if compute_storage_bindings & binding_mask != 0 {
+                                    return false;
+                                }
+                                compute_storage_bindings |= binding_mask;
+                            }
+                        }
+                    }
+                }
+            }
             _ => return false,
         }
     }
@@ -3110,6 +3386,77 @@ fn supported_storage_texture_binding_layout_kind(
         }
         _ => None,
     }
+}
+
+fn supported_buffer_texture_sampler_storage_texture_bind_group_layout_kind_group(
+    entries: &[wgt::BindGroupLayoutEntry],
+) -> Option<BindGroupLayoutKind> {
+    let mut buffer_entries = Vec::with_capacity(entries.len().saturating_sub(3));
+    let mut texture_binding = None;
+    let mut sampler_binding = None;
+    let mut texture_sampler_visibility = wgt::ShaderStages::empty();
+    let mut storage_texture = None;
+    let mut bindings = 0u32;
+
+    for entry in entries {
+        let binding_mask = 1u32.checked_shl(entry.binding)?;
+        if bindings & binding_mask != 0 {
+            return None;
+        }
+        bindings |= binding_mask;
+
+        if let Some(kind) = supported_buffer_binding_layout_kind(*entry) {
+            buffer_entries.push(kind);
+            continue;
+        }
+
+        if let Some(kind) = supported_storage_texture_binding_layout_kind(*entry) {
+            if storage_texture.replace(kind).is_some() {
+                return None;
+            }
+            continue;
+        }
+
+        if entry.count.is_some()
+            || entry.visibility.is_empty()
+            || !(wgt::ShaderStages::VERTEX_FRAGMENT | wgt::ShaderStages::COMPUTE)
+                .contains(entry.visibility)
+        {
+            return None;
+        }
+
+        match entry.ty {
+            wgt::BindingType::Texture {
+                sample_type: wgt::TextureSampleType::Float { .. },
+                view_dimension: wgt::TextureViewDimension::D2,
+                multisampled: false,
+            } if entry.binding < DEKO_IMAGE_BINDING_COUNT => {
+                if texture_binding.replace(entry.binding).is_some() {
+                    return None;
+                }
+                texture_sampler_visibility |= entry.visibility;
+            }
+            wgt::BindingType::Sampler(
+                wgt::SamplerBindingType::Filtering | wgt::SamplerBindingType::NonFiltering,
+            ) => {
+                if sampler_binding.replace(entry.binding).is_some() {
+                    return None;
+                }
+                texture_sampler_visibility |= entry.visibility;
+            }
+            _ => return None,
+        }
+    }
+
+    Some(
+        BindGroupLayoutKind::BufferTextureSamplerStorageTextureGroup {
+            buffers: buffer_entries,
+            texture_binding: texture_binding?,
+            sampler_binding: sampler_binding?,
+            texture_visibility: texture_sampler_visibility,
+            storage_texture: storage_texture?,
+        },
+    )
 }
 
 fn supported_buffer_texture_sampler_bind_group_layout_kind_group(
