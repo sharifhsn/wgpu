@@ -2181,6 +2181,19 @@ unsafe fn submit_deko_draw(
                         stage,
                     )?;
                 }
+                for binding in bindings
+                    .iter()
+                    .filter(|binding| binding.kind == ShaderBindingKind::Storage)
+                {
+                    let group = bound_group(binding.group)?;
+                    group.group.bind_storage_binding(
+                        cmdbuf,
+                        &group.dynamic_offsets,
+                        binding.binding,
+                        binding.target,
+                        stage,
+                    )?;
+                }
             }
             dk::dkCmdBufBindRasterizerState(cmdbuf, &pipeline.rasterizer_state);
             dk::dkCmdBufBindColorState(cmdbuf, &pipeline.color_state);
