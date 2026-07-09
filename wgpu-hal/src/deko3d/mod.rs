@@ -180,6 +180,7 @@ pub(super) struct RenderPipelineInnerRaw {
     color_state: dk::DkColorState,
     color_write_state: dk::DkColorWriteState,
     blend_state: dk::DkBlendState,
+    depth_stencil_state: dk::DkDepthStencilState,
 }
 
 #[cfg(target_os = "horizon")]
@@ -855,8 +856,7 @@ impl RenderPipelineInner {
     fn new(
         desc: &crate::RenderPipelineDescriptor<Resource, Resource, Resource>,
     ) -> Result<Self, crate::PipelineError> {
-        if desc.depth_stencil.is_some()
-            || desc.multiview_mask.is_some()
+        if desc.multiview_mask.is_some()
             || desc.multisample.count != 1
             || desc.multisample.alpha_to_coverage_enabled
         {
@@ -882,6 +882,7 @@ impl RenderPipelineInner {
         let (color_state, blend_state) = map_blend_state(color_target.blend)?;
         let color_write_state = map_color_write_state(color_target.write_mask);
         let rasterizer_state = map_rasterizer_state(&desc.primitive);
+        let depth_stencil_state = map_depth_stencil_state(desc.depth_stencil.as_ref())?;
 
         let crate::VertexProcessor::Standard {
             vertex_buffers,
@@ -944,6 +945,7 @@ impl RenderPipelineInner {
                 color_state,
                 color_write_state,
                 blend_state,
+                depth_stencil_state,
             },
         })
     }
@@ -977,6 +979,50 @@ fn map_rasterizer_state(primitive: &wgt::PrimitiveState) -> dk::DkRasterizerStat
     state.set_cull_mode(cull_mode);
     state.set_front_face(front_face);
     state
+}
+
+#[cfg(target_os = "horizon")]
+fn map_depth_stencil_state(
+    depth_stencil: Option<&wgt::DepthStencilState>,
+) -> Result<dk::DkDepthStencilState, crate::PipelineError> {
+    let mut state = dk::DkDepthStencilState::defaults();
+    state.set_depth_test_enable(false);
+    state.set_depth_write_enable(false);
+    state.set_stencil_test_enable(false);
+    state.set_depth_compare_op(dk::DkCompareOp::DkCompareOp_Always);
+
+    let Some(depth_stencil) = depth_stencil else {
+        return Ok(state);
+    };
+
+    if depth_stencil.format != wgt::TextureFormat::Depth32Float
+        || depth_stencil.stencil.is_enabled()
+        || depth_stencil.bias.is_enabled()
+    {
+        return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+    }
+
+    if let Some(compare) = depth_stencil.depth_compare {
+        state.set_depth_test_enable(true);
+        state.set_depth_compare_op(map_compare_function(compare));
+    }
+    state.set_depth_write_enable(depth_stencil.depth_write_enabled.unwrap_or(false));
+
+    Ok(state)
+}
+
+#[cfg(target_os = "horizon")]
+fn map_compare_function(compare: wgt::CompareFunction) -> dk::DkCompareOp {
+    match compare {
+        wgt::CompareFunction::Never => dk::DkCompareOp::DkCompareOp_Never,
+        wgt::CompareFunction::Less => dk::DkCompareOp::DkCompareOp_Less,
+        wgt::CompareFunction::Equal => dk::DkCompareOp::DkCompareOp_Equal,
+        wgt::CompareFunction::LessEqual => dk::DkCompareOp::DkCompareOp_Lequal,
+        wgt::CompareFunction::Greater => dk::DkCompareOp::DkCompareOp_Greater,
+        wgt::CompareFunction::NotEqual => dk::DkCompareOp::DkCompareOp_NotEqual,
+        wgt::CompareFunction::GreaterEqual => dk::DkCompareOp::DkCompareOp_Gequal,
+        wgt::CompareFunction::Always => dk::DkCompareOp::DkCompareOp_Always,
+    }
 }
 
 #[cfg(target_os = "horizon")]
@@ -1059,24 +1105,30 @@ fn map_blend_factor(factor: wgt::BlendFactor) -> Result<dk::DkBlendFactor, crate
 #[cfg(target_os = "horizon")]
 impl TextureInner {
     unsafe fn new(raw_device: dk::DkDevice, desc: &crate::TextureDescriptor) -> DeviceResult<Self> {
+        let format = map_texture_format(desc.format)?;
+        let valid_usage = match desc.format {
+            wgt::TextureFormat::Rgba8Unorm => {
+                desc.usage.contains(wgt::TextureUses::RESOURCE)
+                    && desc.usage.contains(wgt::TextureUses::COPY_DST)
+            }
+            wgt::TextureFormat::Depth32Float => desc.usage.intersects(
+                wgt::TextureUses::DEPTH_STENCIL_READ | wgt::TextureUses::DEPTH_STENCIL_WRITE,
+            ),
+            _ => false,
+        };
         if desc.dimension != wgt::TextureDimension::D2
-            || desc.format != wgt::TextureFormat::Rgba8Unorm
             || desc.mip_level_count != 1
             || desc.sample_count != 1
             || desc.size.width == 0
             || desc.size.height == 0
             || desc.size.depth_or_array_layers != 1
-        {
-            return Err(crate::DeviceError::Lost);
-        }
-        if !desc.usage.contains(wgt::TextureUses::RESOURCE)
-            || !desc.usage.contains(wgt::TextureUses::COPY_DST)
+            || !valid_usage
         {
             return Err(crate::DeviceError::Lost);
         }
 
         let mut image_layout_maker = dk::DkImageLayoutMaker::defaults(raw_device);
-        image_layout_maker.format = dk::DkImageFormat::DkImageFormat_RGBA8_Unorm;
+        image_layout_maker.format = format;
         image_layout_maker.dimensions[0] = desc.size.width;
         image_layout_maker.dimensions[1] = desc.size.height;
         image_layout_maker.mipLevels = 1;
@@ -1106,6 +1158,15 @@ impl TextureInner {
                 extent: desc.size,
             },
         })
+    }
+}
+
+#[cfg(target_os = "horizon")]
+fn map_texture_format(format: wgt::TextureFormat) -> DeviceResult<dk::DkImageFormat> {
+    match format {
+        wgt::TextureFormat::Rgba8Unorm => Ok(dk::DkImageFormat::DkImageFormat_RGBA8_Unorm),
+        wgt::TextureFormat::Depth32Float => Ok(dk::DkImageFormat::DkImageFormat_ZF32),
+        _ => Err(crate::DeviceError::Lost),
     }
 }
 
@@ -1782,14 +1843,18 @@ impl crate::Adapter for Adapter {
         &self,
         format: wgt::TextureFormat,
     ) -> crate::TextureFormatCapabilities {
-        if format == wgt::TextureFormat::Rgba8Unorm {
-            crate::TextureFormatCapabilities::SAMPLED
-                | crate::TextureFormatCapabilities::COLOR_ATTACHMENT
-                | crate::TextureFormatCapabilities::COLOR_ATTACHMENT_BLEND
-                | crate::TextureFormatCapabilities::COPY_SRC
-                | crate::TextureFormatCapabilities::COPY_DST
-        } else {
-            crate::TextureFormatCapabilities::empty()
+        match format {
+            wgt::TextureFormat::Rgba8Unorm => {
+                crate::TextureFormatCapabilities::SAMPLED
+                    | crate::TextureFormatCapabilities::COLOR_ATTACHMENT
+                    | crate::TextureFormatCapabilities::COLOR_ATTACHMENT_BLEND
+                    | crate::TextureFormatCapabilities::COPY_SRC
+                    | crate::TextureFormatCapabilities::COPY_DST
+            }
+            wgt::TextureFormat::Depth32Float => {
+                crate::TextureFormatCapabilities::DEPTH_STENCIL_ATTACHMENT
+            }
+            _ => crate::TextureFormatCapabilities::empty(),
         }
     }
 

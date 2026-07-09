@@ -41,7 +41,9 @@ enum Command {
     BeginRenderPass {
         image: RawImage,
         extent: wgt::Extent3d,
-        clear_value: Option<wgt::Color>,
+        color_clear_value: Option<wgt::Color>,
+        depth_image: Option<RawImage>,
+        depth_clear_value: Option<f32>,
     },
     SetRenderPipeline {
         pipeline: alloc::sync::Arc<RenderPipelineInner>,
@@ -312,8 +314,7 @@ impl crate::CommandEncoder for CommandBuffer {
         &mut self,
         desc: &crate::RenderPassDescriptor<Resource, Resource>,
     ) -> DeviceResult<()> {
-        if desc.depth_stencil_attachment.is_some()
-            || desc.multiview_mask.is_some()
+        if desc.multiview_mask.is_some()
             || desc.timestamp_writes.is_some()
             || desc.occlusion_query_set.is_some()
             || desc.sample_count != 1
@@ -346,10 +347,14 @@ impl crate::CommandEncoder for CommandBuffer {
             } else {
                 return Err(crate::DeviceError::Lost);
             };
+            let (depth_image, depth_clear_value) =
+                depth_attachment(desc.depth_stencil_attachment.as_ref(), *extent)?;
             self.commands.push(Command::BeginRenderPass {
                 image: *image,
                 extent: *extent,
-                clear_value,
+                color_clear_value: clear_value,
+                depth_image,
+                depth_clear_value,
             });
         }
         Ok(())
@@ -640,7 +645,9 @@ impl Command {
             Command::BeginRenderPass {
                 image,
                 extent,
-                clear_value,
+                color_clear_value,
+                depth_image,
+                depth_clear_value,
             } => {
                 state.target = Some(RenderTarget {
                     image: *image,
@@ -650,7 +657,15 @@ impl Command {
                 state.scissor = None;
                 state.blend_constants = [0.0; 4];
                 unsafe {
-                    submit_begin_render_pass(queue, surface_queue, *image, *extent, *clear_value)
+                    submit_begin_render_pass(
+                        queue,
+                        surface_queue,
+                        *image,
+                        *extent,
+                        *color_clear_value,
+                        *depth_image,
+                        *depth_clear_value,
+                    )
                 }
             }
             Command::SetRenderPipeline { pipeline } => {
@@ -813,6 +828,51 @@ impl Command {
     }
 }
 
+fn depth_attachment(
+    attachment: Option<&crate::DepthStencilAttachment<'_, Resource>>,
+    expected_extent: wgt::Extent3d,
+) -> DeviceResult<(Option<RawImage>, Option<f32>)> {
+    let Some(attachment) = attachment else {
+        return Ok((None, None));
+    };
+    if !attachment.stencil_ops.is_empty()
+        || attachment
+            .depth_ops
+            .contains(crate::AttachmentOps::STORE_DISCARD)
+        || !attachment.depth_ops.contains(crate::AttachmentOps::STORE)
+    {
+        return Err(crate::DeviceError::Lost);
+    }
+    if !attachment
+        .target
+        .usage
+        .contains(wgt::TextureUses::DEPTH_STENCIL_WRITE)
+    {
+        return Err(crate::DeviceError::Lost);
+    }
+    let Resource::TextureView { image, extent, .. } = attachment.target.view else {
+        return Err(crate::DeviceError::Lost);
+    };
+    if *extent != expected_extent {
+        return Err(crate::DeviceError::Lost);
+    }
+    let clear_value = if attachment
+        .depth_ops
+        .contains(crate::AttachmentOps::LOAD_CLEAR)
+    {
+        Some(attachment.clear_value.0)
+    } else if attachment.depth_ops.contains(crate::AttachmentOps::LOAD)
+        || attachment
+            .depth_ops
+            .contains(crate::AttachmentOps::LOAD_DONT_CARE)
+    {
+        None
+    } else {
+        return Err(crate::DeviceError::Lost);
+    };
+    Ok((Some(*image), clear_value))
+}
+
 #[cfg(target_os = "horizon")]
 unsafe fn submit_copy_buffer_to_texture(
     queue: &Queue,
@@ -914,11 +974,18 @@ unsafe fn submit_begin_render_pass(
     image: RawImage,
     extent: wgt::Extent3d,
     clear_value: Option<wgt::Color>,
+    depth_image: Option<RawImage>,
+    depth_clear_value: Option<f32>,
 ) -> DeviceResult<()> {
     unsafe {
         submit_deko_commands(queue, surface_queue, |cmdbuf| {
             let image_view = dk::DkImageView::defaults(image.0);
-            dk::dkCmdBufBindRenderTarget(cmdbuf, &image_view, ptr::null());
+            let depth_image_view =
+                depth_image.map(|depth_image| dk::DkImageView::defaults(depth_image.0));
+            let depth_image_view_ptr = depth_image_view
+                .as_ref()
+                .map_or(ptr::null(), |view| ptr::from_ref(view));
+            dk::dkCmdBufBindRenderTarget(cmdbuf, &image_view, depth_image_view_ptr);
             let viewport = dk::DkViewport {
                 x: 0.0,
                 y: 0.0,
@@ -946,6 +1013,9 @@ unsafe fn submit_begin_render_pass(
                     clear_value.a as f32,
                 );
             }
+            if let Some(depth_clear_value) = depth_clear_value {
+                dk::dkCmdBufClearDepthStencil(cmdbuf, true, depth_clear_value, 0, 0);
+            }
             Ok(())
         })
     }
@@ -958,6 +1028,8 @@ unsafe fn submit_begin_render_pass(
     _image: RawImage,
     _extent: wgt::Extent3d,
     _clear_value: Option<wgt::Color>,
+    _depth_image: Option<RawImage>,
+    _depth_clear_value: Option<f32>,
 ) -> DeviceResult<()> {
     Err(crate::DeviceError::Lost)
 }
@@ -1224,6 +1296,7 @@ unsafe fn submit_deko_draw(
             dk::dkCmdBufBindColorState(cmdbuf, &pipeline.color_state);
             dk::dkCmdBufBindColorWriteState(cmdbuf, &pipeline.color_write_state);
             dk::dkCmdBufBindBlendStates(cmdbuf, 0, &pipeline.blend_state, 1);
+            dk::dkCmdBufBindDepthStencilState(cmdbuf, &pipeline.depth_stencil_state);
             dk::dkCmdBufSetBlendConst(
                 cmdbuf,
                 state.blend_constants[0],
