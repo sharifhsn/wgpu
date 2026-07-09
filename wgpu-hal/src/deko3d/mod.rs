@@ -98,6 +98,12 @@ pub enum BindGroupLayoutKind {
         read_only: bool,
         has_dynamic_offset: bool,
     },
+    StorageTexture {
+        binding: u32,
+        visibility: wgt::ShaderStages,
+        access: wgt::StorageTextureAccess,
+        format: wgt::TextureFormat,
+    },
     BufferGroup(Vec<BufferBindGroupLayoutKind>),
 }
 
@@ -269,6 +275,7 @@ pub(super) enum BindGroupInnerRaw {
     },
     UniformBuffer(UniformBufferBinding),
     StorageBuffer(StorageBufferBinding),
+    StorageTexture(StorageTextureBinding),
     BufferGroup(Vec<BufferBinding>),
 }
 
@@ -300,6 +307,21 @@ pub(super) struct StorageBufferBinding {
     buffer: Buffer,
     offset: wgt::BufferAddress,
     size: Option<wgt::BufferSize>,
+}
+
+#[cfg(target_os = "horizon")]
+pub(super) struct StorageTextureBinding {
+    binding: u32,
+    visibility: wgt::ShaderStages,
+    #[allow(dead_code)]
+    access: wgt::StorageTextureAccess,
+    #[allow(dead_code)]
+    format: wgt::TextureFormat,
+    #[allow(dead_code)]
+    texture: Arc<TextureInner>,
+    descriptor_mem_block: dk::DkMemBlock,
+    image_descriptor_gpu_addr: dk::DkGpuAddr,
+    image_descriptor: dk::DkImageDescriptor,
 }
 
 #[cfg(target_os = "horizon")]
@@ -367,6 +389,7 @@ const CMDMEMSIZE: u32 = 16 * 1024;
 const DEKO_UNIFORM_BUFFER_COUNT: u32 = 16;
 const DEKO_UNIFORM_BUF_MAX_SIZE: u64 = 0x10000;
 const DEKO_STORAGE_BUFFER_COUNT: u32 = 16;
+const DEKO_IMAGE_BINDING_COUNT: u32 = 8;
 
 impl fmt::Debug for Surface {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -643,6 +666,9 @@ impl BindGroupInner {
             BindGroupInnerRaw::StorageBuffer(binding) => unsafe {
                 binding.bind(cmdbuf, dynamic_offsets)?;
             },
+            BindGroupInnerRaw::StorageTexture(binding) => unsafe {
+                binding.bind(cmdbuf, dynamic_offsets)?;
+            },
             BindGroupInnerRaw::BufferGroup(bindings) => {
                 let mut dynamic_offsets = dynamic_offsets.iter();
                 for binding in bindings {
@@ -801,6 +827,39 @@ impl StorageBufferBinding {
     }
 }
 
+#[cfg(target_os = "horizon")]
+impl StorageTextureBinding {
+    unsafe fn bind(
+        &self,
+        cmdbuf: dk::DkCmdBuf,
+        dynamic_offsets: &[wgt::DynamicOffset],
+    ) -> DeviceResult<()> {
+        if !dynamic_offsets.is_empty() {
+            return Err(crate::DeviceError::Lost);
+        }
+        unsafe {
+            dk::dkCmdBufPushData(
+                cmdbuf,
+                self.image_descriptor_gpu_addr,
+                ptr::addr_of!(self.image_descriptor).cast(),
+                size_of::<dk::DkImageDescriptor>() as u32,
+            );
+            dk::dkCmdBufBindImageDescriptorSet(cmdbuf, self.image_descriptor_gpu_addr, 1);
+            let handle = dk::dkMakeImageHandle(0);
+            if self.visibility.contains(wgt::ShaderStages::VERTEX) {
+                dk::dkCmdBufBindImage(cmdbuf, dk::DkStage::DkStage_Vertex, self.binding, handle);
+            }
+            if self.visibility.contains(wgt::ShaderStages::FRAGMENT) {
+                dk::dkCmdBufBindImage(cmdbuf, dk::DkStage::DkStage_Fragment, self.binding, handle);
+            }
+            if self.visibility.contains(wgt::ShaderStages::COMPUTE) {
+                dk::dkCmdBufBindImage(cmdbuf, dk::DkStage::DkStage_Compute, self.binding, handle);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Queue {
     #[cfg(target_os = "horizon")]
     pub(super) fn raw_queue(&self) -> RawQueueHandle {
@@ -914,14 +973,20 @@ impl Drop for TextureInnerRaw {
 #[cfg(target_os = "horizon")]
 impl Drop for BindGroupInnerRaw {
     fn drop(&mut self) {
-        if let Self::TextureSampler {
-            descriptor_mem_block,
-            ..
-        } = self
-        {
-            if !descriptor_mem_block.is_null() {
-                unsafe { dk::dkMemBlockDestroy(*descriptor_mem_block) };
+        match self {
+            Self::TextureSampler {
+                descriptor_mem_block,
+                ..
             }
+            | Self::StorageTexture(StorageTextureBinding {
+                descriptor_mem_block,
+                ..
+            }) => {
+                if !descriptor_mem_block.is_null() {
+                    unsafe { dk::dkMemBlockDestroy(*descriptor_mem_block) };
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -1509,6 +1574,13 @@ impl TextureInner {
         {
             image_layout_maker.flags |= dk::DkImageFlags_Usage2DEngine;
         }
+        if desc.usage.intersects(
+            wgt::TextureUses::STORAGE_READ_ONLY
+                | wgt::TextureUses::STORAGE_WRITE_ONLY
+                | wgt::TextureUses::STORAGE_READ_WRITE,
+        ) {
+            image_layout_maker.flags |= dk::DkImageFlags_UsageLoadStore;
+        }
         image_layout_maker.msMode = ms_mode;
         image_layout_maker.dimensions[0] = desc.size.width;
         image_layout_maker.dimensions[1] = desc.size.height;
@@ -1576,6 +1648,7 @@ fn texture_format_support(format: wgt::TextureFormat) -> Option<TextureFormatSup
                 usage: TextureUsageRequirement::Intersects(
                     wgt::TextureUses::RESOURCE
                         | wgt::TextureUses::COPY_DST
+                        | wgt::TextureUses::STORAGE_WRITE_ONLY
                         | wgt::TextureUses::COLOR_TARGET,
                 ),
             })
@@ -1606,6 +1679,11 @@ fn deko3d_texture_format_capabilities(
                 | crate::TextureFormatCapabilities::COLOR_ATTACHMENT_BLEND
                 | crate::TextureFormatCapabilities::COPY_SRC
                 | crate::TextureFormatCapabilities::COPY_DST
+                | if format == wgt::TextureFormat::Rgba8Unorm {
+                    crate::TextureFormatCapabilities::STORAGE_WRITE_ONLY
+                } else {
+                    crate::TextureFormatCapabilities::empty()
+                }
         }
         wgt::TextureFormat::Depth32Float | wgt::TextureFormat::Stencil8 => {
             crate::TextureFormatCapabilities::DEPTH_STENCIL_ATTACHMENT
@@ -1683,6 +1761,14 @@ impl BindGroupInner {
                 *read_only,
                 *has_dynamic_offset,
             ),
+            BindGroupLayoutKind::StorageTexture {
+                binding,
+                visibility,
+                access,
+                format,
+            } => unsafe {
+                Self::new_storage_texture(raw_device, desc, *binding, *visibility, *access, *format)
+            },
             BindGroupLayoutKind::BufferGroup(entries) => Self::new_buffer_group(desc, entries),
         }
     }
@@ -1768,6 +1854,96 @@ impl BindGroupInner {
                 image_descriptor,
                 sampler_descriptor,
             },
+        })
+    }
+
+    unsafe fn new_storage_texture(
+        raw_device: dk::DkDevice,
+        desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
+        binding: u32,
+        visibility: wgt::ShaderStages,
+        access: wgt::StorageTextureAccess,
+        format: wgt::TextureFormat,
+    ) -> DeviceResult<Self> {
+        if !desc.buffers.is_empty()
+            || !desc.samplers.is_empty()
+            || desc.textures.len() != 1
+            || !desc.acceleration_structures.is_empty()
+            || !desc.external_textures.is_empty()
+            || desc.entries.len() != 1
+        {
+            return Err(crate::DeviceError::Lost);
+        }
+
+        let entry = &desc.entries[0];
+        if entry.binding != binding || entry.resource_index != 0 || entry.count != 1 {
+            return Err(crate::DeviceError::Lost);
+        }
+
+        let texture_binding = &desc.textures[0];
+        if access != wgt::StorageTextureAccess::WriteOnly
+            || format != wgt::TextureFormat::Rgba8Unorm
+            || !texture_binding
+                .usage
+                .contains(wgt::TextureUses::STORAGE_WRITE_ONLY)
+        {
+            return Err(crate::DeviceError::Lost);
+        }
+        let Resource::TextureView {
+            image,
+            base_mip_level,
+            mip_level_count,
+            base_array_layer,
+            array_layer_count,
+            owner: Some(texture),
+            ..
+        } = texture_binding.view
+        else {
+            return Err(crate::DeviceError::Lost);
+        };
+
+        if *mip_level_count != 1 || *base_array_layer != 0 || *array_layer_count != 1 {
+            return Err(crate::DeviceError::Lost);
+        }
+
+        let descriptor_size = align_up(
+            size_of::<dk::DkImageDescriptor>() as u32,
+            dk::DK_IMAGE_DESCRIPTOR_ALIGNMENT,
+        );
+        let allocation_size = align_up(descriptor_size, dk::DK_MEMBLOCK_ALIGNMENT);
+        let mut mem_block_maker = dk::DkMemBlockMaker::defaults(raw_device, allocation_size);
+        mem_block_maker.flags = dk::DkMemBlockFlags_CpuUncached | dk::DkMemBlockFlags_GpuCached;
+        let descriptor_mem_block = unsafe { dk::dkMemBlockCreate(&mem_block_maker) };
+        if descriptor_mem_block.is_null() {
+            return Err(crate::DeviceError::OutOfMemory);
+        }
+        let descriptor_gpu_addr = unsafe { dk::dkMemBlockGetGpuAddr(descriptor_mem_block) };
+        if descriptor_gpu_addr == u64::MAX {
+            unsafe { dk::dkMemBlockDestroy(descriptor_mem_block) };
+            return Err(crate::DeviceError::Lost);
+        }
+
+        let mut image_descriptor = dk::DkImageDescriptor::zeroed();
+        let mut image_view = dk::DkImageView::defaults(image.0);
+        image_view.mipLevelOffset = *base_mip_level;
+        image_view.mipLevelCount = 1;
+        image_view.layerOffset = 0;
+        image_view.layerCount = 1;
+        unsafe {
+            dk::dkImageDescriptorInitialize(&mut image_descriptor, &image_view, true, false);
+        }
+
+        Ok(Self {
+            inner: BindGroupInnerRaw::StorageTexture(StorageTextureBinding {
+                binding,
+                visibility,
+                access,
+                format,
+                texture: texture.clone(),
+                descriptor_mem_block,
+                image_descriptor_gpu_addr: descriptor_gpu_addr,
+                image_descriptor,
+            }),
         })
     }
 
@@ -1996,7 +2172,10 @@ fn supported_bind_group_layout_kind(
     entries: &[wgt::BindGroupLayoutEntry],
 ) -> Option<BindGroupLayoutKind> {
     if entries.len() == 1 {
-        return supported_buffer_bind_group_layout_kind(entries[0]);
+        if let Some(kind) = supported_buffer_bind_group_layout_kind(entries[0]) {
+            return Some(kind);
+        }
+        return supported_storage_texture_bind_group_layout_kind(entries[0]);
     }
 
     if entries.len() == 2 {
@@ -2024,10 +2203,14 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
     let mut vertex_storage_bindings = 0u32;
     let mut fragment_storage_bindings = 0u32;
     let mut compute_storage_bindings = 0u32;
+    let mut has_storage_texture = false;
+    let mut vertex_image_bindings = 0u32;
+    let mut fragment_image_bindings = 0u32;
+    let mut compute_image_bindings = 0u32;
     for layout in bind_group_layouts.iter().flatten() {
         match layout {
             Resource::BindGroupLayout(BindGroupLayoutKind::TextureSampler) => {
-                if has_texture_sampler {
+                if has_texture_sampler || has_storage_texture {
                     return false;
                 }
                 has_texture_sampler = true;
@@ -2084,6 +2267,37 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
                         return false;
                     }
                     compute_storage_bindings |= binding_mask;
+                }
+            }
+            Resource::BindGroupLayout(BindGroupLayoutKind::StorageTexture {
+                binding,
+                visibility,
+                ..
+            }) => {
+                if has_texture_sampler {
+                    return false;
+                }
+                has_storage_texture = true;
+                let Some(binding_mask) = 1u32.checked_shl(*binding) else {
+                    return false;
+                };
+                if visibility.contains(wgt::ShaderStages::VERTEX) {
+                    if vertex_image_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    vertex_image_bindings |= binding_mask;
+                }
+                if visibility.contains(wgt::ShaderStages::FRAGMENT) {
+                    if fragment_image_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    fragment_image_bindings |= binding_mask;
+                }
+                if visibility.contains(wgt::ShaderStages::COMPUTE) {
+                    if compute_image_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    compute_image_bindings |= binding_mask;
                 }
             }
             Resource::BindGroupLayout(BindGroupLayoutKind::BufferGroup(entries)) => {
@@ -2172,6 +2386,35 @@ fn supported_texture_bind_group_layout_kind(
         }
     }
     (has_texture && has_sampler).then_some(BindGroupLayoutKind::TextureSampler)
+}
+
+fn supported_storage_texture_bind_group_layout_kind(
+    entry: wgt::BindGroupLayoutEntry,
+) -> Option<BindGroupLayoutKind> {
+    if entry.count.is_some()
+        || entry.visibility.is_empty()
+        || entry.binding >= DEKO_IMAGE_BINDING_COUNT
+    {
+        return None;
+    }
+
+    match entry.ty {
+        wgt::BindingType::StorageTexture {
+            access: wgt::StorageTextureAccess::WriteOnly,
+            format: wgt::TextureFormat::Rgba8Unorm,
+            view_dimension: wgt::TextureViewDimension::D2,
+        } if (wgt::ShaderStages::VERTEX_FRAGMENT | wgt::ShaderStages::COMPUTE)
+            .contains(entry.visibility) =>
+        {
+            Some(BindGroupLayoutKind::StorageTexture {
+                binding: entry.binding,
+                visibility: entry.visibility,
+                access: wgt::StorageTextureAccess::WriteOnly,
+                format: wgt::TextureFormat::Rgba8Unorm,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn supported_buffer_bind_group_layout_kind(
