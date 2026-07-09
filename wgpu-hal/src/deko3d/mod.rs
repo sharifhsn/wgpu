@@ -113,7 +113,7 @@ pub enum BindGroupLayoutKind {
     BufferGroup(Vec<BufferBindGroupLayoutKind>),
     BufferStorageTextureGroup {
         buffers: Vec<BufferBindGroupLayoutKind>,
-        storage_texture: StorageTextureBindGroupLayoutKind,
+        storage_textures: Vec<StorageTextureBindGroupLayoutKind>,
     },
     BufferTextureSamplerGroup {
         buffers: Vec<BufferBindGroupLayoutKind>,
@@ -121,10 +121,8 @@ pub enum BindGroupLayoutKind {
     },
     BufferTextureSamplerStorageTextureGroup {
         buffers: Vec<BufferBindGroupLayoutKind>,
-        texture_binding: u32,
-        sampler_binding: u32,
-        texture_visibility: wgt::ShaderStages,
-        storage_texture: StorageTextureBindGroupLayoutKind,
+        texture_sampler: TextureSamplerBindGroupLayoutKind,
+        storage_textures: Vec<StorageTextureBindGroupLayoutKind>,
     },
 }
 
@@ -312,12 +310,12 @@ pub(super) enum BindGroupInnerRaw {
     },
     BufferStorageTextureGroup {
         buffers: Vec<BufferBinding>,
-        storage_texture: StorageTextureBinding,
+        storage_textures: Vec<StorageTextureBinding>,
     },
     BufferTextureSamplerStorageTextureGroup {
         buffers: Vec<BufferBinding>,
         texture_sampler: TextureSamplerBinding,
-        storage_texture: StorageTextureBinding,
+        storage_textures: Vec<StorageTextureBinding>,
     },
 }
 
@@ -859,7 +857,7 @@ impl BindGroupInner {
             }
             BindGroupInnerRaw::BufferStorageTextureGroup {
                 buffers,
-                storage_texture,
+                storage_textures,
             } => {
                 let mut dynamic_offsets = dynamic_offsets.iter();
                 for binding in buffers {
@@ -873,12 +871,14 @@ impl BindGroupInner {
                 if dynamic_offsets.next().is_some() {
                     return Err(crate::DeviceError::Lost);
                 }
-                unsafe { storage_texture.bind(cmdbuf, &[])? };
+                for storage_texture in storage_textures {
+                    unsafe { storage_texture.bind(cmdbuf, &[])? };
+                }
             }
             BindGroupInnerRaw::BufferTextureSamplerStorageTextureGroup {
                 buffers,
                 texture_sampler,
-                storage_texture,
+                storage_textures,
             } => {
                 let mut dynamic_offsets = dynamic_offsets.iter();
                 for binding in buffers {
@@ -894,7 +894,9 @@ impl BindGroupInner {
                 }
                 unsafe {
                     texture_sampler.bind(cmdbuf, &[])?;
-                    storage_texture.bind(cmdbuf, &[])?;
+                    for storage_texture in storage_textures {
+                        storage_texture.bind(cmdbuf, &[])?;
+                    }
                 }
             }
         }
@@ -2063,30 +2065,26 @@ impl BindGroupInner {
             },
             BindGroupLayoutKind::BufferStorageTextureGroup {
                 buffers,
-                storage_texture,
+                storage_textures,
             } => unsafe {
                 Self::new_buffer_storage_texture_group(
                     texture_descriptor_heap,
                     desc,
                     buffers,
-                    *storage_texture,
+                    storage_textures,
                 )
             },
             BindGroupLayoutKind::BufferTextureSamplerStorageTextureGroup {
                 buffers,
-                texture_binding,
-                sampler_binding,
-                texture_visibility,
-                storage_texture,
+                texture_sampler,
+                storage_textures,
             } => unsafe {
                 Self::new_buffer_texture_sampler_storage_texture_group(
                     texture_descriptor_heap,
                     desc,
                     buffers,
-                    *texture_binding,
-                    *sampler_binding,
-                    *texture_visibility,
-                    *storage_texture,
+                    *texture_sampler,
+                    storage_textures,
                 )
             },
         }
@@ -2528,14 +2526,14 @@ impl BindGroupInner {
         texture_descriptor_heap: &TextureDescriptorHeap,
         desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
         buffer_layouts: &[BufferBindGroupLayoutKind],
-        storage_texture_layout: StorageTextureBindGroupLayoutKind,
+        storage_texture_layouts: &[StorageTextureBindGroupLayoutKind],
     ) -> DeviceResult<Self> {
         if desc.buffers.len() != buffer_layouts.len()
             || !desc.samplers.is_empty()
-            || desc.textures.len() != 1
+            || desc.textures.len() != storage_texture_layouts.len()
             || !desc.acceleration_structures.is_empty()
             || !desc.external_textures.is_empty()
-            || desc.entries.len() != buffer_layouts.len() + 1
+            || desc.entries.len() != buffer_layouts.len() + storage_texture_layouts.len()
         {
             return Err(crate::DeviceError::Lost);
         }
@@ -2586,34 +2584,37 @@ impl BindGroupInner {
             }
         }
 
-        let Some(entry) = desc
-            .entries
-            .iter()
-            .find(|entry| entry.binding == storage_texture_layout.binding)
-        else {
-            return Err(crate::DeviceError::Lost);
-        };
-        if entry.count != 1 {
-            return Err(crate::DeviceError::Lost);
+        let mut storage_textures = Vec::with_capacity(storage_texture_layouts.len());
+        for storage_texture_layout in storage_texture_layouts {
+            let Some(entry) = desc
+                .entries
+                .iter()
+                .find(|entry| entry.binding == storage_texture_layout.binding)
+            else {
+                return Err(crate::DeviceError::Lost);
+            };
+            if entry.count != 1 {
+                return Err(crate::DeviceError::Lost);
+            }
+            let Some(texture_binding) = desc.textures.get(entry.resource_index as usize) else {
+                return Err(crate::DeviceError::Lost);
+            };
+            storage_textures.push(unsafe {
+                Self::make_storage_texture_binding(
+                    texture_descriptor_heap,
+                    storage_texture_layout.binding,
+                    storage_texture_layout.visibility,
+                    storage_texture_layout.access,
+                    storage_texture_layout.format,
+                    texture_binding,
+                )?
+            });
         }
-        let Some(texture_binding) = desc.textures.get(entry.resource_index as usize) else {
-            return Err(crate::DeviceError::Lost);
-        };
-        let storage_texture = unsafe {
-            Self::make_storage_texture_binding(
-                texture_descriptor_heap,
-                storage_texture_layout.binding,
-                storage_texture_layout.visibility,
-                storage_texture_layout.access,
-                storage_texture_layout.format,
-                texture_binding,
-            )?
-        };
 
         Ok(Self {
             inner: BindGroupInnerRaw::BufferStorageTextureGroup {
                 buffers,
-                storage_texture,
+                storage_textures,
             },
         })
     }
@@ -2622,17 +2623,15 @@ impl BindGroupInner {
         texture_descriptor_heap: &TextureDescriptorHeap,
         desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
         buffer_layouts: &[BufferBindGroupLayoutKind],
-        texture_binding: u32,
-        sampler_binding: u32,
-        texture_visibility: wgt::ShaderStages,
-        storage_texture_layout: StorageTextureBindGroupLayoutKind,
+        texture_sampler_layout: TextureSamplerBindGroupLayoutKind,
+        storage_texture_layouts: &[StorageTextureBindGroupLayoutKind],
     ) -> DeviceResult<Self> {
         if desc.buffers.len() != buffer_layouts.len()
             || desc.samplers.len() != 1
-            || desc.textures.len() != 2
+            || desc.textures.len() != 1 + storage_texture_layouts.len()
             || !desc.acceleration_structures.is_empty()
             || !desc.external_textures.is_empty()
-            || desc.entries.len() != buffer_layouts.len() + 3
+            || desc.entries.len() != buffer_layouts.len() + 2 + storage_texture_layouts.len()
         {
             return Err(crate::DeviceError::Lost);
         }
@@ -2687,41 +2686,44 @@ impl BindGroupInner {
             Self::make_texture_sampler_binding(
                 texture_descriptor_heap,
                 desc,
-                texture_binding,
-                sampler_binding,
-                texture_visibility,
+                texture_sampler_layout.texture_binding,
+                texture_sampler_layout.sampler_binding,
+                texture_sampler_layout.visibility,
             )?
         };
 
-        let Some(entry) = desc
-            .entries
-            .iter()
-            .find(|entry| entry.binding == storage_texture_layout.binding)
-        else {
-            return Err(crate::DeviceError::Lost);
-        };
-        if entry.count != 1 {
-            return Err(crate::DeviceError::Lost);
+        let mut storage_textures = Vec::with_capacity(storage_texture_layouts.len());
+        for storage_texture_layout in storage_texture_layouts {
+            let Some(entry) = desc
+                .entries
+                .iter()
+                .find(|entry| entry.binding == storage_texture_layout.binding)
+            else {
+                return Err(crate::DeviceError::Lost);
+            };
+            if entry.count != 1 {
+                return Err(crate::DeviceError::Lost);
+            }
+            let Some(texture_binding) = desc.textures.get(entry.resource_index as usize) else {
+                return Err(crate::DeviceError::Lost);
+            };
+            storage_textures.push(unsafe {
+                Self::make_storage_texture_binding(
+                    texture_descriptor_heap,
+                    storage_texture_layout.binding,
+                    storage_texture_layout.visibility,
+                    storage_texture_layout.access,
+                    storage_texture_layout.format,
+                    texture_binding,
+                )?
+            });
         }
-        let Some(texture_binding) = desc.textures.get(entry.resource_index as usize) else {
-            return Err(crate::DeviceError::Lost);
-        };
-        let storage_texture = unsafe {
-            Self::make_storage_texture_binding(
-                texture_descriptor_heap,
-                storage_texture_layout.binding,
-                storage_texture_layout.visibility,
-                storage_texture_layout.access,
-                storage_texture_layout.format,
-                texture_binding,
-            )?
-        };
 
         Ok(Self {
             inner: BindGroupInnerRaw::BufferTextureSamplerStorageTextureGroup {
                 buffers,
                 texture_sampler,
-                storage_texture,
+                storage_textures,
             },
         })
     }
@@ -3116,37 +3118,39 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
             }
             Resource::BindGroupLayout(BindGroupLayoutKind::BufferStorageTextureGroup {
                 buffers,
-                storage_texture,
+                storage_textures,
             }) => {
-                let Some(binding_mask) = 1u32.checked_shl(storage_texture.binding) else {
-                    return false;
-                };
-                if storage_texture
-                    .visibility
-                    .contains(wgt::ShaderStages::VERTEX)
-                {
-                    if vertex_image_bindings & binding_mask != 0 {
+                for storage_texture in storage_textures {
+                    let Some(binding_mask) = 1u32.checked_shl(storage_texture.binding) else {
                         return false;
+                    };
+                    if storage_texture
+                        .visibility
+                        .contains(wgt::ShaderStages::VERTEX)
+                    {
+                        if vertex_image_bindings & binding_mask != 0 {
+                            return false;
+                        }
+                        vertex_image_bindings |= binding_mask;
                     }
-                    vertex_image_bindings |= binding_mask;
-                }
-                if storage_texture
-                    .visibility
-                    .contains(wgt::ShaderStages::FRAGMENT)
-                {
-                    if fragment_image_bindings & binding_mask != 0 {
-                        return false;
+                    if storage_texture
+                        .visibility
+                        .contains(wgt::ShaderStages::FRAGMENT)
+                    {
+                        if fragment_image_bindings & binding_mask != 0 {
+                            return false;
+                        }
+                        fragment_image_bindings |= binding_mask;
                     }
-                    fragment_image_bindings |= binding_mask;
-                }
-                if storage_texture
-                    .visibility
-                    .contains(wgt::ShaderStages::COMPUTE)
-                {
-                    if compute_image_bindings & binding_mask != 0 {
-                        return false;
+                    if storage_texture
+                        .visibility
+                        .contains(wgt::ShaderStages::COMPUTE)
+                    {
+                        if compute_image_bindings & binding_mask != 0 {
+                            return false;
+                        }
+                        compute_image_bindings |= binding_mask;
                     }
-                    compute_image_bindings |= binding_mask;
                 }
                 for entry in buffers {
                     let binding = entry.binding();
@@ -3201,38 +3205,14 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
             Resource::BindGroupLayout(
                 BindGroupLayoutKind::BufferTextureSamplerStorageTextureGroup {
                     buffers,
-                    texture_binding,
-                    texture_visibility,
-                    storage_texture,
-                    ..
+                    texture_sampler,
+                    storage_textures,
                 },
             ) => {
-                let Some(binding_mask) = 1u32.checked_shl(*texture_binding) else {
+                let Some(binding_mask) = 1u32.checked_shl(texture_sampler.texture_binding) else {
                     return false;
                 };
-                if texture_visibility.contains(wgt::ShaderStages::VERTEX) {
-                    if vertex_image_bindings & binding_mask != 0 {
-                        return false;
-                    }
-                    vertex_image_bindings |= binding_mask;
-                }
-                if texture_visibility.contains(wgt::ShaderStages::FRAGMENT) {
-                    if fragment_image_bindings & binding_mask != 0 {
-                        return false;
-                    }
-                    fragment_image_bindings |= binding_mask;
-                }
-                if texture_visibility.contains(wgt::ShaderStages::COMPUTE) {
-                    if compute_image_bindings & binding_mask != 0 {
-                        return false;
-                    }
-                    compute_image_bindings |= binding_mask;
-                }
-
-                let Some(binding_mask) = 1u32.checked_shl(storage_texture.binding) else {
-                    return false;
-                };
-                if storage_texture
+                if texture_sampler
                     .visibility
                     .contains(wgt::ShaderStages::VERTEX)
                 {
@@ -3241,7 +3221,7 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
                     }
                     vertex_image_bindings |= binding_mask;
                 }
-                if storage_texture
+                if texture_sampler
                     .visibility
                     .contains(wgt::ShaderStages::FRAGMENT)
                 {
@@ -3250,7 +3230,7 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
                     }
                     fragment_image_bindings |= binding_mask;
                 }
-                if storage_texture
+                if texture_sampler
                     .visibility
                     .contains(wgt::ShaderStages::COMPUTE)
                 {
@@ -3258,6 +3238,39 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
                         return false;
                     }
                     compute_image_bindings |= binding_mask;
+                }
+
+                for storage_texture in storage_textures {
+                    let Some(binding_mask) = 1u32.checked_shl(storage_texture.binding) else {
+                        return false;
+                    };
+                    if storage_texture
+                        .visibility
+                        .contains(wgt::ShaderStages::VERTEX)
+                    {
+                        if vertex_image_bindings & binding_mask != 0 {
+                            return false;
+                        }
+                        vertex_image_bindings |= binding_mask;
+                    }
+                    if storage_texture
+                        .visibility
+                        .contains(wgt::ShaderStages::FRAGMENT)
+                    {
+                        if fragment_image_bindings & binding_mask != 0 {
+                            return false;
+                        }
+                        fragment_image_bindings |= binding_mask;
+                    }
+                    if storage_texture
+                        .visibility
+                        .contains(wgt::ShaderStages::COMPUTE)
+                    {
+                        if compute_image_bindings & binding_mask != 0 {
+                            return false;
+                        }
+                        compute_image_bindings |= binding_mask;
+                    }
                 }
 
                 for entry in buffers {
@@ -3410,7 +3423,7 @@ fn supported_buffer_texture_sampler_storage_texture_bind_group_layout_kind_group
     let mut texture_binding = None;
     let mut sampler_binding = None;
     let mut texture_sampler_visibility = wgt::ShaderStages::empty();
-    let mut storage_texture = None;
+    let mut storage_textures = Vec::new();
     let mut bindings = 0u32;
 
     for entry in entries {
@@ -3426,9 +3439,7 @@ fn supported_buffer_texture_sampler_storage_texture_bind_group_layout_kind_group
         }
 
         if let Some(kind) = supported_storage_texture_binding_layout_kind(*entry) {
-            if storage_texture.replace(kind).is_some() {
-                return None;
-            }
+            storage_textures.push(kind);
             continue;
         }
 
@@ -3463,13 +3474,19 @@ fn supported_buffer_texture_sampler_storage_texture_bind_group_layout_kind_group
         }
     }
 
+    if storage_textures.is_empty() {
+        return None;
+    }
+
     Some(
         BindGroupLayoutKind::BufferTextureSamplerStorageTextureGroup {
             buffers: buffer_entries,
-            texture_binding: texture_binding?,
-            sampler_binding: sampler_binding?,
-            texture_visibility: texture_sampler_visibility,
-            storage_texture: storage_texture?,
+            texture_sampler: TextureSamplerBindGroupLayoutKind {
+                texture_binding: texture_binding?,
+                sampler_binding: sampler_binding?,
+                visibility: texture_sampler_visibility,
+            },
+            storage_textures,
         },
     )
 }
@@ -3550,7 +3567,7 @@ fn supported_buffer_storage_texture_bind_group_layout_kind_group(
     entries: &[wgt::BindGroupLayoutEntry],
 ) -> Option<BindGroupLayoutKind> {
     let mut buffer_entries = Vec::with_capacity(entries.len().saturating_sub(1));
-    let mut storage_texture = None;
+    let mut storage_textures = Vec::new();
     let mut bindings = 0u32;
     for entry in entries {
         let binding_mask = 1u32.checked_shl(entry.binding)?;
@@ -3565,19 +3582,16 @@ fn supported_buffer_storage_texture_bind_group_layout_kind_group(
         }
 
         let kind = supported_storage_texture_binding_layout_kind(*entry)?;
-        if storage_texture.replace(kind).is_some() {
-            return None;
-        }
+        storage_textures.push(kind);
     }
 
-    let storage_texture = storage_texture?;
-    if buffer_entries.is_empty() {
+    if buffer_entries.is_empty() || storage_textures.is_empty() {
         return None;
     }
 
     Some(BindGroupLayoutKind::BufferStorageTextureGroup {
         buffers: buffer_entries,
-        storage_texture,
+        storage_textures,
     })
 }
 
