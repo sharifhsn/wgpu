@@ -1953,7 +1953,9 @@ fn texture_format_support(format: wgt::TextureFormat) -> Option<TextureFormatSup
                 usage: TextureUsageRequirement::Intersects(
                     wgt::TextureUses::RESOURCE
                         | wgt::TextureUses::COPY_DST
+                        | wgt::TextureUses::STORAGE_READ_ONLY
                         | wgt::TextureUses::STORAGE_WRITE_ONLY
+                        | wgt::TextureUses::STORAGE_READ_WRITE
                         | wgt::TextureUses::COLOR_TARGET,
                 ),
             })
@@ -1991,7 +1993,9 @@ fn deko3d_texture_format_capabilities(
                 | crate::TextureFormatCapabilities::COPY_SRC
                 | crate::TextureFormatCapabilities::COPY_DST
                 | if format == wgt::TextureFormat::Rgba8Unorm {
-                    crate::TextureFormatCapabilities::STORAGE_WRITE_ONLY
+                    crate::TextureFormatCapabilities::STORAGE_READ_ONLY
+                        | crate::TextureFormatCapabilities::STORAGE_WRITE_ONLY
+                        | crate::TextureFormatCapabilities::STORAGE_READ_WRITE
                 } else {
                     crate::TextureFormatCapabilities::empty()
                 }
@@ -2343,11 +2347,14 @@ impl BindGroupInner {
         format: wgt::TextureFormat,
         texture_binding: &crate::TextureBinding<'_, Resource>,
     ) -> DeviceResult<StorageTextureBinding> {
-        if access != wgt::StorageTextureAccess::WriteOnly
-            || format != wgt::TextureFormat::Rgba8Unorm
-            || !texture_binding
-                .usage
-                .contains(wgt::TextureUses::STORAGE_WRITE_ONLY)
+        let required_usage = match access {
+            wgt::StorageTextureAccess::ReadOnly => wgt::TextureUses::STORAGE_READ_ONLY,
+            wgt::StorageTextureAccess::WriteOnly => wgt::TextureUses::STORAGE_WRITE_ONLY,
+            wgt::StorageTextureAccess::ReadWrite => wgt::TextureUses::STORAGE_READ_WRITE,
+            wgt::StorageTextureAccess::Atomic => return Err(crate::DeviceError::Lost),
+        };
+        if format != wgt::TextureFormat::Rgba8Unorm
+            || !texture_binding.usage.contains(required_usage)
         {
             return Err(crate::DeviceError::Lost);
         }
@@ -3501,19 +3508,27 @@ fn supported_storage_texture_binding_layout_kind(
 
     match entry.ty {
         wgt::BindingType::StorageTexture {
-            access: wgt::StorageTextureAccess::WriteOnly,
+            access,
             format: wgt::TextureFormat::Rgba8Unorm,
-            view_dimension:
+            view_dimension,
+        } if matches!(
+            (access, view_dimension),
+            (
+                wgt::StorageTextureAccess::ReadOnly | wgt::StorageTextureAccess::ReadWrite,
+                wgt::TextureViewDimension::D2 | wgt::TextureViewDimension::D2Array,
+            ) | (
+                wgt::StorageTextureAccess::WriteOnly,
                 wgt::TextureViewDimension::D2
-                | wgt::TextureViewDimension::D2Array
-                | wgt::TextureViewDimension::D3,
-        } if (wgt::ShaderStages::VERTEX_FRAGMENT | wgt::ShaderStages::COMPUTE)
+                    | wgt::TextureViewDimension::D2Array
+                    | wgt::TextureViewDimension::D3,
+            )
+        ) && (wgt::ShaderStages::VERTEX_FRAGMENT | wgt::ShaderStages::COMPUTE)
             .contains(entry.visibility) =>
         {
             Some(StorageTextureBindGroupLayoutKind {
                 binding: entry.binding,
                 visibility: entry.visibility,
-                access: wgt::StorageTextureAccess::WriteOnly,
+                access,
                 format: wgt::TextureFormat::Rgba8Unorm,
             })
         }
@@ -4042,6 +4057,7 @@ pub fn supported_features() -> wgt::Features {
     wgt::Features::PASSTHROUGH_SHADERS
         | wgt::Features::MAPPABLE_PRIMARY_BUFFERS
         | wgt::Features::MULTI_DRAW_INDIRECT_COUNT
+        | wgt::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
 }
 
 /// Conservative capabilities for the first Deko3D adapter slice.
