@@ -86,7 +86,11 @@ pub enum Resource {
 
 #[derive(Clone, Debug)]
 pub enum BindGroupLayoutKind {
-    TextureSampler,
+    TextureSampler {
+        texture_binding: u32,
+        sampler_binding: u32,
+        visibility: wgt::ShaderStages,
+    },
     UniformBuffer {
         binding: u32,
         visibility: wgt::ShaderStages,
@@ -275,6 +279,10 @@ struct SamplerInnerRaw {
 #[cfg(target_os = "horizon")]
 pub(super) enum BindGroupInnerRaw {
     TextureSampler {
+        texture_binding: u32,
+        visibility: wgt::ShaderStages,
+        #[allow(dead_code)]
+        sampler_binding: u32,
         #[allow(dead_code)]
         texture: Arc<TextureInner>,
         #[allow(dead_code)]
@@ -646,6 +654,8 @@ impl BindGroupInner {
     ) -> DeviceResult<()> {
         match &self.inner {
             BindGroupInnerRaw::TextureSampler {
+                texture_binding,
+                visibility,
                 image_descriptor_gpu_addr,
                 sampler_descriptor_gpu_addr,
                 image_descriptor,
@@ -669,12 +679,31 @@ impl BindGroupInner {
                 );
                 dk::dkCmdBufBindImageDescriptorSet(cmdbuf, *image_descriptor_gpu_addr, 1);
                 dk::dkCmdBufBindSamplerDescriptorSet(cmdbuf, *sampler_descriptor_gpu_addr, 1);
-                dk::dkCmdBufBindTexture(
-                    cmdbuf,
-                    dk::DkStage::DkStage_Fragment,
-                    0,
-                    dk::dkMakeTextureHandle(0, 0),
-                );
+                let handle = dk::dkMakeTextureHandle(0, 0);
+                if visibility.contains(wgt::ShaderStages::VERTEX) {
+                    dk::dkCmdBufBindTexture(
+                        cmdbuf,
+                        dk::DkStage::DkStage_Vertex,
+                        *texture_binding,
+                        handle,
+                    );
+                }
+                if visibility.contains(wgt::ShaderStages::FRAGMENT) {
+                    dk::dkCmdBufBindTexture(
+                        cmdbuf,
+                        dk::DkStage::DkStage_Fragment,
+                        *texture_binding,
+                        handle,
+                    );
+                }
+                if visibility.contains(wgt::ShaderStages::COMPUTE) {
+                    dk::dkCmdBufBindTexture(
+                        cmdbuf,
+                        dk::DkStage::DkStage_Compute,
+                        *texture_binding,
+                        handle,
+                    );
+                }
             },
             BindGroupInnerRaw::UniformBuffer(binding) => unsafe {
                 binding.bind(cmdbuf, dynamic_offsets)?;
@@ -1791,8 +1820,18 @@ impl BindGroupInner {
             return Err(crate::DeviceError::Lost);
         };
         match kind {
-            BindGroupLayoutKind::TextureSampler => unsafe {
-                Self::new_texture_sampler(raw_device, desc)
+            BindGroupLayoutKind::TextureSampler {
+                texture_binding,
+                sampler_binding,
+                visibility,
+            } => unsafe {
+                Self::new_texture_sampler(
+                    raw_device,
+                    desc,
+                    *texture_binding,
+                    *sampler_binding,
+                    *visibility,
+                )
             },
             BindGroupLayoutKind::UniformBuffer {
                 binding,
@@ -1832,6 +1871,9 @@ impl BindGroupInner {
     unsafe fn new_texture_sampler(
         raw_device: dk::DkDevice,
         desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
+        texture_binding: u32,
+        sampler_binding: u32,
+        visibility: wgt::ShaderStages,
     ) -> DeviceResult<Self> {
         if desc.buffers.len() != 0
             || desc.samplers.len() != 1
@@ -1843,11 +1885,42 @@ impl BindGroupInner {
             return Err(crate::DeviceError::Lost);
         }
 
-        let Resource::Sampler(sampler) = desc.samplers[0] else {
+        let Some(texture_entry) = desc
+            .entries
+            .iter()
+            .find(|entry| entry.binding == texture_binding)
+        else {
             return Err(crate::DeviceError::Lost);
         };
-        let texture_binding = &desc.textures[0];
-        if !texture_binding.usage.contains(wgt::TextureUses::RESOURCE) {
+        if texture_entry.count != 1 {
+            return Err(crate::DeviceError::Lost);
+        }
+        let Some(sampler_entry) = desc
+            .entries
+            .iter()
+            .find(|entry| entry.binding == sampler_binding)
+        else {
+            return Err(crate::DeviceError::Lost);
+        };
+        if sampler_entry.count != 1 {
+            return Err(crate::DeviceError::Lost);
+        }
+
+        let Some(sampler) = desc.samplers.get(sampler_entry.resource_index as usize) else {
+            return Err(crate::DeviceError::Lost);
+        };
+        let Resource::Sampler(sampler) = *sampler else {
+            return Err(crate::DeviceError::Lost);
+        };
+        let Some(texture_binding_resource) =
+            desc.textures.get(texture_entry.resource_index as usize)
+        else {
+            return Err(crate::DeviceError::Lost);
+        };
+        if !texture_binding_resource
+            .usage
+            .contains(wgt::TextureUses::RESOURCE)
+        {
             return Err(crate::DeviceError::Lost);
         }
         let Resource::TextureView {
@@ -1858,7 +1931,7 @@ impl BindGroupInner {
             array_layer_count,
             owner: Some(texture),
             ..
-        } = texture_binding.view
+        } = texture_binding_resource.view
         else {
             return Err(crate::DeviceError::Lost);
         };
@@ -1902,6 +1975,9 @@ impl BindGroupInner {
 
         Ok(Self {
             inner: BindGroupInnerRaw::TextureSampler {
+                texture_binding,
+                visibility,
+                sampler_binding,
                 texture: texture.clone(),
                 sampler: sampler.clone(),
                 descriptor_mem_block,
@@ -2383,7 +2459,7 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
     let mut compute_image_bindings = 0u32;
     for layout in bind_group_layouts.iter().flatten() {
         match layout {
-            Resource::BindGroupLayout(BindGroupLayoutKind::TextureSampler) => {
+            Resource::BindGroupLayout(BindGroupLayoutKind::TextureSampler { .. }) => {
                 if has_texture_sampler || has_storage_texture {
                     return false;
                 }
@@ -2623,31 +2699,46 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
 fn supported_texture_bind_group_layout_kind(
     entries: &[wgt::BindGroupLayoutEntry],
 ) -> Option<BindGroupLayoutKind> {
-    let mut has_texture = false;
-    let mut has_sampler = false;
+    let mut texture_binding = None;
+    let mut sampler_binding = None;
+    let mut visibility = wgt::ShaderStages::empty();
     for entry in entries {
-        if entry.count.is_some() || !entry.visibility.contains(wgt::ShaderStages::FRAGMENT) {
+        if entry.count.is_some()
+            || entry.visibility.is_empty()
+            || !(wgt::ShaderStages::VERTEX_FRAGMENT | wgt::ShaderStages::COMPUTE)
+                .contains(entry.visibility)
+        {
             return None;
         }
         match (entry.binding, entry.ty) {
             (
-                0,
+                binding,
                 wgt::BindingType::Texture {
                     sample_type: wgt::TextureSampleType::Float { .. },
                     view_dimension: wgt::TextureViewDimension::D2,
                     multisampled: false,
                 },
-            ) => has_texture = true,
+            ) if binding < DEKO_IMAGE_BINDING_COUNT => {
+                texture_binding = Some(binding);
+                visibility |= entry.visibility;
+            }
             (
-                1,
+                binding,
                 wgt::BindingType::Sampler(
                     wgt::SamplerBindingType::Filtering | wgt::SamplerBindingType::NonFiltering,
                 ),
-            ) => has_sampler = true,
+            ) => {
+                sampler_binding = Some(binding);
+                visibility |= entry.visibility;
+            }
             _ => return None,
         }
     }
-    (has_texture && has_sampler).then_some(BindGroupLayoutKind::TextureSampler)
+    Some(BindGroupLayoutKind::TextureSampler {
+        texture_binding: texture_binding?,
+        sampler_binding: sampler_binding?,
+        visibility,
+    })
 }
 
 fn supported_storage_texture_bind_group_layout_kind(
