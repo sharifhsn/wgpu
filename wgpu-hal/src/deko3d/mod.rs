@@ -91,6 +91,11 @@ pub enum BindGroupLayoutKind {
         visibility: wgt::ShaderStages,
         has_dynamic_offset: bool,
     },
+    StorageBuffer {
+        binding: u32,
+        visibility: wgt::ShaderStages,
+        read_only: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -221,6 +226,7 @@ pub(super) enum BindGroupInnerRaw {
         sampler_descriptor: dk::DkSamplerDescriptor,
     },
     UniformBuffer(UniformBufferBinding),
+    StorageBuffer(StorageBufferBinding),
 }
 
 #[cfg(target_os = "horizon")]
@@ -229,6 +235,17 @@ pub(super) struct UniformBufferBinding {
     binding: u32,
     visibility: wgt::ShaderStages,
     has_dynamic_offset: bool,
+    buffer: Buffer,
+    offset: wgt::BufferAddress,
+    size: Option<wgt::BufferSize>,
+}
+
+#[cfg(target_os = "horizon")]
+#[derive(Clone, Debug)]
+pub(super) struct StorageBufferBinding {
+    binding: u32,
+    visibility: wgt::ShaderStages,
+    read_only: bool,
     buffer: Buffer,
     offset: wgt::BufferAddress,
     size: Option<wgt::BufferSize>,
@@ -294,6 +311,7 @@ const DEFAULT_HEIGHT: u32 = 720;
 const CMDMEMSIZE: u32 = 16 * 1024;
 const DEKO_UNIFORM_BUFFER_COUNT: u32 = 16;
 const DEKO_UNIFORM_BUF_MAX_SIZE: u64 = 0x10000;
+const DEKO_STORAGE_BUFFER_COUNT: u32 = 16;
 
 impl fmt::Debug for Surface {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -579,6 +597,33 @@ impl BindGroupInner {
                     }
                     if binding.visibility.contains(wgt::ShaderStages::FRAGMENT) {
                         dk::dkCmdBufBindUniformBuffer(
+                            cmdbuf,
+                            dk::DkStage::DkStage_Fragment,
+                            binding.binding,
+                            gpu_addr,
+                            gpu_size,
+                        );
+                    }
+                }
+            }
+            BindGroupInnerRaw::StorageBuffer(binding) => {
+                if !dynamic_offsets.is_empty() || !binding.read_only {
+                    return Err(crate::DeviceError::Lost);
+                }
+                let (gpu_addr, gpu_size) =
+                    binding.buffer.gpu_binding(binding.offset, binding.size)?;
+                unsafe {
+                    if binding.visibility.contains(wgt::ShaderStages::VERTEX) {
+                        dk::dkCmdBufBindStorageBuffer(
+                            cmdbuf,
+                            dk::DkStage::DkStage_Vertex,
+                            binding.binding,
+                            gpu_addr,
+                            gpu_size,
+                        );
+                    }
+                    if binding.visibility.contains(wgt::ShaderStages::FRAGMENT) {
+                        dk::dkCmdBufBindStorageBuffer(
                             cmdbuf,
                             dk::DkStage::DkStage_Fragment,
                             binding.binding,
@@ -1442,6 +1487,11 @@ impl BindGroupInner {
                 visibility,
                 has_dynamic_offset,
             } => Self::new_uniform_buffer(desc, binding, visibility, has_dynamic_offset),
+            BindGroupLayoutKind::StorageBuffer {
+                binding,
+                visibility,
+                read_only,
+            } => Self::new_storage_buffer(desc, binding, visibility, read_only),
         }
     }
 
@@ -1572,6 +1622,44 @@ impl BindGroupInner {
             }),
         })
     }
+
+    fn new_storage_buffer(
+        desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
+        binding: u32,
+        visibility: wgt::ShaderStages,
+        read_only: bool,
+    ) -> DeviceResult<Self> {
+        if desc.buffers.len() != 1
+            || !desc.samplers.is_empty()
+            || !desc.textures.is_empty()
+            || !desc.acceleration_structures.is_empty()
+            || !desc.external_textures.is_empty()
+            || desc.entries.len() != 1
+        {
+            return Err(crate::DeviceError::Lost);
+        }
+
+        let entry = &desc.entries[0];
+        if entry.binding != binding || entry.resource_index != 0 || entry.count != 1 {
+            return Err(crate::DeviceError::Lost);
+        }
+
+        let buffer = &desc.buffers[0];
+        if buffer.offset % u64::from(wgt::STORAGE_BINDING_SIZE_ALIGNMENT) != 0 {
+            return Err(crate::DeviceError::Lost);
+        }
+
+        Ok(Self {
+            inner: BindGroupInnerRaw::StorageBuffer(StorageBufferBinding {
+                binding,
+                visibility,
+                read_only,
+                buffer: buffer.buffer.clone(),
+                offset: buffer.offset,
+                size: buffer.size,
+            }),
+        })
+    }
 }
 
 #[cfg(target_os = "horizon")]
@@ -1625,7 +1713,7 @@ fn supported_bind_group_layout_kind(
     }
 
     if entries.len() == 1 {
-        return supported_uniform_bind_group_layout_kind(entries[0]);
+        return supported_buffer_bind_group_layout_kind(entries[0]);
     }
 
     None
@@ -1639,6 +1727,8 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
     let mut has_texture_sampler = false;
     let mut vertex_uniform_bindings = 0u32;
     let mut fragment_uniform_bindings = 0u32;
+    let mut vertex_storage_bindings = 0u32;
+    let mut fragment_storage_bindings = 0u32;
     for layout in bind_group_layouts.iter().flatten() {
         match layout {
             Resource::BindGroupLayout(BindGroupLayoutKind::TextureSampler) => {
@@ -1666,6 +1756,27 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
                         return false;
                     }
                     fragment_uniform_bindings |= binding_mask;
+                }
+            }
+            Resource::BindGroupLayout(BindGroupLayoutKind::StorageBuffer {
+                binding,
+                visibility,
+                ..
+            }) => {
+                let Some(binding_mask) = 1u32.checked_shl(*binding) else {
+                    return false;
+                };
+                if visibility.contains(wgt::ShaderStages::VERTEX) {
+                    if vertex_storage_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    vertex_storage_bindings |= binding_mask;
+                }
+                if visibility.contains(wgt::ShaderStages::FRAGMENT) {
+                    if fragment_storage_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    fragment_storage_bindings |= binding_mask;
                 }
             }
             _ => return false,
@@ -1705,13 +1816,12 @@ fn supported_texture_bind_group_layout_kind(
     (has_texture && has_sampler).then_some(BindGroupLayoutKind::TextureSampler)
 }
 
-fn supported_uniform_bind_group_layout_kind(
+fn supported_buffer_bind_group_layout_kind(
     entry: wgt::BindGroupLayoutEntry,
 ) -> Option<BindGroupLayoutKind> {
     if entry.count.is_some()
         || entry.visibility.is_empty()
         || !wgt::ShaderStages::VERTEX_FRAGMENT.contains(entry.visibility)
-        || entry.binding >= DEKO_UNIFORM_BUFFER_COUNT
     {
         return None;
     }
@@ -1721,7 +1831,7 @@ fn supported_uniform_bind_group_layout_kind(
             ty: wgt::BufferBindingType::Uniform,
             has_dynamic_offset,
             min_binding_size,
-        } => {
+        } if entry.binding < DEKO_UNIFORM_BUFFER_COUNT => {
             if min_binding_size.is_some_and(|size| size.get() > DEKO_UNIFORM_BUF_MAX_SIZE) {
                 return None;
             }
@@ -1729,6 +1839,17 @@ fn supported_uniform_bind_group_layout_kind(
                 binding: entry.binding,
                 visibility: entry.visibility,
                 has_dynamic_offset,
+            })
+        }
+        wgt::BindingType::Buffer {
+            ty: wgt::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: _,
+        } if entry.binding < DEKO_STORAGE_BUFFER_COUNT => {
+            Some(BindGroupLayoutKind::StorageBuffer {
+                binding: entry.binding,
+                visibility: entry.visibility,
+                read_only: true,
             })
         }
         _ => None,
