@@ -700,6 +700,7 @@ impl Command {
                 // Caller is responsible for ensuring this does not alias.
                 let buffer_slice: &mut [u8] = unsafe { &mut *buffer.get_slice_ptr(range.clone()) };
                 buffer_slice.fill(0);
+                upload_after_host_write(buffer)?;
                 Ok(())
             }
 
@@ -718,6 +719,7 @@ impl Command {
                         unsafe { &mut *dst.get_slice_ptr(dst_offset..dst_offset + size.get()) };
                     dst_region.copy_from_slice(src_region);
                 }
+                upload_after_host_write(dst)?;
                 Ok(())
             }
             Command::CopyBufferToTexture { src, dst, regions } => {
@@ -946,6 +948,18 @@ impl Command {
             Command::Error => Err(crate::DeviceError::Lost),
         }
     }
+}
+
+fn upload_after_host_write(buffer: &Buffer) -> DeviceResult<()> {
+    #[cfg(target_os = "horizon")]
+    unsafe {
+        buffer.upload_to_gpu()?;
+    }
+    #[cfg(not(target_os = "horizon"))]
+    {
+        let _ = buffer;
+    }
+    Ok(())
 }
 
 fn color_attachments(
