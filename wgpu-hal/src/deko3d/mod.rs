@@ -6,6 +6,8 @@ use core::{cell::UnsafeCell, ptr, sync::atomic::Ordering, time::Duration};
 use core::fmt;
 #[cfg(target_os = "horizon")]
 use core::mem::size_of;
+#[cfg(target_os = "horizon")]
+use core::sync::atomic::AtomicU32;
 
 #[cfg(supports_64bit_atomics)]
 use core::sync::atomic::AtomicU64;
@@ -169,6 +171,8 @@ type DeviceResult<T> = Result<T, crate::DeviceError>;
 struct DeviceInner {
     #[allow(dead_code)]
     raw: RawDevice,
+    #[cfg(target_os = "horizon")]
+    sampled_texture_descriptor_heap: SampledTextureDescriptorHeap,
 }
 
 struct SurfaceState {
@@ -327,11 +331,38 @@ pub(super) struct TextureSamplerBinding {
     texture: Arc<TextureInner>,
     #[allow(dead_code)]
     sampler: Arc<SamplerInner>,
-    descriptor_mem_block: dk::DkMemBlock,
+    image_descriptor_set_gpu_addr: dk::DkGpuAddr,
+    sampler_descriptor_set_gpu_addr: dk::DkGpuAddr,
     image_descriptor_gpu_addr: dk::DkGpuAddr,
     sampler_descriptor_gpu_addr: dk::DkGpuAddr,
+    image_descriptor_index: u32,
+    sampler_descriptor_index: u32,
+    descriptor_count: u32,
     image_descriptor: dk::DkImageDescriptor,
     sampler_descriptor: dk::DkSamplerDescriptor,
+}
+
+#[cfg(target_os = "horizon")]
+#[derive(Debug)]
+struct SampledTextureDescriptorHeap {
+    mem_block: dk::DkMemBlock,
+    image_descriptor_set_gpu_addr: dk::DkGpuAddr,
+    sampler_descriptor_set_gpu_addr: dk::DkGpuAddr,
+    image_descriptor_stride: u64,
+    sampler_descriptor_stride: u64,
+    capacity: u32,
+    next_slot: AtomicU32,
+}
+
+#[cfg(target_os = "horizon")]
+struct SampledTextureDescriptorSlot {
+    image_descriptor_set_gpu_addr: dk::DkGpuAddr,
+    sampler_descriptor_set_gpu_addr: dk::DkGpuAddr,
+    image_descriptor_gpu_addr: dk::DkGpuAddr,
+    sampler_descriptor_gpu_addr: dk::DkGpuAddr,
+    image_descriptor_index: u32,
+    sampler_descriptor_index: u32,
+    descriptor_count: u32,
 }
 
 #[cfg(target_os = "horizon")]
@@ -427,6 +458,8 @@ const DEKO_UNIFORM_BUFFER_COUNT: u32 = 16;
 const DEKO_UNIFORM_BUF_MAX_SIZE: u64 = 0x10000;
 const DEKO_STORAGE_BUFFER_COUNT: u32 = 16;
 const DEKO_IMAGE_BINDING_COUNT: u32 = 8;
+#[cfg(target_os = "horizon")]
+const DEKO_SAMPLED_TEXTURE_DESCRIPTOR_COUNT: u32 = 256;
 
 impl fmt::Debug for Surface {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -570,6 +603,98 @@ impl DeviceInner {
     #[cfg(target_os = "horizon")]
     fn raw_device(&self) -> dk::DkDevice {
         self.raw.0
+    }
+
+    #[cfg(target_os = "horizon")]
+    fn sampled_texture_descriptor_heap(&self) -> &SampledTextureDescriptorHeap {
+        &self.sampled_texture_descriptor_heap
+    }
+}
+
+#[cfg(target_os = "horizon")]
+impl SampledTextureDescriptorHeap {
+    unsafe fn new(raw_device: dk::DkDevice) -> DeviceResult<Self> {
+        let image_descriptor_stride = u64::from(align_up(
+            size_of::<dk::DkImageDescriptor>() as u32,
+            dk::DK_IMAGE_DESCRIPTOR_ALIGNMENT,
+        ));
+        let sampler_descriptor_stride = u64::from(align_up(
+            size_of::<dk::DkSamplerDescriptor>() as u32,
+            dk::DK_SAMPLER_DESCRIPTOR_ALIGNMENT,
+        ));
+        let image_descriptor_bytes = image_descriptor_stride
+            .checked_mul(u64::from(DEKO_SAMPLED_TEXTURE_DESCRIPTOR_COUNT))
+            .ok_or(crate::DeviceError::Lost)?;
+        let sampler_descriptor_offset = u64::from(align_up(
+            u32::try_from(image_descriptor_bytes).map_err(|_| crate::DeviceError::Lost)?,
+            dk::DK_SAMPLER_DESCRIPTOR_ALIGNMENT,
+        ));
+        let sampler_descriptor_bytes = sampler_descriptor_stride
+            .checked_mul(u64::from(DEKO_SAMPLED_TEXTURE_DESCRIPTOR_COUNT))
+            .ok_or(crate::DeviceError::Lost)?;
+        let descriptor_bytes = sampler_descriptor_offset
+            .checked_add(sampler_descriptor_bytes)
+            .ok_or(crate::DeviceError::Lost)?;
+        let allocation_size = align_up(
+            u32::try_from(descriptor_bytes).map_err(|_| crate::DeviceError::Lost)?,
+            dk::DK_MEMBLOCK_ALIGNMENT,
+        );
+
+        let mut mem_block_maker = dk::DkMemBlockMaker::defaults(raw_device, allocation_size);
+        mem_block_maker.flags = dk::DkMemBlockFlags_CpuUncached | dk::DkMemBlockFlags_GpuCached;
+        let mem_block = unsafe { dk::dkMemBlockCreate(&mem_block_maker) };
+        if mem_block.is_null() {
+            return Err(crate::DeviceError::OutOfMemory);
+        }
+        let descriptor_gpu_addr = unsafe { dk::dkMemBlockGetGpuAddr(mem_block) };
+        if descriptor_gpu_addr == u64::MAX {
+            unsafe { dk::dkMemBlockDestroy(mem_block) };
+            return Err(crate::DeviceError::Lost);
+        }
+
+        Ok(Self {
+            mem_block,
+            image_descriptor_set_gpu_addr: descriptor_gpu_addr,
+            sampler_descriptor_set_gpu_addr: descriptor_gpu_addr + sampler_descriptor_offset,
+            image_descriptor_stride,
+            sampler_descriptor_stride,
+            capacity: DEKO_SAMPLED_TEXTURE_DESCRIPTOR_COUNT,
+            next_slot: AtomicU32::new(0),
+        })
+    }
+
+    fn allocate_slot(&self) -> DeviceResult<SampledTextureDescriptorSlot> {
+        let index = self
+            .next_slot
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                (next < self.capacity).then_some(next + 1)
+            })
+            .map_err(|_| crate::DeviceError::OutOfMemory)?;
+        Ok(SampledTextureDescriptorSlot {
+            image_descriptor_set_gpu_addr: self.image_descriptor_set_gpu_addr,
+            sampler_descriptor_set_gpu_addr: self.sampler_descriptor_set_gpu_addr,
+            image_descriptor_gpu_addr: self.image_descriptor_set_gpu_addr
+                + self.image_descriptor_stride * u64::from(index),
+            sampler_descriptor_gpu_addr: self.sampler_descriptor_set_gpu_addr
+                + self.sampler_descriptor_stride * u64::from(index),
+            image_descriptor_index: index,
+            sampler_descriptor_index: index,
+            descriptor_count: self.capacity,
+        })
+    }
+
+    unsafe fn destroy(&mut self) {
+        if !self.mem_block.is_null() {
+            unsafe { dk::dkMemBlockDestroy(self.mem_block) };
+            self.mem_block = ptr::null_mut();
+        }
+    }
+}
+
+#[cfg(target_os = "horizon")]
+impl Drop for SampledTextureDescriptorHeap {
+    fn drop(&mut self) {
+        unsafe { self.destroy() };
     }
 }
 
@@ -756,9 +881,18 @@ impl TextureSamplerBinding {
                 ptr::addr_of!(self.sampler_descriptor).cast(),
                 size_of::<dk::DkSamplerDescriptor>() as u32,
             );
-            dk::dkCmdBufBindImageDescriptorSet(cmdbuf, self.image_descriptor_gpu_addr, 1);
-            dk::dkCmdBufBindSamplerDescriptorSet(cmdbuf, self.sampler_descriptor_gpu_addr, 1);
-            let handle = dk::dkMakeTextureHandle(0, 0);
+            dk::dkCmdBufBindImageDescriptorSet(
+                cmdbuf,
+                self.image_descriptor_set_gpu_addr,
+                self.descriptor_count,
+            );
+            dk::dkCmdBufBindSamplerDescriptorSet(
+                cmdbuf,
+                self.sampler_descriptor_set_gpu_addr,
+                self.descriptor_count,
+            );
+            let handle =
+                dk::dkMakeTextureHandle(self.image_descriptor_index, self.sampler_descriptor_index);
             if self.visibility.contains(wgt::ShaderStages::VERTEX) {
                 dk::dkCmdBufBindTexture(
                     cmdbuf,
@@ -1020,6 +1154,7 @@ impl CommandRecorder {
 #[cfg(target_os = "horizon")]
 impl Drop for DeviceInner {
     fn drop(&mut self) {
+        unsafe { self.sampled_texture_descriptor_heap.destroy() };
         if !self.raw.0.is_null() {
             unsafe { dk::dkDeviceDestroy(self.raw.0) };
         }
@@ -1074,26 +1209,6 @@ impl Drop for TextureInnerRaw {
 impl Drop for BindGroupInnerRaw {
     fn drop(&mut self) {
         match self {
-            Self::TextureSampler(TextureSamplerBinding {
-                descriptor_mem_block,
-                ..
-            }) => {
-                if !descriptor_mem_block.is_null() {
-                    unsafe { dk::dkMemBlockDestroy(*descriptor_mem_block) };
-                }
-            }
-            Self::BufferTextureSamplerGroup {
-                texture_sampler:
-                    TextureSamplerBinding {
-                        descriptor_mem_block,
-                        ..
-                    },
-                ..
-            } => {
-                if !descriptor_mem_block.is_null() {
-                    unsafe { dk::dkMemBlockDestroy(*descriptor_mem_block) };
-                }
-            }
             Self::StorageTexture(StorageTextureBinding {
                 descriptor_mem_block,
                 ..
@@ -1863,6 +1978,7 @@ impl SamplerInner {
 impl BindGroupInner {
     unsafe fn new(
         raw_device: dk::DkDevice,
+        sampled_texture_descriptor_heap: &SampledTextureDescriptorHeap,
         desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
     ) -> DeviceResult<Self> {
         let Resource::BindGroupLayout(kind) = desc.layout else {
@@ -1875,7 +1991,7 @@ impl BindGroupInner {
                 visibility,
             } => unsafe {
                 Self::new_texture_sampler(
-                    raw_device,
+                    sampled_texture_descriptor_heap,
                     desc,
                     *texture_binding,
                     *sampler_binding,
@@ -1915,7 +2031,7 @@ impl BindGroupInner {
                 visibility,
             } => unsafe {
                 Self::new_buffer_texture_sampler_group(
-                    raw_device,
+                    sampled_texture_descriptor_heap,
                     desc,
                     buffers,
                     *texture_binding,
@@ -1933,7 +2049,7 @@ impl BindGroupInner {
     }
 
     unsafe fn new_texture_sampler(
-        raw_device: dk::DkDevice,
+        sampled_texture_descriptor_heap: &SampledTextureDescriptorHeap,
         desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
         texture_binding: u32,
         sampler_binding: u32,
@@ -1951,7 +2067,7 @@ impl BindGroupInner {
 
         let texture_sampler = unsafe {
             Self::make_texture_sampler_binding(
-                raw_device,
+                sampled_texture_descriptor_heap,
                 desc,
                 texture_binding,
                 sampler_binding,
@@ -1965,7 +2081,7 @@ impl BindGroupInner {
     }
 
     unsafe fn make_texture_sampler_binding(
-        raw_device: dk::DkDevice,
+        sampled_texture_descriptor_heap: &SampledTextureDescriptorHeap,
         desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
         texture_binding: u32,
         sampler_binding: u32,
@@ -2022,25 +2138,7 @@ impl BindGroupInner {
             return Err(crate::DeviceError::Lost);
         };
 
-        let descriptor_size = align_up(
-            size_of::<dk::DkImageDescriptor>() as u32,
-            dk::DK_IMAGE_DESCRIPTOR_ALIGNMENT,
-        ) + align_up(
-            size_of::<dk::DkSamplerDescriptor>() as u32,
-            dk::DK_SAMPLER_DESCRIPTOR_ALIGNMENT,
-        );
-        let allocation_size = align_up(descriptor_size, dk::DK_MEMBLOCK_ALIGNMENT);
-        let mut mem_block_maker = dk::DkMemBlockMaker::defaults(raw_device, allocation_size);
-        mem_block_maker.flags = dk::DkMemBlockFlags_CpuUncached | dk::DkMemBlockFlags_GpuCached;
-        let descriptor_mem_block = unsafe { dk::dkMemBlockCreate(&mem_block_maker) };
-        if descriptor_mem_block.is_null() {
-            return Err(crate::DeviceError::OutOfMemory);
-        }
-        let descriptor_gpu_addr = unsafe { dk::dkMemBlockGetGpuAddr(descriptor_mem_block) };
-        if descriptor_gpu_addr == u64::MAX {
-            unsafe { dk::dkMemBlockDestroy(descriptor_mem_block) };
-            return Err(crate::DeviceError::Lost);
-        }
+        let descriptor_slot = sampled_texture_descriptor_heap.allocate_slot()?;
 
         let mut image_descriptor = dk::DkImageDescriptor::zeroed();
         let mut image_view = dk::DkImageView::defaults(image.0);
@@ -2054,20 +2152,19 @@ impl BindGroupInner {
             dk::dkSamplerDescriptorInitialize(&mut sampler_descriptor, &sampler.inner.sampler);
         }
 
-        let sampler_offset = align_up(
-            size_of::<dk::DkImageDescriptor>() as u32,
-            dk::DK_SAMPLER_DESCRIPTOR_ALIGNMENT,
-        ) as u64;
-
         Ok(TextureSamplerBinding {
             texture_binding,
             visibility,
             sampler_binding,
             texture: texture.clone(),
             sampler: sampler.clone(),
-            descriptor_mem_block,
-            image_descriptor_gpu_addr: descriptor_gpu_addr,
-            sampler_descriptor_gpu_addr: descriptor_gpu_addr + sampler_offset,
+            image_descriptor_set_gpu_addr: descriptor_slot.image_descriptor_set_gpu_addr,
+            sampler_descriptor_set_gpu_addr: descriptor_slot.sampler_descriptor_set_gpu_addr,
+            image_descriptor_gpu_addr: descriptor_slot.image_descriptor_gpu_addr,
+            sampler_descriptor_gpu_addr: descriptor_slot.sampler_descriptor_gpu_addr,
+            image_descriptor_index: descriptor_slot.image_descriptor_index,
+            sampler_descriptor_index: descriptor_slot.sampler_descriptor_index,
+            descriptor_count: descriptor_slot.descriptor_count,
             image_descriptor,
             sampler_descriptor,
         })
@@ -2314,7 +2411,7 @@ impl BindGroupInner {
     }
 
     unsafe fn new_buffer_texture_sampler_group(
-        raw_device: dk::DkDevice,
+        sampled_texture_descriptor_heap: &SampledTextureDescriptorHeap,
         desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
         buffer_layouts: &[BufferBindGroupLayoutKind],
         texture_binding: u32,
@@ -2379,7 +2476,7 @@ impl BindGroupInner {
 
         let texture_sampler = unsafe {
             Self::make_texture_sampler_binding(
-                raw_device,
+                sampled_texture_descriptor_heap,
                 desc,
                 texture_binding,
                 sampler_binding,
@@ -2628,11 +2725,36 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
     let mut compute_image_bindings = 0u32;
     for layout in bind_group_layouts.iter().flatten() {
         match layout {
-            Resource::BindGroupLayout(BindGroupLayoutKind::TextureSampler { .. }) => {
-                if has_texture_sampler || has_storage_texture {
+            Resource::BindGroupLayout(BindGroupLayoutKind::TextureSampler {
+                texture_binding,
+                visibility,
+                ..
+            }) => {
+                if has_storage_texture {
                     return false;
                 }
                 has_texture_sampler = true;
+                let Some(binding_mask) = 1u32.checked_shl(*texture_binding) else {
+                    return false;
+                };
+                if visibility.contains(wgt::ShaderStages::VERTEX) {
+                    if vertex_image_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    vertex_image_bindings |= binding_mask;
+                }
+                if visibility.contains(wgt::ShaderStages::FRAGMENT) {
+                    if fragment_image_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    fragment_image_bindings |= binding_mask;
+                }
+                if visibility.contains(wgt::ShaderStages::COMPUTE) {
+                    if compute_image_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    compute_image_bindings |= binding_mask;
+                }
             }
             Resource::BindGroupLayout(BindGroupLayoutKind::UniformBuffer {
                 binding,
@@ -2772,12 +2894,35 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
             }
             Resource::BindGroupLayout(BindGroupLayoutKind::BufferTextureSamplerGroup {
                 buffers,
+                texture_binding,
+                visibility,
                 ..
             }) => {
-                if has_texture_sampler || has_storage_texture {
+                if has_storage_texture {
                     return false;
                 }
                 has_texture_sampler = true;
+                let Some(binding_mask) = 1u32.checked_shl(*texture_binding) else {
+                    return false;
+                };
+                if visibility.contains(wgt::ShaderStages::VERTEX) {
+                    if vertex_image_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    vertex_image_bindings |= binding_mask;
+                }
+                if visibility.contains(wgt::ShaderStages::FRAGMENT) {
+                    if fragment_image_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    fragment_image_bindings |= binding_mask;
+                }
+                if visibility.contains(wgt::ShaderStages::COMPUTE) {
+                    if compute_image_bindings & binding_mask != 0 {
+                        return false;
+                    }
+                    compute_image_bindings |= binding_mask;
+                }
                 for entry in buffers {
                     let binding = entry.binding();
                     let visibility = entry.visibility();
@@ -3258,9 +3403,22 @@ impl Adapter {
                 return Err(error);
             }
         };
+        let sampled_texture_descriptor_heap =
+            match unsafe { SampledTextureDescriptorHeap::new(raw_device) } {
+                Ok(heap) => heap,
+                Err(error) => {
+                    drop(command_recorder);
+                    unsafe {
+                        dk::dkQueueDestroy(raw_queue);
+                        dk::dkDeviceDestroy(raw_device);
+                    }
+                    return Err(error);
+                }
+            };
 
         let inner = Arc::new(DeviceInner {
             raw: RawDevice(raw_device),
+            sampled_texture_descriptor_heap,
         });
 
         Ok(crate::OpenDevice {
@@ -3810,7 +3968,11 @@ impl crate::Device for Device {
         #[cfg(target_os = "horizon")]
         {
             Ok(Resource::BindGroup(Arc::new(unsafe {
-                BindGroupInner::new(self.inner.raw_device(), desc)?
+                BindGroupInner::new(
+                    self.inner.raw_device(),
+                    self.inner.sampled_texture_descriptor_heap(),
+                    desc,
+                )?
             })))
         }
         #[cfg(not(target_os = "horizon"))]
