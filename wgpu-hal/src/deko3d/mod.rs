@@ -96,6 +96,7 @@ pub enum BindGroupLayoutKind {
         binding: u32,
         visibility: wgt::ShaderStages,
         read_only: bool,
+        has_dynamic_offset: bool,
     },
 }
 
@@ -257,6 +258,7 @@ pub(super) struct StorageBufferBinding {
     binding: u32,
     visibility: wgt::ShaderStages,
     read_only: bool,
+    has_dynamic_offset: bool,
     buffer: Buffer,
     offset: wgt::BufferAddress,
     size: Option<wgt::BufferSize>,
@@ -638,12 +640,20 @@ impl BindGroupInner {
                 }
             }
             BindGroupInnerRaw::StorageBuffer(binding) => {
-                if !dynamic_offsets.is_empty() {
+                let dynamic_offset = match (binding.has_dynamic_offset, dynamic_offsets) {
+                    (true, [offset]) => u64::from(*offset),
+                    (false, []) => 0,
+                    _ => return Err(crate::DeviceError::Lost),
+                };
+                if dynamic_offset % u64::from(wgt::STORAGE_BINDING_SIZE_ALIGNMENT) != 0 {
                     return Err(crate::DeviceError::Lost);
                 }
                 let _storage_is_read_only = binding.read_only;
-                let (gpu_addr, gpu_size) =
-                    binding.buffer.gpu_binding(binding.offset, binding.size)?;
+                let offset = binding
+                    .offset
+                    .checked_add(dynamic_offset)
+                    .ok_or(crate::DeviceError::Lost)?;
+                let (gpu_addr, gpu_size) = binding.buffer.gpu_binding(offset, binding.size)?;
                 unsafe {
                     if binding.visibility.contains(wgt::ShaderStages::VERTEX) {
                         dk::dkCmdBufBindStorageBuffer(
@@ -1553,7 +1563,8 @@ impl BindGroupInner {
                 binding,
                 visibility,
                 read_only,
-            } => Self::new_storage_buffer(desc, binding, visibility, read_only),
+                has_dynamic_offset,
+            } => Self::new_storage_buffer(desc, binding, visibility, read_only, has_dynamic_offset),
         }
     }
 
@@ -1690,6 +1701,7 @@ impl BindGroupInner {
         binding: u32,
         visibility: wgt::ShaderStages,
         read_only: bool,
+        has_dynamic_offset: bool,
     ) -> DeviceResult<Self> {
         if desc.buffers.len() != 1
             || !desc.samplers.is_empty()
@@ -1716,6 +1728,7 @@ impl BindGroupInner {
                 binding,
                 visibility,
                 read_only,
+                has_dynamic_offset,
                 buffer: buffer.buffer.clone(),
                 offset: buffer.offset,
                 size: buffer.size,
@@ -1911,7 +1924,7 @@ fn supported_buffer_bind_group_layout_kind(
         }
         wgt::BindingType::Buffer {
             ty: wgt::BufferBindingType::Storage { read_only },
-            has_dynamic_offset: false,
+            has_dynamic_offset,
             min_binding_size: _,
         } if entry.binding < DEKO_STORAGE_BUFFER_COUNT
             && (wgt::ShaderStages::VERTEX_FRAGMENT | wgt::ShaderStages::COMPUTE)
@@ -1921,6 +1934,7 @@ fn supported_buffer_bind_group_layout_kind(
                 binding: entry.binding,
                 visibility: entry.visibility,
                 read_only,
+                has_dynamic_offset,
             })
         }
         _ => None,
