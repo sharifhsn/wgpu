@@ -1819,13 +1819,17 @@ impl TextureInner {
             || desc.mip_level_count > u32::from(u8::MAX)
             || desc.size.width == 0
             || desc.size.height == 0
-            || desc.size.depth_or_array_layers != 1
+            || desc.size.depth_or_array_layers == 0
+            || (desc.size.depth_or_array_layers != 1 && desc.sample_count != 1)
             || !format_support.supports_usage(desc.usage)
         {
             return Err(crate::DeviceError::Lost);
         }
 
         let mut image_layout_maker = dk::DkImageLayoutMaker::defaults(raw_device);
+        if desc.size.depth_or_array_layers > 1 {
+            image_layout_maker.type_ = dk::DkImageType::DkImageType_2DArray;
+        }
         image_layout_maker.format = format_support.image_format;
         if desc.usage.intersects(
             wgt::TextureUses::COLOR_TARGET
@@ -1850,6 +1854,7 @@ impl TextureInner {
         image_layout_maker.msMode = ms_mode;
         image_layout_maker.dimensions[0] = desc.size.width;
         image_layout_maker.dimensions[1] = desc.size.height;
+        image_layout_maker.dimensions[2] = desc.size.depth_or_array_layers;
         image_layout_maker.mipLevels = desc.mip_level_count;
 
         let mut texture_layout = dk::DkImageLayout::zeroed();
@@ -2186,6 +2191,9 @@ impl BindGroupInner {
 
         let mut image_descriptor = dk::DkImageDescriptor::zeroed();
         let mut image_view = dk::DkImageView::defaults(image.0);
+        if *array_layer_count > 1 {
+            image_view.type_ = dk::DkImageType::DkImageType_2DArray;
+        }
         image_view.mipLevelOffset = *base_mip_level;
         image_view.mipLevelCount = *mip_level_count;
         image_view.layerOffset = *base_array_layer;
@@ -3360,7 +3368,8 @@ fn supported_texture_bind_group_layout_kind(
                 binding,
                 wgt::BindingType::Texture {
                     sample_type: wgt::TextureSampleType::Float { .. },
-                    view_dimension: wgt::TextureViewDimension::D2,
+                    view_dimension:
+                        wgt::TextureViewDimension::D2 | wgt::TextureViewDimension::D2Array,
                     multisampled: false,
                 },
             ) if binding < DEKO_IMAGE_BINDING_COUNT => {
@@ -3464,7 +3473,7 @@ fn supported_buffer_texture_sampler_storage_texture_bind_group_layout_kind_group
         match entry.ty {
             wgt::BindingType::Texture {
                 sample_type: wgt::TextureSampleType::Float { .. },
-                view_dimension: wgt::TextureViewDimension::D2,
+                view_dimension: wgt::TextureViewDimension::D2 | wgt::TextureViewDimension::D2Array,
                 multisampled: false,
             } if entry.binding < DEKO_IMAGE_BINDING_COUNT => {
                 textures.push((entry.binding, entry.visibility));
@@ -3539,7 +3548,7 @@ fn supported_buffer_texture_sampler_bind_group_layout_kind_group(
         match entry.ty {
             wgt::BindingType::Texture {
                 sample_type: wgt::TextureSampleType::Float { .. },
-                view_dimension: wgt::TextureViewDimension::D2,
+                view_dimension: wgt::TextureViewDimension::D2 | wgt::TextureViewDimension::D2Array,
                 multisampled: false,
             } if entry.binding < DEKO_IMAGE_BINDING_COUNT => {
                 textures.push((entry.binding, entry.visibility));
@@ -4247,9 +4256,10 @@ impl crate::Device for Device {
                     .range
                     .array_layer_count
                     .ok_or(crate::DeviceError::Lost)?;
-                if desc.dimension != wgt::TextureViewDimension::D2
-                    || desc.range.base_array_layer != 0
-                    || array_layer_count != 1
+                if !matches!(
+                    desc.dimension,
+                    wgt::TextureViewDimension::D2 | wgt::TextureViewDimension::D2Array
+                ) || (desc.dimension == wgt::TextureViewDimension::D2 && array_layer_count != 1)
                     || mip_level_count == 0
                     || desc
                         .range
@@ -4260,16 +4270,28 @@ impl crate::Device for Device {
                 {
                     return Err(crate::DeviceError::Lost);
                 }
+                let extent = texture.mip_extent(desc.range.base_mip_level)?;
+                if desc
+                    .range
+                    .base_array_layer
+                    .checked_add(array_layer_count)
+                    .ok_or(crate::DeviceError::Lost)?
+                    > extent.depth_or_array_layers
+                {
+                    return Err(crate::DeviceError::Lost);
+                }
                 Ok(Resource::TextureView {
                     image: texture.raw_image(),
-                    extent: texture.mip_extent(desc.range.base_mip_level)?,
+                    extent,
                     sample_count: texture.sample_count(),
                     base_mip_level: u8::try_from(desc.range.base_mip_level)
                         .map_err(|_| crate::DeviceError::Lost)?,
                     mip_level_count: u8::try_from(mip_level_count)
                         .map_err(|_| crate::DeviceError::Lost)?,
-                    base_array_layer: 0,
-                    array_layer_count: 1,
+                    base_array_layer: u16::try_from(desc.range.base_array_layer)
+                        .map_err(|_| crate::DeviceError::Lost)?,
+                    array_layer_count: u16::try_from(array_layer_count)
+                        .map_err(|_| crate::DeviceError::Lost)?,
                     owner: Some(texture.clone()),
                 })
             }
