@@ -180,7 +180,7 @@ pub(super) struct RenderPipelineInnerRaw {
     rasterizer_state: dk::DkRasterizerState,
     color_state: dk::DkColorState,
     color_write_state: dk::DkColorWriteState,
-    blend_state: dk::DkBlendState,
+    blend_states: Vec<dk::DkBlendState>,
     depth_stencil_state: dk::DkDepthStencilState,
     multisample_state: dk::DkMultisampleState,
     sample_mask: u32,
@@ -887,17 +887,7 @@ impl RenderPipelineInner {
         {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         }
-        if desc.color_targets.len() != 1 {
-            return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
-        }
-        let Some(color_target) = &desc.color_targets[0] else {
-            return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
-        };
-        if color_target.format != wgt::TextureFormat::Rgba8Unorm {
-            return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
-        }
-        let (color_state, blend_state) = map_blend_state(color_target.blend)?;
-        let color_write_state = map_color_write_state(color_target.write_mask);
+        let (color_state, color_write_state, blend_states) = map_color_targets(desc.color_targets)?;
         let rasterizer_state = map_rasterizer_state(&desc.primitive);
         let depth_stencil_state = map_depth_stencil_state(desc.depth_stencil.as_ref())?;
         let mut multisample_state = dk::DkMultisampleState::defaults();
@@ -964,7 +954,7 @@ impl RenderPipelineInner {
                 rasterizer_state,
                 color_state,
                 color_write_state,
-                blend_state,
+                blend_states,
                 depth_stencil_state,
                 multisample_state,
                 sample_mask,
@@ -1114,7 +1104,43 @@ fn map_compare_function(compare: wgt::CompareFunction) -> dk::DkCompareOp {
 }
 
 #[cfg(target_os = "horizon")]
-fn map_color_write_state(write_mask: wgt::ColorWrites) -> dk::DkColorWriteState {
+fn map_color_targets(
+    color_targets: &[Option<wgt::ColorTargetState>],
+) -> Result<
+    (
+        dk::DkColorState,
+        dk::DkColorWriteState,
+        Vec<dk::DkBlendState>,
+    ),
+    crate::PipelineError,
+> {
+    if color_targets.is_empty() || color_targets.len() > 2 {
+        return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+    }
+
+    let mut color_state = dk::DkColorState::defaults();
+    let mut color_write_state = dk::DkColorWriteState::defaults();
+    let mut blend_states = Vec::with_capacity(color_targets.len());
+    for (index, color_target) in color_targets.iter().enumerate() {
+        let Some(color_target) = color_target else {
+            return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+        };
+        if color_target.format != wgt::TextureFormat::Rgba8Unorm {
+            return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+        }
+        let index = u32::try_from(index)
+            .map_err(|_| crate::PipelineError::Device(crate::DeviceError::Lost))?;
+        color_write_state.set_mask(index, map_color_write_mask(color_target.write_mask));
+        let (blend_enable, blend_state) = map_blend_state(color_target.blend)?;
+        color_state.set_blend_enable(index, blend_enable);
+        blend_states.push(blend_state);
+    }
+
+    Ok((color_state, color_write_state, blend_states))
+}
+
+#[cfg(target_os = "horizon")]
+fn map_color_write_mask(write_mask: wgt::ColorWrites) -> u32 {
     let mut mask = 0;
     if write_mask.contains(wgt::ColorWrites::RED) {
         mask |= dk::DkColorMask_R;
@@ -1129,14 +1155,13 @@ fn map_color_write_state(write_mask: wgt::ColorWrites) -> dk::DkColorWriteState 
         mask |= dk::DkColorMask_A;
     }
 
-    dk::DkColorWriteState { masks: mask }
+    mask
 }
 
 #[cfg(target_os = "horizon")]
 fn map_blend_state(
     blend: Option<wgt::BlendState>,
-) -> Result<(dk::DkColorState, dk::DkBlendState), crate::PipelineError> {
-    let mut color_state = dk::DkColorState::defaults();
+) -> Result<(bool, dk::DkBlendState), crate::PipelineError> {
     let mut blend_state = dk::DkBlendState::defaults();
 
     if let Some(blend) = blend {
@@ -1148,10 +1173,10 @@ fn map_blend_state(
         let dst_alpha = map_blend_factor(blend.alpha.dst_factor)?;
         blend_state.set_ops(color_op, alpha_op);
         blend_state.set_factors(src_color, dst_color, src_alpha, dst_alpha);
-        color_state.set_blend_enable(0, true);
+        return Ok((true, blend_state));
     }
 
-    Ok((color_state, blend_state))
+    Ok((false, blend_state))
 }
 
 #[cfg(target_os = "horizon")]

@@ -39,7 +39,7 @@ enum Command {
         regions: Vec<crate::BufferTextureCopy>,
     },
     BeginRenderPass {
-        color: ColorAttachmentState,
+        colors: Vec<ColorAttachmentState>,
         depth_stencil: DepthStencilAttachmentState,
     },
     EndRenderPass,
@@ -154,10 +154,16 @@ struct ExecutionState {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct RenderTarget {
-    image: RawImage,
     extent: wgt::Extent3d,
+    colors: Vec<RenderTargetColor>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+struct RenderTargetColor {
+    image: RawImage,
     resolve_image: Option<RawImage>,
 }
 
@@ -350,11 +356,12 @@ impl crate::CommandEncoder for CommandBuffer {
             return Err(crate::DeviceError::Lost);
         }
 
-        let color = color_attachment(desc.color_attachments, desc.sample_count)?;
+        let colors = color_attachments(desc.color_attachments, desc.sample_count)?;
+        let extent = colors[0].extent;
         let depth_stencil =
-            depth_stencil_attachment(desc.depth_stencil_attachment.as_ref(), color.extent)?;
+            depth_stencil_attachment(desc.depth_stencil_attachment.as_ref(), extent)?;
         self.commands.push(Command::BeginRenderPass {
-            color,
+            colors,
             depth_stencil,
         });
         Ok(())
@@ -649,19 +656,25 @@ impl Command {
                 unsafe { submit_copy_buffer_to_texture(queue, surface_queue, src, dst, regions) }
             }
             Command::BeginRenderPass {
-                color,
+                colors,
                 depth_stencil,
             } => {
+                let extent = colors.first().ok_or(crate::DeviceError::Lost)?.extent;
                 state.target = Some(RenderTarget {
-                    image: color.image,
-                    extent: color.extent,
-                    resolve_image: color.resolve_image,
+                    extent,
+                    colors: colors
+                        .iter()
+                        .map(|color| RenderTargetColor {
+                            image: color.image,
+                            resolve_image: color.resolve_image,
+                        })
+                        .collect(),
                 });
                 state.viewport = None;
                 state.scissor = None;
                 state.stencil_reference = 0;
                 state.blend_constants = [0.0; 4];
-                unsafe { submit_begin_render_pass(queue, surface_queue, *color, *depth_stencil) }
+                unsafe { submit_begin_render_pass(queue, surface_queue, colors, *depth_stencil) }
             }
             Command::EndRenderPass => unsafe {
                 submit_end_render_pass(queue, surface_queue, state)
@@ -830,15 +843,34 @@ impl Command {
     }
 }
 
-fn color_attachment(
+fn color_attachments(
     color_attachments: &[Option<crate::ColorAttachment<'_, Resource>>],
     sample_count: u32,
-) -> DeviceResult<ColorAttachmentState> {
-    let mut attachments = color_attachments.iter().flatten();
-    let Some(attachment) = attachments.next() else {
+) -> DeviceResult<Vec<ColorAttachmentState>> {
+    if color_attachments.is_empty() || color_attachments.len() > 2 {
         return Err(crate::DeviceError::Lost);
-    };
-    if attachments.next().is_some() || attachment.depth_slice.is_some() {
+    }
+    let mut colors: Vec<ColorAttachmentState> = Vec::with_capacity(color_attachments.len());
+    for attachment in color_attachments {
+        let Some(attachment) = attachment else {
+            return Err(crate::DeviceError::Lost);
+        };
+        let color = color_attachment(attachment, sample_count)?;
+        if let Some(first) = colors.first() {
+            if color.extent != first.extent {
+                return Err(crate::DeviceError::Lost);
+            }
+        }
+        colors.push(color);
+    }
+    Ok(colors)
+}
+
+fn color_attachment(
+    attachment: &crate::ColorAttachment<'_, Resource>,
+    sample_count: u32,
+) -> DeviceResult<ColorAttachmentState> {
+    if attachment.depth_slice.is_some() {
         return Err(crate::DeviceError::Lost);
     }
     let Resource::TextureView {
@@ -1062,45 +1094,59 @@ unsafe fn submit_copy_buffer_to_texture(
 unsafe fn submit_begin_render_pass(
     queue: &Queue,
     surface_queue: Option<RawQueueHandle>,
-    color: ColorAttachmentState,
+    colors: &[ColorAttachmentState],
     depth_stencil: DepthStencilAttachmentState,
 ) -> DeviceResult<()> {
+    let Some(first_color) = colors.first() else {
+        return Err(crate::DeviceError::Lost);
+    };
     unsafe {
         submit_deko_commands(queue, surface_queue, |cmdbuf| {
-            let image_view = dk::DkImageView::defaults(color.image.0);
+            let image_views = colors
+                .iter()
+                .map(|color| dk::DkImageView::defaults(color.image.0))
+                .collect::<Vec<_>>();
+            let image_view_ptrs = image_views.iter().map(ptr::from_ref).collect::<Vec<_>>();
             let depth_stencil_image_view = depth_stencil
                 .image
                 .map(|image| dk::DkImageView::defaults(image.0));
             let depth_stencil_image_view_ptr = depth_stencil_image_view
                 .as_ref()
                 .map_or(ptr::null(), |view| ptr::from_ref(view));
-            dk::dkCmdBufBindRenderTarget(cmdbuf, &image_view, depth_stencil_image_view_ptr);
+            dk::dkCmdBufBindRenderTargets(
+                cmdbuf,
+                image_view_ptrs.as_ptr(),
+                image_view_ptrs.len() as u32,
+                depth_stencil_image_view_ptr,
+            );
             let viewport = dk::DkViewport {
                 x: 0.0,
                 y: 0.0,
-                width: color.extent.width as f32,
-                height: color.extent.height as f32,
+                width: first_color.extent.width as f32,
+                height: first_color.extent.height as f32,
                 near: 0.0,
                 far: 1.0,
             };
             let scissor = dk::DkScissor {
                 x: 0,
                 y: 0,
-                width: color.extent.width,
-                height: color.extent.height,
+                width: first_color.extent.width,
+                height: first_color.extent.height,
             };
             dk::dkCmdBufSetViewports(cmdbuf, 0, &viewport, 1);
             dk::dkCmdBufSetScissors(cmdbuf, 0, &scissor, 1);
-            if let Some(clear_value) = color.clear_value {
-                dk::dkCmdBufClearColorFloat(
-                    cmdbuf,
-                    0,
-                    dk::DkColorMask_RGBA,
-                    clear_value.r as f32,
-                    clear_value.g as f32,
-                    clear_value.b as f32,
-                    clear_value.a as f32,
-                );
+            for (index, color) in colors.iter().enumerate() {
+                if let Some(clear_value) = color.clear_value {
+                    dk::dkCmdBufClearColorFloat(
+                        cmdbuf,
+                        index as u32,
+                        dk::DkColorMask_RGBA,
+                        clear_value.r as f32,
+                        clear_value.g as f32,
+                        clear_value.b as f32,
+                        clear_value.a as f32,
+                    );
+                }
             }
             if depth_stencil.has_clear() {
                 dk::dkCmdBufClearDepthStencil(
@@ -1124,7 +1170,7 @@ unsafe fn submit_begin_render_pass(
 unsafe fn submit_begin_render_pass(
     _queue: &Queue,
     _surface_queue: Option<RawQueueHandle>,
-    _color: ColorAttachmentState,
+    _colors: &[ColorAttachmentState],
     _depth_stencil: DepthStencilAttachmentState,
 ) -> DeviceResult<()> {
     Err(crate::DeviceError::Lost)
@@ -1139,14 +1185,22 @@ unsafe fn submit_end_render_pass(
     let Some(target) = state.target.take() else {
         return Err(crate::DeviceError::Lost);
     };
-    let Some(resolve_image) = target.resolve_image else {
+    if !target
+        .colors
+        .iter()
+        .any(|color| color.resolve_image.is_some())
+    {
         return Ok(());
-    };
+    }
     unsafe {
         submit_deko_commands(queue, surface_queue, |cmdbuf| {
-            let src_view = dk::DkImageView::defaults(target.image.0);
-            let dst_view = dk::DkImageView::defaults(resolve_image.0);
-            dk::dkCmdBufResolveImage(cmdbuf, &src_view, &dst_view);
+            for color in target.colors {
+                if let Some(resolve_image) = color.resolve_image {
+                    let src_view = dk::DkImageView::defaults(color.image.0);
+                    let dst_view = dk::DkImageView::defaults(resolve_image.0);
+                    dk::dkCmdBufResolveImage(cmdbuf, &src_view, &dst_view);
+                }
+            }
             Ok(())
         })
     }
@@ -1365,7 +1419,7 @@ unsafe fn submit_deko_draw(
     state: &ExecutionState,
     draw: impl FnOnce(dk::DkCmdBuf, &super::RenderPipelineInnerRaw) -> DeviceResult<()>,
 ) -> DeviceResult<()> {
-    let target = state.target.ok_or(crate::DeviceError::Lost)?;
+    let target = state.target.as_ref().ok_or(crate::DeviceError::Lost)?;
     let pipeline = state.pipeline.as_ref().ok_or(crate::DeviceError::Lost)?;
     let pipeline = pipeline.raw();
     unsafe {
@@ -1422,7 +1476,12 @@ unsafe fn submit_deko_draw(
             dk::dkCmdBufBindRasterizerState(cmdbuf, &pipeline.rasterizer_state);
             dk::dkCmdBufBindColorState(cmdbuf, &pipeline.color_state);
             dk::dkCmdBufBindColorWriteState(cmdbuf, &pipeline.color_write_state);
-            dk::dkCmdBufBindBlendStates(cmdbuf, 0, &pipeline.blend_state, 1);
+            dk::dkCmdBufBindBlendStates(
+                cmdbuf,
+                0,
+                pipeline.blend_states.as_ptr(),
+                pipeline.blend_states.len() as u32,
+            );
             dk::dkCmdBufBindDepthStencilState(cmdbuf, &pipeline.depth_stencil_state);
             dk::dkCmdBufBindMultisampleState(cmdbuf, &pipeline.multisample_state);
             dk::dkCmdBufSetSampleMask(cmdbuf, pipeline.sample_mask);
