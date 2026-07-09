@@ -89,6 +89,7 @@ pub enum Resource {
     PipelineLayout(Vec<Option<BindGroupLayoutKind>>),
     ShaderModule(Arc<ShaderModuleInner>),
     RenderPipeline(Arc<RenderPipelineInner>),
+    ComputePipeline(Arc<ComputePipelineInner>),
     Texture(Arc<TextureInner>),
     Sampler(Arc<SamplerInner>),
     BindGroup(Arc<BindGroupInner>),
@@ -202,6 +203,11 @@ pub struct RenderPipelineInner {
     inner: RenderPipelineInnerRaw,
 }
 
+pub struct ComputePipelineInner {
+    #[allow(dead_code)]
+    inner: ComputePipelineInnerRaw,
+}
+
 pub struct TextureInner {
     #[allow(dead_code)]
     inner: TextureInnerRaw,
@@ -298,6 +304,11 @@ pub(super) struct RenderPipelineInnerRaw {
     bind_group_count: usize,
     vertex_bindings: Vec<ShaderBinding>,
     fragment_bindings: Vec<ShaderBinding>,
+}
+
+#[cfg(target_os = "horizon")]
+pub(super) struct ComputePipelineInnerRaw {
+    compute_shader: Arc<ShaderModuleInner>,
 }
 
 #[cfg(target_os = "horizon")]
@@ -554,6 +565,10 @@ pub(super) struct RenderPipelineInnerRaw;
 
 #[cfg(not(target_os = "horizon"))]
 #[derive(Debug)]
+pub(super) struct ComputePipelineInnerRaw;
+
+#[cfg(not(target_os = "horizon"))]
+#[derive(Debug)]
 struct TextureInnerRaw;
 
 #[cfg(not(target_os = "horizon"))]
@@ -658,6 +673,13 @@ impl fmt::Debug for RenderPipelineInner {
     }
 }
 
+impl fmt::Debug for ComputePipelineInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ComputePipelineInner")
+            .finish_non_exhaustive()
+    }
+}
+
 impl fmt::Debug for TextureInner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TextureInner").finish_non_exhaustive()
@@ -722,6 +744,8 @@ unsafe impl Send for ShaderModuleInner {}
 unsafe impl Sync for ShaderModuleInner {}
 unsafe impl Send for RenderPipelineInner {}
 unsafe impl Sync for RenderPipelineInner {}
+unsafe impl Send for ComputePipelineInner {}
+unsafe impl Sync for ComputePipelineInner {}
 unsafe impl Send for TextureInner {}
 unsafe impl Sync for TextureInner {}
 unsafe impl Send for SamplerInner {}
@@ -782,6 +806,13 @@ impl ShaderModuleInner {
 impl RenderPipelineInner {
     #[cfg(target_os = "horizon")]
     pub(super) fn raw(&self) -> &RenderPipelineInnerRaw {
+        &self.inner
+    }
+}
+
+impl ComputePipelineInner {
+    #[cfg(target_os = "horizon")]
+    pub(super) fn raw(&self) -> &ComputePipelineInnerRaw {
         &self.inner
     }
 }
@@ -1492,6 +1523,271 @@ impl RenderPipelineInner {
                 fragment_bindings: fragment_shader.inner.bindings.clone(),
             },
         })
+    }
+}
+
+#[cfg(target_os = "horizon")]
+impl ComputePipelineInner {
+    fn new(
+        desc: &crate::ComputePipelineDescriptor<Resource, Resource, Resource>,
+    ) -> Result<Self, crate::PipelineError> {
+        if !matches!(desc.layout, Resource::PipelineLayout) || desc.cache.is_some() {
+            return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+        }
+
+        let Resource::ShaderModule(compute_shader) = desc.stage.module else {
+            return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+        };
+
+        Ok(Self {
+            inner: ComputePipelineInnerRaw {
+                compute_shader: compute_shader.clone(),
+            },
+        })
+    }
+}
+
+#[cfg(target_os = "horizon")]
+fn map_primitive_topology(
+    primitive: &wgt::PrimitiveState,
+) -> Result<dk::DkPrimitive, crate::PipelineError> {
+    match primitive.topology {
+        wgt::PrimitiveTopology::PointList => Ok(dk::DkPrimitive::DkPrimitive_Points),
+        wgt::PrimitiveTopology::LineList => Ok(dk::DkPrimitive::DkPrimitive_Lines),
+        wgt::PrimitiveTopology::LineStrip => Ok(dk::DkPrimitive::DkPrimitive_LineStrip),
+        wgt::PrimitiveTopology::TriangleList => Ok(dk::DkPrimitive::DkPrimitive_Triangles),
+        wgt::PrimitiveTopology::TriangleStrip => Ok(dk::DkPrimitive::DkPrimitive_TriangleStrip),
+    }
+}
+
+#[cfg(target_os = "horizon")]
+fn map_sample_count(sample_count: u32) -> DeviceResult<dk::DkMsMode> {
+    match sample_count {
+        1 => Ok(dk::DkMsMode::DkMsMode_1x),
+        4 => Ok(dk::DkMsMode::DkMsMode_4x),
+        _ => Err(crate::DeviceError::Lost),
+    }
+}
+
+#[cfg(target_os = "horizon")]
+fn map_rasterizer_state(primitive: &wgt::PrimitiveState) -> dk::DkRasterizerState {
+    let mut state = dk::DkRasterizerState::defaults();
+    let cull_mode = match primitive.cull_mode {
+        None => dk::DkFace_None,
+        Some(wgt::Face::Front) => dk::DkFace_Front,
+        Some(wgt::Face::Back) => dk::DkFace_Back,
+    };
+    let front_face = match primitive.front_face {
+        wgt::FrontFace::Cw => dk::DkFrontFace_CW,
+        wgt::FrontFace::Ccw => dk::DkFrontFace_CCW,
+    };
+    state.set_cull_mode(cull_mode);
+    state.set_front_face(front_face);
+    state
+}
+
+#[cfg(target_os = "horizon")]
+fn map_depth_stencil_state(
+    depth_stencil: Option<&wgt::DepthStencilState>,
+) -> Result<dk::DkDepthStencilState, crate::PipelineError> {
+    let mut state = dk::DkDepthStencilState::defaults();
+    state.set_depth_test_enable(false);
+    state.set_depth_write_enable(false);
+    state.set_stencil_test_enable(false);
+    state.set_depth_compare_op(dk::DkCompareOp::DkCompareOp_Always);
+
+    let Some(depth_stencil) = depth_stencil else {
+        return Ok(state);
+    };
+
+    if depth_stencil.bias.is_enabled()
+        || (depth_stencil.format != wgt::TextureFormat::Depth32Float
+            && depth_stencil.format != wgt::TextureFormat::Stencil8)
+    {
+        return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+    }
+
+    if depth_stencil.format == wgt::TextureFormat::Stencil8
+        && (depth_stencil.depth_compare.is_some()
+            || depth_stencil.depth_write_enabled.unwrap_or(false))
+    {
+        return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+    }
+    if depth_stencil.format == wgt::TextureFormat::Depth32Float
+        && depth_stencil.stencil.is_enabled()
+    {
+        return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+    }
+
+    if let Some(compare) = depth_stencil.depth_compare {
+        state.set_depth_test_enable(true);
+        state.set_depth_compare_op(map_compare_function(compare));
+    }
+    state.set_depth_write_enable(depth_stencil.depth_write_enabled.unwrap_or(false));
+    if depth_stencil.stencil.is_enabled() {
+        state.set_stencil_test_enable(true);
+        map_stencil_face_state(&mut state, true, depth_stencil.stencil.front)?;
+        map_stencil_face_state(&mut state, false, depth_stencil.stencil.back)?;
+    }
+
+    Ok(state)
+}
+
+#[cfg(target_os = "horizon")]
+fn map_stencil_face_state(
+    state: &mut dk::DkDepthStencilState,
+    front: bool,
+    face: wgt::StencilFaceState,
+) -> Result<(), crate::PipelineError> {
+    let fail = map_stencil_operation(face.fail_op);
+    let pass = map_stencil_operation(face.pass_op);
+    let depth_fail = map_stencil_operation(face.depth_fail_op);
+    let compare = map_compare_function(face.compare);
+    if front {
+        state.set_stencil_front(fail, pass, depth_fail, compare);
+    } else {
+        state.set_stencil_back(fail, pass, depth_fail, compare);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "horizon")]
+fn map_stencil_operation(operation: wgt::StencilOperation) -> dk::DkStencilOp {
+    match operation {
+        wgt::StencilOperation::Keep => dk::DkStencilOp::DkStencilOp_Keep,
+        wgt::StencilOperation::Zero => dk::DkStencilOp::DkStencilOp_Zero,
+        wgt::StencilOperation::Replace => dk::DkStencilOp::DkStencilOp_Replace,
+        wgt::StencilOperation::Invert => dk::DkStencilOp::DkStencilOp_Invert,
+        wgt::StencilOperation::IncrementClamp => dk::DkStencilOp::DkStencilOp_Incr,
+        wgt::StencilOperation::DecrementClamp => dk::DkStencilOp::DkStencilOp_Decr,
+        wgt::StencilOperation::IncrementWrap => dk::DkStencilOp::DkStencilOp_IncrWrap,
+        wgt::StencilOperation::DecrementWrap => dk::DkStencilOp::DkStencilOp_DecrWrap,
+    }
+}
+
+#[cfg(target_os = "horizon")]
+fn map_compare_function(compare: wgt::CompareFunction) -> dk::DkCompareOp {
+    match compare {
+        wgt::CompareFunction::Never => dk::DkCompareOp::DkCompareOp_Never,
+        wgt::CompareFunction::Less => dk::DkCompareOp::DkCompareOp_Less,
+        wgt::CompareFunction::Equal => dk::DkCompareOp::DkCompareOp_Equal,
+        wgt::CompareFunction::LessEqual => dk::DkCompareOp::DkCompareOp_Lequal,
+        wgt::CompareFunction::Greater => dk::DkCompareOp::DkCompareOp_Greater,
+        wgt::CompareFunction::NotEqual => dk::DkCompareOp::DkCompareOp_NotEqual,
+        wgt::CompareFunction::GreaterEqual => dk::DkCompareOp::DkCompareOp_Gequal,
+        wgt::CompareFunction::Always => dk::DkCompareOp::DkCompareOp_Always,
+    }
+}
+
+#[cfg(target_os = "horizon")]
+fn map_color_targets(
+    color_targets: &[Option<wgt::ColorTargetState>],
+) -> Result<
+    (
+        dk::DkColorState,
+        dk::DkColorWriteState,
+        Vec<dk::DkBlendState>,
+    ),
+    crate::PipelineError,
+> {
+    if color_targets.is_empty() || color_targets.len() > 2 {
+        return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+    }
+
+    let mut color_state = dk::DkColorState::defaults();
+    let mut color_write_state = dk::DkColorWriteState::defaults();
+    let mut blend_states = Vec::with_capacity(color_targets.len());
+    for (index, color_target) in color_targets.iter().enumerate() {
+        let Some(color_target) = color_target else {
+            return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+        };
+        if map_color_image_format(color_target.format).is_none() {
+            return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+        }
+        let index = u32::try_from(index)
+            .map_err(|_| crate::PipelineError::Device(crate::DeviceError::Lost))?;
+        color_write_state.set_mask(index, map_color_write_mask(color_target.write_mask));
+        let (blend_enable, blend_state) = map_blend_state(color_target.blend)?;
+        color_state.set_blend_enable(index, blend_enable);
+        blend_states.push(blend_state);
+    }
+
+    Ok((color_state, color_write_state, blend_states))
+}
+
+#[cfg(target_os = "horizon")]
+fn map_color_write_mask(write_mask: wgt::ColorWrites) -> u32 {
+    let mut mask = 0;
+    if write_mask.contains(wgt::ColorWrites::RED) {
+        mask |= dk::DkColorMask_R;
+    }
+    if write_mask.contains(wgt::ColorWrites::GREEN) {
+        mask |= dk::DkColorMask_G;
+    }
+    if write_mask.contains(wgt::ColorWrites::BLUE) {
+        mask |= dk::DkColorMask_B;
+    }
+    if write_mask.contains(wgt::ColorWrites::ALPHA) {
+        mask |= dk::DkColorMask_A;
+    }
+
+    mask
+}
+
+#[cfg(target_os = "horizon")]
+fn map_blend_state(
+    blend: Option<wgt::BlendState>,
+) -> Result<(bool, dk::DkBlendState), crate::PipelineError> {
+    let mut blend_state = dk::DkBlendState::defaults();
+
+    if let Some(blend) = blend {
+        let color_op = map_blend_operation(blend.color.operation);
+        let alpha_op = map_blend_operation(blend.alpha.operation);
+        let src_color = map_blend_factor(blend.color.src_factor)?;
+        let dst_color = map_blend_factor(blend.color.dst_factor)?;
+        let src_alpha = map_blend_factor(blend.alpha.src_factor)?;
+        let dst_alpha = map_blend_factor(blend.alpha.dst_factor)?;
+        blend_state.set_ops(color_op, alpha_op);
+        blend_state.set_factors(src_color, dst_color, src_alpha, dst_alpha);
+        return Ok((true, blend_state));
+    }
+
+    Ok((false, blend_state))
+}
+
+#[cfg(target_os = "horizon")]
+fn map_blend_operation(operation: wgt::BlendOperation) -> dk::DkBlendOp {
+    match operation {
+        wgt::BlendOperation::Add => dk::DkBlendOp::DkBlendOp_Add,
+        wgt::BlendOperation::Subtract => dk::DkBlendOp::DkBlendOp_Sub,
+        wgt::BlendOperation::ReverseSubtract => dk::DkBlendOp::DkBlendOp_RevSub,
+        wgt::BlendOperation::Min => dk::DkBlendOp::DkBlendOp_Min,
+        wgt::BlendOperation::Max => dk::DkBlendOp::DkBlendOp_Max,
+    }
+}
+
+#[cfg(target_os = "horizon")]
+fn map_blend_factor(factor: wgt::BlendFactor) -> Result<dk::DkBlendFactor, crate::PipelineError> {
+    match factor {
+        wgt::BlendFactor::Zero => Ok(dk::DkBlendFactor::DkBlendFactor_Zero),
+        wgt::BlendFactor::One => Ok(dk::DkBlendFactor::DkBlendFactor_One),
+        wgt::BlendFactor::Src => Ok(dk::DkBlendFactor::DkBlendFactor_SrcColor),
+        wgt::BlendFactor::OneMinusSrc => Ok(dk::DkBlendFactor::DkBlendFactor_InvSrcColor),
+        wgt::BlendFactor::SrcAlpha => Ok(dk::DkBlendFactor::DkBlendFactor_SrcAlpha),
+        wgt::BlendFactor::OneMinusSrcAlpha => Ok(dk::DkBlendFactor::DkBlendFactor_InvSrcAlpha),
+        wgt::BlendFactor::Dst => Ok(dk::DkBlendFactor::DkBlendFactor_DstColor),
+        wgt::BlendFactor::OneMinusDst => Ok(dk::DkBlendFactor::DkBlendFactor_InvDstColor),
+        wgt::BlendFactor::DstAlpha => Ok(dk::DkBlendFactor::DkBlendFactor_DstAlpha),
+        wgt::BlendFactor::OneMinusDstAlpha => Ok(dk::DkBlendFactor::DkBlendFactor_InvDstAlpha),
+        wgt::BlendFactor::SrcAlphaSaturated => {
+            Ok(dk::DkBlendFactor::DkBlendFactor_SrcAlphaSaturate)
+        }
+        wgt::BlendFactor::Src1 => Ok(dk::DkBlendFactor::DkBlendFactor_Src1Color),
+        wgt::BlendFactor::OneMinusSrc1 => Ok(dk::DkBlendFactor::DkBlendFactor_InvSrc1Color),
+        wgt::BlendFactor::Src1Alpha => Ok(dk::DkBlendFactor::DkBlendFactor_Src1Alpha),
+        wgt::BlendFactor::OneMinusSrc1Alpha => Ok(dk::DkBlendFactor::DkBlendFactor_InvSrc1Alpha),
+        wgt::BlendFactor::Constant => Ok(dk::DkBlendFactor::DkBlendFactor_ConstColor),
+        wgt::BlendFactor::OneMinusConstant => Ok(dk::DkBlendFactor::DkBlendFactor_InvConstColor),
     }
 }
 
@@ -3719,7 +4015,16 @@ impl crate::Device for Device {
         &self,
         desc: &crate::ComputePipelineDescriptor<Resource, Resource, Resource>,
     ) -> Result<Resource, crate::PipelineError> {
-        Err(crate::PipelineError::Device(crate::DeviceError::Lost))
+        #[cfg(target_os = "horizon")]
+        {
+            Ok(Resource::ComputePipeline(Arc::new(
+                ComputePipelineInner::new(desc)?,
+            )))
+        }
+        #[cfg(not(target_os = "horizon"))]
+        {
+            Err(crate::PipelineError::Device(crate::DeviceError::Lost))
+        }
     }
     unsafe fn destroy_compute_pipeline(&self, pipeline: Resource) {}
     unsafe fn create_pipeline_cache(

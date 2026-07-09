@@ -14,8 +14,8 @@ use deko3d_sys as dk;
 use super::ShaderBindingKind;
 
 use super::{
-    Api, BindGroupInner, Buffer, DeviceResult, Queue, RawImage, RawQueueHandle,
-    RenderPipelineInner, Resource, TextureInner,
+    Api, BindGroupInner, Buffer, ComputePipelineInner, DeviceResult, Queue, RawImage,
+    RawQueueHandle, RenderPipelineInner, Resource, TextureInner,
 };
 
 const DEKO_INVALIDATE_IMAGE: u32 = 1 << 0;
@@ -72,6 +72,11 @@ enum Command {
     },
     SetRenderPipeline {
         pipeline: alloc::sync::Arc<RenderPipelineInner>,
+    },
+    BeginComputePass,
+    EndComputePass,
+    SetComputePipeline {
+        pipeline: alloc::sync::Arc<ComputePipelineInner>,
     },
     SetVertexBuffer {
         index: u32,
@@ -140,12 +145,21 @@ enum Command {
         count_offset: wgt::BufferAddress,
         max_count: u32,
     },
+    DispatchWorkgroups {
+        count: [u32; 3],
+    },
+    DispatchWorkgroupsIndirect {
+        buffer: Buffer,
+        offset: wgt::BufferAddress,
+    },
 }
 
 #[derive(Default)]
 struct ExecutionState {
     target: Option<RenderTarget>,
     pipeline: Option<alloc::sync::Arc<RenderPipelineInner>>,
+    compute_pipeline: Option<alloc::sync::Arc<ComputePipelineInner>>,
+    in_compute_pass: bool,
     vertex_buffers: Vec<Option<VertexBinding>>,
     index_buffer: Option<IndexBinding>,
     bind_groups: Vec<Option<BoundBindGroup>>,
@@ -214,7 +228,10 @@ impl CommandBuffer {
                         Command::CopyTextureToBuffer { .. } => "copy_texture_to_buffer",
                         Command::ResourceBarrier { .. } => "resource_barrier",
                         Command::BeginRenderPass { .. } => "begin_render_pass",
+                        Command::BeginComputePass => "begin_compute_pass",
+                        Command::EndComputePass => "end_compute_pass",
                         Command::SetRenderPipeline { .. } => "set_render_pipeline",
+                        Command::SetComputePipeline { .. } => "set_compute_pipeline",
                         Command::SetVertexBuffer { .. } => "set_vertex_buffer",
                         Command::SetIndexBuffer { .. } => "set_index_buffer",
                         Command::SetBindGroup { .. } => "set_bind_group",
@@ -228,6 +245,10 @@ impl CommandBuffer {
                         Command::DrawIndexedIndirect { .. } => "draw_indexed_indirect",
                         Command::DrawIndirectCount { .. } => "draw_indirect_count",
                         Command::DrawIndexedIndirectCount { .. } => "draw_indexed_indirect_count",
+                        Command::DispatchWorkgroups { .. } => "dispatch_workgroups",
+                        Command::DispatchWorkgroupsIndirect { .. } => {
+                            "dispatch_workgroups_indirect"
+                        }
                     }
                 );
                 #[cfg(target_os = "horizon")]
@@ -763,21 +784,32 @@ impl crate::CommandEncoder for CommandBuffer {
     // compute
 
     unsafe fn begin_compute_pass(&mut self, desc: &crate::ComputePassDescriptor<Resource>) {
-        self.record_unsupported();
+        if desc.timestamp_writes.is_some() {
+            self.record_unsupported();
+            return;
+        }
+        self.commands.push(Command::BeginComputePass);
     }
     unsafe fn end_compute_pass(&mut self) {
-        self.record_unsupported();
+        self.commands.push(Command::EndComputePass);
     }
 
     unsafe fn set_compute_pipeline(&mut self, pipeline: &Resource) {
-        self.record_unsupported();
+        if let Resource::ComputePipeline(pipeline) = pipeline {
+            self.commands.push(Command::SetComputePipeline {
+                pipeline: pipeline.clone(),
+            });
+        }
     }
 
     unsafe fn dispatch(&mut self, count: [u32; 3]) {
-        self.record_unsupported();
+        self.commands.push(Command::DispatchWorkgroups { count });
     }
     unsafe fn dispatch_indirect(&mut self, buffer: &Buffer, offset: wgt::BufferAddress) {
-        self.record_unsupported();
+        self.commands.push(Command::DispatchWorkgroupsIndirect {
+            buffer: buffer.clone(),
+            offset,
+        });
     }
 
     unsafe fn build_acceleration_structures<'a, T>(
@@ -899,6 +931,26 @@ impl Command {
             }
             Command::SetRenderPipeline { pipeline } => {
                 state.pipeline = Some(pipeline.clone());
+                Ok(())
+            }
+            Command::BeginComputePass => {
+                state.in_compute_pass = true;
+                state.compute_pipeline = None;
+                Ok(())
+            }
+            Command::EndComputePass => {
+                if !state.in_compute_pass {
+                    return Err(crate::DeviceError::Lost);
+                }
+                state.in_compute_pass = false;
+                state.compute_pipeline = None;
+                Ok(())
+            }
+            Command::SetComputePipeline { pipeline } => {
+                if !state.in_compute_pass {
+                    return Err(crate::DeviceError::Lost);
+                }
+                state.compute_pipeline = Some(pipeline.clone());
                 Ok(())
             }
             Command::SetVertexBuffer {
@@ -1054,6 +1106,12 @@ impl Command {
                     *max_count,
                 )
             },
+            Command::DispatchWorkgroups { count } => unsafe {
+                submit_dispatch_workgroups(queue, surface_queue, state, *count)
+            },
+            Command::DispatchWorkgroupsIndirect { buffer, offset } => unsafe {
+                submit_dispatch_workgroups_indirect(queue, surface_queue, state, buffer, *offset)
+            },
         }
     }
 }
@@ -1087,9 +1145,28 @@ mod tests {
         assert_end_fails(|encoder| unsafe {
             encoder.draw_mesh_tasks(1, 1, 1);
         });
-        assert_end_fails(|encoder| unsafe {
-            encoder.dispatch([1, 1, 1]);
-        });
+    }
+
+    #[test]
+    fn compute_pass_and_dispatch_encode_on_forced_host() {
+        let mut encoder = CommandBuffer::new();
+        unsafe {
+            encoder.begin_compute_pass(&crate::ComputePassDescriptor {
+                label: Some("host-compute"),
+                timestamp_writes: None,
+            });
+            encoder.dispatch([2, 3, 4]);
+            encoder.end_compute_pass();
+        }
+        let encoded = unsafe { encoder.end_encoding() }.unwrap();
+        assert!(matches!(
+            encoded.commands.as_slice(),
+            [
+                Command::BeginComputePass,
+                Command::DispatchWorkgroups { count: [2, 3, 4] },
+                Command::EndComputePass
+            ]
+        ));
     }
 
     #[test]
@@ -2014,6 +2091,123 @@ unsafe fn submit_draw_indexed_indirect_count(
 }
 
 #[cfg(target_os = "horizon")]
+unsafe fn submit_dispatch_workgroups(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    state: &ExecutionState,
+    count: [u32; 3],
+) -> DeviceResult<()> {
+    if !state.in_compute_pass {
+        return Err(crate::DeviceError::Lost);
+    }
+    let pipeline = state
+        .compute_pipeline
+        .as_ref()
+        .ok_or(crate::DeviceError::Lost)?;
+    let pipeline = pipeline.raw();
+    unsafe {
+        submit_deko_commands(queue, surface_queue, "dispatch_workgroups", |cmdbuf| {
+            let shader = [pipeline.compute_shader.raw_shader()];
+            dk::dkCmdBufBindShaders(
+                cmdbuf,
+                dk::DkStageFlag_Compute,
+                shader.as_ptr(),
+                shader.len() as u32,
+            );
+            for binding in &pipeline.compute_shader.inner.bindings {
+                let group = state
+                    .bind_groups
+                    .get(binding.group as usize)
+                    .and_then(Option::as_ref)
+                    .ok_or(crate::DeviceError::Lost)?;
+                match binding.kind {
+                    ShaderBindingKind::Uniform => group.group.bind_uniform_binding(
+                        cmdbuf,
+                        &group.dynamic_offsets,
+                        binding.binding,
+                        binding.target,
+                        dk::DkStage::DkStage_Compute,
+                    )?,
+                    ShaderBindingKind::Storage => group.group.bind_storage_binding(
+                        cmdbuf,
+                        &group.dynamic_offsets,
+                        binding.binding,
+                        binding.target,
+                        dk::DkStage::DkStage_Compute,
+                    )?,
+                    _ => return Err(crate::DeviceError::Lost),
+                }
+            }
+            dk::dkCmdBufDispatchCompute(cmdbuf, count[0], count[1], count[2]);
+            Ok(())
+        })
+    }
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_dispatch_workgroups_indirect(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    state: &ExecutionState,
+    buffer: &Buffer,
+    offset: wgt::BufferAddress,
+) -> DeviceResult<()> {
+    if !state.in_compute_pass {
+        return Err(crate::DeviceError::Lost);
+    }
+    let indirect_size = wgt::BufferSize::new(size_of::<dk::DkDispatchIndirectData>() as u64)
+        .ok_or(crate::DeviceError::Lost)?;
+    let (dispatch_addr, _) = buffer.gpu_binding(offset, Some(indirect_size))?;
+    let pipeline = state
+        .compute_pipeline
+        .as_ref()
+        .ok_or(crate::DeviceError::Lost)?;
+    let pipeline = pipeline.raw();
+    unsafe {
+        submit_deko_commands(
+            queue,
+            surface_queue,
+            "dispatch_workgroups_indirect",
+            |cmdbuf| {
+                let shader = [pipeline.compute_shader.raw_shader()];
+                dk::dkCmdBufBindShaders(
+                    cmdbuf,
+                    dk::DkStageFlag_Compute,
+                    shader.as_ptr(),
+                    shader.len() as u32,
+                );
+                for binding in &pipeline.compute_shader.inner.bindings {
+                    let group = state
+                        .bind_groups
+                        .get(binding.group as usize)
+                        .and_then(Option::as_ref)
+                        .ok_or(crate::DeviceError::Lost)?;
+                    match binding.kind {
+                        ShaderBindingKind::Uniform => group.group.bind_uniform_binding(
+                            cmdbuf,
+                            &group.dynamic_offsets,
+                            binding.binding,
+                            binding.target,
+                            dk::DkStage::DkStage_Compute,
+                        )?,
+                        ShaderBindingKind::Storage => group.group.bind_storage_binding(
+                            cmdbuf,
+                            &group.dynamic_offsets,
+                            binding.binding,
+                            binding.target,
+                            dk::DkStage::DkStage_Compute,
+                        )?,
+                        _ => return Err(crate::DeviceError::Lost),
+                    }
+                }
+                dk::dkCmdBufDispatchComputeIndirect(cmdbuf, dispatch_addr);
+                Ok(())
+            },
+        )
+    }
+}
+
+#[cfg(target_os = "horizon")]
 struct IndirectDrawRange {
     base_addr: dk::DkGpuAddr,
     stride: u64,
@@ -2336,6 +2530,27 @@ unsafe fn submit_draw_indexed_indirect_count(
     _count_buffer: &Buffer,
     _count_offset: wgt::BufferAddress,
     _max_count: u32,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_dispatch_workgroups(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _state: &ExecutionState,
+    _count: [u32; 3],
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_dispatch_workgroups_indirect(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _state: &ExecutionState,
+    _buffer: &Buffer,
+    _offset: wgt::BufferAddress,
 ) -> DeviceResult<()> {
     Err(crate::DeviceError::Lost)
 }
