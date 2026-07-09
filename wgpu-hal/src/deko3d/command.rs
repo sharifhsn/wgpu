@@ -1209,7 +1209,8 @@ fn texture_copy_rect(
     base: &crate::TextureCopyBase,
     size: crate::CopyExtent,
 ) -> DeviceResult<dk::DkImageRect> {
-    if base.origin.z != 0 || base.aspect != crate::FormatAspects::COLOR || size.depth == 0 {
+    if base.origin.z != 0 || base.aspect != copy_format_aspect(texture.format())? || size.depth == 0
+    {
         return Err(crate::DeviceError::Lost);
     }
 
@@ -1246,6 +1247,17 @@ fn texture_copy_rect(
 }
 
 #[cfg(target_os = "horizon")]
+fn copy_format_aspect(format: wgt::TextureFormat) -> DeviceResult<crate::FormatAspects> {
+    match format {
+        wgt::TextureFormat::Rgba8Unorm | wgt::TextureFormat::Rgba8UnormSrgb => {
+            Ok(crate::FormatAspects::COLOR)
+        }
+        wgt::TextureFormat::Depth32Float => Ok(crate::FormatAspects::DEPTH),
+        _ => Err(crate::DeviceError::Lost),
+    }
+}
+
+#[cfg(target_os = "horizon")]
 fn texture_copy_view(
     texture: &TextureInner,
     base: &crate::TextureCopyBase,
@@ -1270,6 +1282,7 @@ fn texture_copy_view(
 fn copy_texel_size(format: wgt::TextureFormat) -> DeviceResult<u32> {
     match format {
         wgt::TextureFormat::Rgba8Unorm | wgt::TextureFormat::Rgba8UnormSrgb => Ok(4),
+        wgt::TextureFormat::Depth32Float => Ok(4),
         _ => Err(crate::DeviceError::Lost),
     }
 }

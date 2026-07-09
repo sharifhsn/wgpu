@@ -1927,7 +1927,9 @@ fn texture_format_support(format: wgt::TextureFormat) -> Option<TextureFormatSup
         wgt::TextureFormat::Depth32Float => Some(TextureFormatSupport {
             image_format: dk::DkImageFormat::DkImageFormat_ZF32,
             usage: TextureUsageRequirement::Intersects(
-                wgt::TextureUses::DEPTH_STENCIL_READ | wgt::TextureUses::DEPTH_STENCIL_WRITE,
+                wgt::TextureUses::DEPTH_STENCIL_READ
+                    | wgt::TextureUses::DEPTH_STENCIL_WRITE
+                    | wgt::TextureUses::COPY_SRC,
             ),
         }),
         wgt::TextureFormat::Stencil8 => Some(TextureFormatSupport {
@@ -1958,6 +1960,11 @@ fn deko3d_texture_format_capabilities(
         }
         wgt::TextureFormat::Depth32Float | wgt::TextureFormat::Stencil8 => {
             crate::TextureFormatCapabilities::DEPTH_STENCIL_ATTACHMENT
+                | if format == wgt::TextureFormat::Depth32Float {
+                    crate::TextureFormatCapabilities::COPY_SRC
+                } else {
+                    crate::TextureFormatCapabilities::empty()
+                }
         }
         _ => crate::TextureFormatCapabilities::empty(),
     }
