@@ -78,6 +78,7 @@ pub enum Resource {
         image: RawImage,
         extent: wgt::Extent3d,
         sample_count: u32,
+        view_dimension: wgt::TextureViewDimension,
         base_mip_level: u8,
         mip_level_count: u8,
         base_array_layer: u16,
@@ -1983,6 +1984,19 @@ fn map_color_image_format(format: wgt::TextureFormat) -> Option<dk::DkImageForma
 }
 
 #[cfg(target_os = "horizon")]
+fn map_texture_view_dimension(
+    dimension: wgt::TextureViewDimension,
+) -> DeviceResult<Option<dk::DkImageType>> {
+    match dimension {
+        wgt::TextureViewDimension::D2 => Ok(None),
+        wgt::TextureViewDimension::D2Array => Ok(Some(dk::DkImageType::DkImageType_2DArray)),
+        wgt::TextureViewDimension::Cube => Ok(Some(dk::DkImageType::DkImageType_Cubemap)),
+        wgt::TextureViewDimension::CubeArray => Ok(Some(dk::DkImageType::DkImageType_CubemapArray)),
+        _ => Err(crate::DeviceError::Lost),
+    }
+}
+
+#[cfg(target_os = "horizon")]
 impl SamplerInner {
     fn new(desc: &crate::SamplerDescriptor) -> DeviceResult<Self> {
         if desc.compare.is_some() || desc.anisotropy_clamp != 1 || desc.border_color.is_some() {
@@ -2184,6 +2198,7 @@ impl BindGroupInner {
         }
         let Resource::TextureView {
             image,
+            view_dimension,
             base_mip_level,
             mip_level_count,
             base_array_layer,
@@ -2199,8 +2214,8 @@ impl BindGroupInner {
 
         let mut image_descriptor = dk::DkImageDescriptor::zeroed();
         let mut image_view = dk::DkImageView::defaults(image.0);
-        if *array_layer_count > 1 {
-            image_view.type_ = dk::DkImageType::DkImageType_2DArray;
+        if let Some(view_type) = map_texture_view_dimension(*view_dimension)? {
+            image_view.type_ = view_type;
         }
         image_view.mipLevelOffset = *base_mip_level;
         image_view.mipLevelCount = *mip_level_count;
@@ -2287,6 +2302,7 @@ impl BindGroupInner {
         }
         let Resource::TextureView {
             image,
+            view_dimension,
             base_mip_level,
             mip_level_count,
             base_array_layer,
@@ -2306,8 +2322,8 @@ impl BindGroupInner {
 
         let mut image_descriptor = dk::DkImageDescriptor::zeroed();
         let mut image_view = dk::DkImageView::defaults(image.0);
-        if *array_layer_count > 1 {
-            image_view.type_ = dk::DkImageType::DkImageType_2DArray;
+        if let Some(view_type) = map_texture_view_dimension(*view_dimension)? {
+            image_view.type_ = view_type;
         }
         image_view.mipLevelOffset = *base_mip_level;
         image_view.mipLevelCount = 1;
@@ -3380,7 +3396,10 @@ fn supported_texture_bind_group_layout_kind(
                 wgt::BindingType::Texture {
                     sample_type: wgt::TextureSampleType::Float { .. },
                     view_dimension:
-                        wgt::TextureViewDimension::D2 | wgt::TextureViewDimension::D2Array,
+                        wgt::TextureViewDimension::D2
+                        | wgt::TextureViewDimension::D2Array
+                        | wgt::TextureViewDimension::Cube
+                        | wgt::TextureViewDimension::CubeArray,
                     multisampled: false,
                 },
             ) if binding < DEKO_IMAGE_BINDING_COUNT => {
@@ -3484,7 +3503,11 @@ fn supported_buffer_texture_sampler_storage_texture_bind_group_layout_kind_group
         match entry.ty {
             wgt::BindingType::Texture {
                 sample_type: wgt::TextureSampleType::Float { .. },
-                view_dimension: wgt::TextureViewDimension::D2 | wgt::TextureViewDimension::D2Array,
+                view_dimension:
+                    wgt::TextureViewDimension::D2
+                    | wgt::TextureViewDimension::D2Array
+                    | wgt::TextureViewDimension::Cube
+                    | wgt::TextureViewDimension::CubeArray,
                 multisampled: false,
             } if entry.binding < DEKO_IMAGE_BINDING_COUNT => {
                 textures.push((entry.binding, entry.visibility));
@@ -3559,7 +3582,11 @@ fn supported_buffer_texture_sampler_bind_group_layout_kind_group(
         match entry.ty {
             wgt::BindingType::Texture {
                 sample_type: wgt::TextureSampleType::Float { .. },
-                view_dimension: wgt::TextureViewDimension::D2 | wgt::TextureViewDimension::D2Array,
+                view_dimension:
+                    wgt::TextureViewDimension::D2
+                    | wgt::TextureViewDimension::D2Array
+                    | wgt::TextureViewDimension::Cube
+                    | wgt::TextureViewDimension::CubeArray,
                 multisampled: false,
             } if entry.binding < DEKO_IMAGE_BINDING_COUNT => {
                 textures.push((entry.binding, entry.visibility));
@@ -4255,6 +4282,7 @@ impl crate::Device for Device {
                 image: *image,
                 extent: *extent,
                 sample_count: 1,
+                view_dimension: wgt::TextureViewDimension::D2,
                 base_mip_level: 0,
                 mip_level_count: 1,
                 base_array_layer: 0,
@@ -4269,8 +4297,14 @@ impl crate::Device for Device {
                     .ok_or(crate::DeviceError::Lost)?;
                 if !matches!(
                     desc.dimension,
-                    wgt::TextureViewDimension::D2 | wgt::TextureViewDimension::D2Array
+                    wgt::TextureViewDimension::D2
+                        | wgt::TextureViewDimension::D2Array
+                        | wgt::TextureViewDimension::Cube
+                        | wgt::TextureViewDimension::CubeArray
                 ) || (desc.dimension == wgt::TextureViewDimension::D2 && array_layer_count != 1)
+                    || (desc.dimension == wgt::TextureViewDimension::Cube && array_layer_count != 6)
+                    || (desc.dimension == wgt::TextureViewDimension::CubeArray
+                        && array_layer_count % 6 != 0)
                     || mip_level_count == 0
                     || desc
                         .range
@@ -4282,6 +4316,13 @@ impl crate::Device for Device {
                     return Err(crate::DeviceError::Lost);
                 }
                 let extent = texture.mip_extent(desc.range.base_mip_level)?;
+                if matches!(
+                    desc.dimension,
+                    wgt::TextureViewDimension::Cube | wgt::TextureViewDimension::CubeArray
+                ) && extent.width != extent.height
+                {
+                    return Err(crate::DeviceError::Lost);
+                }
                 if desc
                     .range
                     .base_array_layer
@@ -4295,6 +4336,7 @@ impl crate::Device for Device {
                     image: texture.raw_image(),
                     extent,
                     sample_count: texture.sample_count(),
+                    view_dimension: desc.dimension,
                     base_mip_level: u8::try_from(desc.range.base_mip_level)
                         .map_err(|_| crate::DeviceError::Lost)?,
                     mip_level_count: u8::try_from(mip_level_count)
