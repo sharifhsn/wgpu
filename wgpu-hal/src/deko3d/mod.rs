@@ -113,6 +113,12 @@ pub enum BindGroupLayoutKind {
         buffers: Vec<BufferBindGroupLayoutKind>,
         storage_texture: StorageTextureBindGroupLayoutKind,
     },
+    BufferTextureSamplerGroup {
+        buffers: Vec<BufferBindGroupLayoutKind>,
+        texture_binding: u32,
+        sampler_binding: u32,
+        visibility: wgt::ShaderStages,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -278,25 +284,15 @@ struct SamplerInnerRaw {
 
 #[cfg(target_os = "horizon")]
 pub(super) enum BindGroupInnerRaw {
-    TextureSampler {
-        texture_binding: u32,
-        visibility: wgt::ShaderStages,
-        #[allow(dead_code)]
-        sampler_binding: u32,
-        #[allow(dead_code)]
-        texture: Arc<TextureInner>,
-        #[allow(dead_code)]
-        sampler: Arc<SamplerInner>,
-        descriptor_mem_block: dk::DkMemBlock,
-        image_descriptor_gpu_addr: dk::DkGpuAddr,
-        sampler_descriptor_gpu_addr: dk::DkGpuAddr,
-        image_descriptor: dk::DkImageDescriptor,
-        sampler_descriptor: dk::DkSamplerDescriptor,
-    },
+    TextureSampler(TextureSamplerBinding),
     UniformBuffer(UniformBufferBinding),
     StorageBuffer(StorageBufferBinding),
     StorageTexture(StorageTextureBinding),
     BufferGroup(Vec<BufferBinding>),
+    BufferTextureSamplerGroup {
+        buffers: Vec<BufferBinding>,
+        texture_sampler: TextureSamplerBinding,
+    },
     BufferStorageTextureGroup {
         buffers: Vec<BufferBinding>,
         storage_texture: StorageTextureBinding,
@@ -319,6 +315,23 @@ pub(super) struct UniformBufferBinding {
 pub(super) enum BufferBinding {
     Uniform(UniformBufferBinding),
     Storage(StorageBufferBinding),
+}
+
+#[cfg(target_os = "horizon")]
+pub(super) struct TextureSamplerBinding {
+    texture_binding: u32,
+    visibility: wgt::ShaderStages,
+    #[allow(dead_code)]
+    sampler_binding: u32,
+    #[allow(dead_code)]
+    texture: Arc<TextureInner>,
+    #[allow(dead_code)]
+    sampler: Arc<SamplerInner>,
+    descriptor_mem_block: dk::DkMemBlock,
+    image_descriptor_gpu_addr: dk::DkGpuAddr,
+    sampler_descriptor_gpu_addr: dk::DkGpuAddr,
+    image_descriptor: dk::DkImageDescriptor,
+    sampler_descriptor: dk::DkSamplerDescriptor,
 }
 
 #[cfg(target_os = "horizon")]
@@ -653,57 +666,8 @@ impl BindGroupInner {
         dynamic_offsets: &[wgt::DynamicOffset],
     ) -> DeviceResult<()> {
         match &self.inner {
-            BindGroupInnerRaw::TextureSampler {
-                texture_binding,
-                visibility,
-                image_descriptor_gpu_addr,
-                sampler_descriptor_gpu_addr,
-                image_descriptor,
-                sampler_descriptor,
-                ..
-            } => unsafe {
-                if !dynamic_offsets.is_empty() {
-                    return Err(crate::DeviceError::Lost);
-                }
-                dk::dkCmdBufPushData(
-                    cmdbuf,
-                    *image_descriptor_gpu_addr,
-                    ptr::addr_of!(*image_descriptor).cast(),
-                    size_of::<dk::DkImageDescriptor>() as u32,
-                );
-                dk::dkCmdBufPushData(
-                    cmdbuf,
-                    *sampler_descriptor_gpu_addr,
-                    ptr::addr_of!(*sampler_descriptor).cast(),
-                    size_of::<dk::DkSamplerDescriptor>() as u32,
-                );
-                dk::dkCmdBufBindImageDescriptorSet(cmdbuf, *image_descriptor_gpu_addr, 1);
-                dk::dkCmdBufBindSamplerDescriptorSet(cmdbuf, *sampler_descriptor_gpu_addr, 1);
-                let handle = dk::dkMakeTextureHandle(0, 0);
-                if visibility.contains(wgt::ShaderStages::VERTEX) {
-                    dk::dkCmdBufBindTexture(
-                        cmdbuf,
-                        dk::DkStage::DkStage_Vertex,
-                        *texture_binding,
-                        handle,
-                    );
-                }
-                if visibility.contains(wgt::ShaderStages::FRAGMENT) {
-                    dk::dkCmdBufBindTexture(
-                        cmdbuf,
-                        dk::DkStage::DkStage_Fragment,
-                        *texture_binding,
-                        handle,
-                    );
-                }
-                if visibility.contains(wgt::ShaderStages::COMPUTE) {
-                    dk::dkCmdBufBindTexture(
-                        cmdbuf,
-                        dk::DkStage::DkStage_Compute,
-                        *texture_binding,
-                        handle,
-                    );
-                }
+            BindGroupInnerRaw::TextureSampler(binding) => unsafe {
+                binding.bind(cmdbuf, dynamic_offsets)?;
             },
             BindGroupInnerRaw::UniformBuffer(binding) => unsafe {
                 binding.bind(cmdbuf, dynamic_offsets)?;
@@ -728,6 +692,24 @@ impl BindGroupInner {
                     return Err(crate::DeviceError::Lost);
                 }
             }
+            BindGroupInnerRaw::BufferTextureSamplerGroup {
+                buffers,
+                texture_sampler,
+            } => {
+                let mut dynamic_offsets = dynamic_offsets.iter();
+                for binding in buffers {
+                    let dynamic_offset = if binding.has_dynamic_offset() {
+                        Some(*dynamic_offsets.next().ok_or(crate::DeviceError::Lost)?)
+                    } else {
+                        None
+                    };
+                    unsafe { binding.bind(cmdbuf, dynamic_offset)? };
+                }
+                if dynamic_offsets.next().is_some() {
+                    return Err(crate::DeviceError::Lost);
+                }
+                unsafe { texture_sampler.bind(cmdbuf, &[])? };
+            }
             BindGroupInnerRaw::BufferStorageTextureGroup {
                 buffers,
                 storage_texture,
@@ -745,6 +727,61 @@ impl BindGroupInner {
                     return Err(crate::DeviceError::Lost);
                 }
                 unsafe { storage_texture.bind(cmdbuf, &[])? };
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "horizon")]
+impl TextureSamplerBinding {
+    unsafe fn bind(
+        &self,
+        cmdbuf: dk::DkCmdBuf,
+        dynamic_offsets: &[wgt::DynamicOffset],
+    ) -> DeviceResult<()> {
+        if !dynamic_offsets.is_empty() {
+            return Err(crate::DeviceError::Lost);
+        }
+        unsafe {
+            dk::dkCmdBufPushData(
+                cmdbuf,
+                self.image_descriptor_gpu_addr,
+                ptr::addr_of!(self.image_descriptor).cast(),
+                size_of::<dk::DkImageDescriptor>() as u32,
+            );
+            dk::dkCmdBufPushData(
+                cmdbuf,
+                self.sampler_descriptor_gpu_addr,
+                ptr::addr_of!(self.sampler_descriptor).cast(),
+                size_of::<dk::DkSamplerDescriptor>() as u32,
+            );
+            dk::dkCmdBufBindImageDescriptorSet(cmdbuf, self.image_descriptor_gpu_addr, 1);
+            dk::dkCmdBufBindSamplerDescriptorSet(cmdbuf, self.sampler_descriptor_gpu_addr, 1);
+            let handle = dk::dkMakeTextureHandle(0, 0);
+            if self.visibility.contains(wgt::ShaderStages::VERTEX) {
+                dk::dkCmdBufBindTexture(
+                    cmdbuf,
+                    dk::DkStage::DkStage_Vertex,
+                    self.texture_binding,
+                    handle,
+                );
+            }
+            if self.visibility.contains(wgt::ShaderStages::FRAGMENT) {
+                dk::dkCmdBufBindTexture(
+                    cmdbuf,
+                    dk::DkStage::DkStage_Fragment,
+                    self.texture_binding,
+                    handle,
+                );
+            }
+            if self.visibility.contains(wgt::ShaderStages::COMPUTE) {
+                dk::dkCmdBufBindTexture(
+                    cmdbuf,
+                    dk::DkStage::DkStage_Compute,
+                    self.texture_binding,
+                    handle,
+                );
             }
         }
         Ok(())
@@ -1037,8 +1074,20 @@ impl Drop for TextureInnerRaw {
 impl Drop for BindGroupInnerRaw {
     fn drop(&mut self) {
         match self {
-            Self::TextureSampler {
+            Self::TextureSampler(TextureSamplerBinding {
                 descriptor_mem_block,
+                ..
+            }) => {
+                if !descriptor_mem_block.is_null() {
+                    unsafe { dk::dkMemBlockDestroy(*descriptor_mem_block) };
+                }
+            }
+            Self::BufferTextureSamplerGroup {
+                texture_sampler:
+                    TextureSamplerBinding {
+                        descriptor_mem_block,
+                        ..
+                    },
                 ..
             } => {
                 if !descriptor_mem_block.is_null() {
@@ -1859,6 +1908,21 @@ impl BindGroupInner {
                 Self::new_storage_texture(raw_device, desc, *binding, *visibility, *access, *format)
             },
             BindGroupLayoutKind::BufferGroup(entries) => Self::new_buffer_group(desc, entries),
+            BindGroupLayoutKind::BufferTextureSamplerGroup {
+                buffers,
+                texture_binding,
+                sampler_binding,
+                visibility,
+            } => unsafe {
+                Self::new_buffer_texture_sampler_group(
+                    raw_device,
+                    desc,
+                    buffers,
+                    *texture_binding,
+                    *sampler_binding,
+                    *visibility,
+                )
+            },
             BindGroupLayoutKind::BufferStorageTextureGroup {
                 buffers,
                 storage_texture,
@@ -1885,6 +1949,28 @@ impl BindGroupInner {
             return Err(crate::DeviceError::Lost);
         }
 
+        let texture_sampler = unsafe {
+            Self::make_texture_sampler_binding(
+                raw_device,
+                desc,
+                texture_binding,
+                sampler_binding,
+                visibility,
+            )?
+        };
+
+        Ok(Self {
+            inner: BindGroupInnerRaw::TextureSampler(texture_sampler),
+        })
+    }
+
+    unsafe fn make_texture_sampler_binding(
+        raw_device: dk::DkDevice,
+        desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
+        texture_binding: u32,
+        sampler_binding: u32,
+        visibility: wgt::ShaderStages,
+    ) -> DeviceResult<TextureSamplerBinding> {
         let Some(texture_entry) = desc
             .entries
             .iter()
@@ -1973,19 +2059,17 @@ impl BindGroupInner {
             dk::DK_SAMPLER_DESCRIPTOR_ALIGNMENT,
         ) as u64;
 
-        Ok(Self {
-            inner: BindGroupInnerRaw::TextureSampler {
-                texture_binding,
-                visibility,
-                sampler_binding,
-                texture: texture.clone(),
-                sampler: sampler.clone(),
-                descriptor_mem_block,
-                image_descriptor_gpu_addr: descriptor_gpu_addr,
-                sampler_descriptor_gpu_addr: descriptor_gpu_addr + sampler_offset,
-                image_descriptor,
-                sampler_descriptor,
-            },
+        Ok(TextureSamplerBinding {
+            texture_binding,
+            visibility,
+            sampler_binding,
+            texture: texture.clone(),
+            sampler: sampler.clone(),
+            descriptor_mem_block,
+            image_descriptor_gpu_addr: descriptor_gpu_addr,
+            sampler_descriptor_gpu_addr: descriptor_gpu_addr + sampler_offset,
+            image_descriptor,
+            sampler_descriptor,
         })
     }
 
@@ -2229,6 +2313,88 @@ impl BindGroupInner {
         })
     }
 
+    unsafe fn new_buffer_texture_sampler_group(
+        raw_device: dk::DkDevice,
+        desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
+        buffer_layouts: &[BufferBindGroupLayoutKind],
+        texture_binding: u32,
+        sampler_binding: u32,
+        visibility: wgt::ShaderStages,
+    ) -> DeviceResult<Self> {
+        if desc.buffers.len() != buffer_layouts.len()
+            || desc.samplers.len() != 1
+            || desc.textures.len() != 1
+            || !desc.acceleration_structures.is_empty()
+            || !desc.external_textures.is_empty()
+            || desc.entries.len() != buffer_layouts.len() + 2
+        {
+            return Err(crate::DeviceError::Lost);
+        }
+
+        let mut buffers = Vec::with_capacity(buffer_layouts.len());
+        for layout_entry in buffer_layouts {
+            let Some(entry) = desc
+                .entries
+                .iter()
+                .find(|entry| entry.binding == layout_entry.binding())
+            else {
+                return Err(crate::DeviceError::Lost);
+            };
+            if entry.count != 1 {
+                return Err(crate::DeviceError::Lost);
+            }
+            let Some(buffer) = desc.buffers.get(entry.resource_index as usize) else {
+                return Err(crate::DeviceError::Lost);
+            };
+
+            match *layout_entry {
+                BufferBindGroupLayoutKind::Uniform {
+                    binding,
+                    visibility,
+                    has_dynamic_offset,
+                } => {
+                    buffers.push(BufferBinding::Uniform(Self::make_uniform_buffer_binding(
+                        binding,
+                        visibility,
+                        has_dynamic_offset,
+                        buffer,
+                    )?));
+                }
+                BufferBindGroupLayoutKind::Storage {
+                    binding,
+                    visibility,
+                    read_only,
+                    has_dynamic_offset,
+                } => {
+                    buffers.push(BufferBinding::Storage(Self::make_storage_buffer_binding(
+                        binding,
+                        visibility,
+                        read_only,
+                        has_dynamic_offset,
+                        buffer,
+                    )?));
+                }
+            }
+        }
+
+        let texture_sampler = unsafe {
+            Self::make_texture_sampler_binding(
+                raw_device,
+                desc,
+                texture_binding,
+                sampler_binding,
+                visibility,
+            )?
+        };
+
+        Ok(Self {
+            inner: BindGroupInnerRaw::BufferTextureSamplerGroup {
+                buffers,
+                texture_sampler,
+            },
+        })
+    }
+
     unsafe fn new_buffer_storage_texture_group(
         raw_device: dk::DkDevice,
         desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
@@ -2432,6 +2598,9 @@ fn supported_bind_group_layout_kind(
     }
 
     if entries.len() > 1 {
+        if let Some(kind) = supported_buffer_texture_sampler_bind_group_layout_kind_group(entries) {
+            return Some(kind);
+        }
         if let Some(kind) = supported_buffer_storage_texture_bind_group_layout_kind_group(entries) {
             return Some(kind);
         }
@@ -2552,6 +2721,64 @@ fn supported_pipeline_layout(bind_group_layouts: &[Option<&Resource>]) -> bool {
             }
             Resource::BindGroupLayout(BindGroupLayoutKind::BufferGroup(entries)) => {
                 for entry in entries {
+                    let binding = entry.binding();
+                    let visibility = entry.visibility();
+                    let Some(binding_mask) = 1u32.checked_shl(binding) else {
+                        return false;
+                    };
+                    match entry {
+                        BufferBindGroupLayoutKind::Uniform { .. } => {
+                            if visibility.contains(wgt::ShaderStages::VERTEX) {
+                                if vertex_uniform_bindings & binding_mask != 0 {
+                                    return false;
+                                }
+                                vertex_uniform_bindings |= binding_mask;
+                            }
+                            if visibility.contains(wgt::ShaderStages::FRAGMENT) {
+                                if fragment_uniform_bindings & binding_mask != 0 {
+                                    return false;
+                                }
+                                fragment_uniform_bindings |= binding_mask;
+                            }
+                            if visibility.contains(wgt::ShaderStages::COMPUTE) {
+                                if compute_uniform_bindings & binding_mask != 0 {
+                                    return false;
+                                }
+                                compute_uniform_bindings |= binding_mask;
+                            }
+                        }
+                        BufferBindGroupLayoutKind::Storage { .. } => {
+                            if visibility.contains(wgt::ShaderStages::VERTEX) {
+                                if vertex_storage_bindings & binding_mask != 0 {
+                                    return false;
+                                }
+                                vertex_storage_bindings |= binding_mask;
+                            }
+                            if visibility.contains(wgt::ShaderStages::FRAGMENT) {
+                                if fragment_storage_bindings & binding_mask != 0 {
+                                    return false;
+                                }
+                                fragment_storage_bindings |= binding_mask;
+                            }
+                            if visibility.contains(wgt::ShaderStages::COMPUTE) {
+                                if compute_storage_bindings & binding_mask != 0 {
+                                    return false;
+                                }
+                                compute_storage_bindings |= binding_mask;
+                            }
+                        }
+                    }
+                }
+            }
+            Resource::BindGroupLayout(BindGroupLayoutKind::BufferTextureSamplerGroup {
+                buffers,
+                ..
+            }) => {
+                if has_texture_sampler || has_storage_texture {
+                    return false;
+                }
+                has_texture_sampler = true;
+                for entry in buffers {
                     let binding = entry.binding();
                     let visibility = entry.visibility();
                     let Some(binding_mask) = 1u32.checked_shl(binding) else {
@@ -2780,6 +3007,70 @@ fn supported_storage_texture_binding_layout_kind(
         }
         _ => None,
     }
+}
+
+fn supported_buffer_texture_sampler_bind_group_layout_kind_group(
+    entries: &[wgt::BindGroupLayoutEntry],
+) -> Option<BindGroupLayoutKind> {
+    let mut buffer_entries = Vec::with_capacity(entries.len().saturating_sub(2));
+    let mut texture_binding = None;
+    let mut sampler_binding = None;
+    let mut texture_sampler_visibility = wgt::ShaderStages::empty();
+    let mut bindings = 0u32;
+
+    for entry in entries {
+        let binding_mask = 1u32.checked_shl(entry.binding)?;
+        if bindings & binding_mask != 0 {
+            return None;
+        }
+        bindings |= binding_mask;
+
+        if let Some(kind) = supported_buffer_binding_layout_kind(*entry) {
+            buffer_entries.push(kind);
+            continue;
+        }
+
+        if entry.count.is_some()
+            || entry.visibility.is_empty()
+            || !(wgt::ShaderStages::VERTEX_FRAGMENT | wgt::ShaderStages::COMPUTE)
+                .contains(entry.visibility)
+        {
+            return None;
+        }
+
+        match entry.ty {
+            wgt::BindingType::Texture {
+                sample_type: wgt::TextureSampleType::Float { .. },
+                view_dimension: wgt::TextureViewDimension::D2,
+                multisampled: false,
+            } if entry.binding < DEKO_IMAGE_BINDING_COUNT => {
+                if texture_binding.replace(entry.binding).is_some() {
+                    return None;
+                }
+                texture_sampler_visibility |= entry.visibility;
+            }
+            wgt::BindingType::Sampler(
+                wgt::SamplerBindingType::Filtering | wgt::SamplerBindingType::NonFiltering,
+            ) => {
+                if sampler_binding.replace(entry.binding).is_some() {
+                    return None;
+                }
+                texture_sampler_visibility |= entry.visibility;
+            }
+            _ => return None,
+        }
+    }
+
+    if buffer_entries.is_empty() {
+        return None;
+    }
+
+    Some(BindGroupLayoutKind::BufferTextureSamplerGroup {
+        buffers: buffer_entries,
+        texture_binding: texture_binding?,
+        sampler_binding: sampler_binding?,
+        visibility: texture_sampler_visibility,
+    })
 }
 
 fn supported_buffer_storage_texture_bind_group_layout_kind_group(
