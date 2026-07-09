@@ -75,6 +75,10 @@ pub enum Resource {
         image: RawImage,
         extent: wgt::Extent3d,
         sample_count: u32,
+        base_mip_level: u8,
+        mip_level_count: u8,
+        base_array_layer: u16,
+        array_layer_count: u16,
         owner: Option<Arc<TextureInner>>,
     },
 }
@@ -194,6 +198,7 @@ struct TextureInnerRaw {
     image: dk::DkImage,
     extent: wgt::Extent3d,
     format: wgt::TextureFormat,
+    mip_level_count: u32,
     sample_count: u32,
 }
 
@@ -452,20 +457,6 @@ impl TextureInner {
     }
 
     #[cfg(target_os = "horizon")]
-    pub(super) fn extent(&self) -> wgt::Extent3d {
-        self.inner.extent
-    }
-
-    #[cfg(not(target_os = "horizon"))]
-    pub(super) fn extent(&self) -> wgt::Extent3d {
-        wgt::Extent3d {
-            width: 0,
-            height: 0,
-            depth_or_array_layers: 1,
-        }
-    }
-
-    #[cfg(target_os = "horizon")]
     pub(super) fn format(&self) -> wgt::TextureFormat {
         self.inner.format
     }
@@ -474,6 +465,37 @@ impl TextureInner {
     #[allow(dead_code)]
     pub(super) fn format(&self) -> wgt::TextureFormat {
         wgt::TextureFormat::Rgba8Unorm
+    }
+
+    #[cfg(target_os = "horizon")]
+    pub(super) fn mip_level_count(&self) -> u32 {
+        self.inner.mip_level_count
+    }
+
+    #[cfg(not(target_os = "horizon"))]
+    pub(super) fn mip_level_count(&self) -> u32 {
+        1
+    }
+
+    #[cfg(target_os = "horizon")]
+    pub(super) fn mip_extent(&self, mip_level: u32) -> DeviceResult<wgt::Extent3d> {
+        if mip_level >= self.inner.mip_level_count {
+            return Err(crate::DeviceError::Lost);
+        }
+        Ok(wgt::Extent3d {
+            width: mip_dimension(self.inner.extent.width, mip_level),
+            height: mip_dimension(self.inner.extent.height, mip_level),
+            depth_or_array_layers: self.inner.extent.depth_or_array_layers,
+        })
+    }
+
+    #[cfg(not(target_os = "horizon"))]
+    pub(super) fn mip_extent(&self, _mip_level: u32) -> DeviceResult<wgt::Extent3d> {
+        Ok(wgt::Extent3d {
+            width: 0,
+            height: 0,
+            depth_or_array_layers: 1,
+        })
     }
 
     #[cfg(target_os = "horizon")]
@@ -1233,7 +1255,8 @@ impl TextureInner {
         let format_support = texture_format_support(desc.format).ok_or(crate::DeviceError::Lost)?;
         let ms_mode = map_sample_count(desc.sample_count)?;
         if desc.dimension != wgt::TextureDimension::D2
-            || desc.mip_level_count != 1
+            || desc.mip_level_count == 0
+            || desc.mip_level_count > u32::from(u8::MAX)
             || desc.size.width == 0
             || desc.size.height == 0
             || desc.size.depth_or_array_layers != 1
@@ -1260,7 +1283,7 @@ impl TextureInner {
         image_layout_maker.msMode = ms_mode;
         image_layout_maker.dimensions[0] = desc.size.width;
         image_layout_maker.dimensions[1] = desc.size.height;
-        image_layout_maker.mipLevels = 1;
+        image_layout_maker.mipLevels = desc.mip_level_count;
 
         let mut texture_layout = dk::DkImageLayout::zeroed();
         unsafe { dk::dkImageLayoutInitialize(&mut texture_layout, &image_layout_maker) };
@@ -1286,6 +1309,7 @@ impl TextureInner {
                 image,
                 extent: desc.size,
                 format: desc.format,
+                mip_level_count: desc.mip_level_count,
                 sample_count: desc.sample_count,
             },
         })
@@ -1444,6 +1468,10 @@ impl BindGroupInner {
         }
         let Resource::TextureView {
             image,
+            base_mip_level,
+            mip_level_count,
+            base_array_layer,
+            array_layer_count,
             owner: Some(texture),
             ..
         } = texture_binding.view
@@ -1472,7 +1500,11 @@ impl BindGroupInner {
         }
 
         let mut image_descriptor = dk::DkImageDescriptor::zeroed();
-        let image_view = dk::DkImageView::defaults(image.0);
+        let mut image_view = dk::DkImageView::defaults(image.0);
+        image_view.mipLevelOffset = *base_mip_level;
+        image_view.mipLevelCount = *mip_level_count;
+        image_view.layerOffset = *base_array_layer;
+        image_view.layerCount = *array_layer_count;
         let mut sampler_descriptor = dk::DkSamplerDescriptor::zeroed();
         unsafe {
             dk::dkImageDescriptorInitialize(&mut image_descriptor, &image_view, false, false);
@@ -1729,6 +1761,11 @@ impl Drop for SurfaceStateInner {
 #[cfg(target_os = "horizon")]
 fn align_up(value: u32, alignment: u32) -> u32 {
     (value + alignment - 1) & !(alignment - 1)
+}
+
+#[cfg(target_os = "horizon")]
+fn mip_dimension(value: u32, mip_level: u32) -> u32 {
+    value.checked_shr(mip_level).unwrap_or(0).max(1)
 }
 
 impl Adapter {
@@ -2218,14 +2255,44 @@ impl crate::Device for Device {
                 image: *image,
                 extent: *extent,
                 sample_count: 1,
+                base_mip_level: 0,
+                mip_level_count: 1,
+                base_array_layer: 0,
+                array_layer_count: 1,
                 owner: None,
             }),
-            Resource::Texture(texture) => Ok(Resource::TextureView {
-                image: texture.raw_image(),
-                extent: texture.extent(),
-                sample_count: texture.sample_count(),
-                owner: Some(texture.clone()),
-            }),
+            Resource::Texture(texture) => {
+                let mip_level_count = desc.range.mip_level_count.ok_or(crate::DeviceError::Lost)?;
+                let array_layer_count = desc
+                    .range
+                    .array_layer_count
+                    .ok_or(crate::DeviceError::Lost)?;
+                if desc.dimension != wgt::TextureViewDimension::D2
+                    || desc.range.base_array_layer != 0
+                    || array_layer_count != 1
+                    || mip_level_count == 0
+                    || desc
+                        .range
+                        .base_mip_level
+                        .checked_add(mip_level_count)
+                        .ok_or(crate::DeviceError::Lost)?
+                        > texture.mip_level_count()
+                {
+                    return Err(crate::DeviceError::Lost);
+                }
+                Ok(Resource::TextureView {
+                    image: texture.raw_image(),
+                    extent: texture.mip_extent(desc.range.base_mip_level)?,
+                    sample_count: texture.sample_count(),
+                    base_mip_level: u8::try_from(desc.range.base_mip_level)
+                        .map_err(|_| crate::DeviceError::Lost)?,
+                    mip_level_count: u8::try_from(mip_level_count)
+                        .map_err(|_| crate::DeviceError::Lost)?,
+                    base_array_layer: 0,
+                    array_layer_count: 1,
+                    owner: Some(texture.clone()),
+                })
+            }
             _ => Err(crate::DeviceError::Lost),
         }
     }

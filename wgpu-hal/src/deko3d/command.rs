@@ -1041,12 +1041,11 @@ fn supports_sample_count(sample_count: u32) -> bool {
 
 #[cfg(target_os = "horizon")]
 fn texture_copy_rect(
+    texture: &TextureInner,
     base: &crate::TextureCopyBase,
     size: crate::CopyExtent,
-    extent: wgt::Extent3d,
 ) -> DeviceResult<dk::DkImageRect> {
-    if base.mip_level != 0
-        || base.array_layer != 0
+    if base.array_layer != 0
         || base.origin.z != 0
         || base.aspect != crate::FormatAspects::COLOR
         || size.depth != 1
@@ -1054,6 +1053,7 @@ fn texture_copy_rect(
         return Err(crate::DeviceError::Lost);
     }
 
+    let extent = texture.mip_extent(base.mip_level)?;
     let end_x = base
         .origin
         .x
@@ -1076,6 +1076,19 @@ fn texture_copy_rect(
         height: size.height,
         depth: size.depth,
     })
+}
+
+#[cfg(target_os = "horizon")]
+fn texture_copy_view(texture: &TextureInner, mip_level: u32) -> DeviceResult<dk::DkImageView> {
+    if mip_level >= texture.mip_level_count() {
+        return Err(crate::DeviceError::Lost);
+    }
+    let mut view = dk::DkImageView::defaults(texture.raw_image().0);
+    view.mipLevelOffset = u8::try_from(mip_level).map_err(|_| crate::DeviceError::Lost)?;
+    view.mipLevelCount = 1;
+    view.layerOffset = 0;
+    view.layerCount = 1;
+    Ok(view)
 }
 
 #[cfg(target_os = "horizon")]
@@ -1144,9 +1157,9 @@ unsafe fn submit_copy_buffer_to_texture(
 ) -> DeviceResult<()> {
     unsafe {
         submit_deko_commands(queue, surface_queue, |cmdbuf| {
-            let dst_view = dk::DkImageView::defaults(dst.raw_image().0);
             for region in regions {
-                let copy_rect = texture_copy_rect(&region.texture_base, region.size, dst.extent())?;
+                let copy_rect = texture_copy_rect(dst, &region.texture_base, region.size)?;
+                let dst_view = texture_copy_view(dst, region.texture_base.mip_level)?;
                 let texel_size = copy_texel_size(dst.format())?;
                 let copy_src = buffer_copy_region(src, region, texel_size)?;
                 dk::dkCmdBufCopyBufferToImage(cmdbuf, &copy_src, &dst_view, &copy_rect, 0);
@@ -1180,11 +1193,11 @@ unsafe fn submit_copy_texture_to_texture(
     }
     unsafe {
         submit_deko_commands(queue, surface_queue, |cmdbuf| {
-            let src_view = dk::DkImageView::defaults(src.raw_image().0);
-            let dst_view = dk::DkImageView::defaults(dst.raw_image().0);
             for region in regions {
-                let src_rect = texture_copy_rect(&region.src_base, region.size, src.extent())?;
-                let dst_rect = texture_copy_rect(&region.dst_base, region.size, dst.extent())?;
+                let src_rect = texture_copy_rect(src, &region.src_base, region.size)?;
+                let dst_rect = texture_copy_rect(dst, &region.dst_base, region.size)?;
+                let src_view = texture_copy_view(src, region.src_base.mip_level)?;
+                let dst_view = texture_copy_view(dst, region.dst_base.mip_level)?;
                 dk::dkCmdBufCopyImage(cmdbuf, &src_view, &src_rect, &dst_view, &dst_rect, 0);
             }
             Ok(())
@@ -1216,9 +1229,9 @@ unsafe fn submit_copy_texture_to_buffer(
     }
     unsafe {
         submit_deko_commands(queue, surface_queue, |cmdbuf| {
-            let src_view = dk::DkImageView::defaults(src.raw_image().0);
             for region in regions {
-                let src_rect = texture_copy_rect(&region.texture_base, region.size, src.extent())?;
+                let src_rect = texture_copy_rect(src, &region.texture_base, region.size)?;
+                let src_view = texture_copy_view(src, region.texture_base.mip_level)?;
                 let texel_size = copy_texel_size(src.format())?;
                 let copy_dst = buffer_copy_region(dst, region, texel_size)?;
                 dk::dkCmdBufCopyImageToBuffer(cmdbuf, &src_view, &src_rect, &copy_dst, 0);
