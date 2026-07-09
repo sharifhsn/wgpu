@@ -1338,6 +1338,8 @@ fn texture_copy_view(
 fn copy_texel_size(format: wgt::TextureFormat) -> DeviceResult<u32> {
     match format {
         wgt::TextureFormat::Rgba8Unorm | wgt::TextureFormat::Rgba8UnormSrgb => Ok(4),
+        wgt::TextureFormat::Rg8Unorm => Ok(2),
+        wgt::TextureFormat::R8Unorm => Ok(1),
         wgt::TextureFormat::Depth32Float => Ok(4),
         wgt::TextureFormat::Stencil8 => Ok(1),
         _ => Err(crate::DeviceError::Lost),

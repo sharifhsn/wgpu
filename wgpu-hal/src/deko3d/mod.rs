@@ -1937,7 +1937,7 @@ struct TextureFormatSupport {
 impl TextureFormatSupport {
     fn supports_usage(self, usage: wgt::TextureUses) -> bool {
         match self.usage {
-            TextureUsageRequirement::Intersects(any) => usage.intersects(any),
+            TextureUsageRequirement::Contains(supported) => supported.contains(usage),
         }
     }
 }
@@ -1945,7 +1945,7 @@ impl TextureFormatSupport {
 #[cfg(target_os = "horizon")]
 #[derive(Clone, Copy)]
 enum TextureUsageRequirement {
-    Intersects(wgt::TextureUses),
+    Contains(wgt::TextureUses),
 }
 
 #[cfg(target_os = "horizon")]
@@ -1954,7 +1954,7 @@ fn texture_format_support(format: wgt::TextureFormat) -> Option<TextureFormatSup
         wgt::TextureFormat::Rgba8Unorm | wgt::TextureFormat::Rgba8UnormSrgb => {
             Some(TextureFormatSupport {
                 image_format: map_color_image_format(format)?,
-                usage: TextureUsageRequirement::Intersects(
+                usage: TextureUsageRequirement::Contains(
                     wgt::TextureUses::RESOURCE
                         | wgt::TextureUses::COPY_DST
                         | wgt::TextureUses::STORAGE_READ_ONLY
@@ -1964,9 +1964,17 @@ fn texture_format_support(format: wgt::TextureFormat) -> Option<TextureFormatSup
                 ),
             })
         }
+        wgt::TextureFormat::R8Unorm | wgt::TextureFormat::Rg8Unorm => Some(TextureFormatSupport {
+            image_format: map_texture_image_format(format)?,
+            usage: TextureUsageRequirement::Contains(
+                wgt::TextureUses::RESOURCE
+                    | wgt::TextureUses::COPY_DST
+                    | wgt::TextureUses::COPY_SRC,
+            ),
+        }),
         wgt::TextureFormat::Depth32Float => Some(TextureFormatSupport {
             image_format: dk::DkImageFormat::DkImageFormat_ZF32,
-            usage: TextureUsageRequirement::Intersects(
+            usage: TextureUsageRequirement::Contains(
                 wgt::TextureUses::DEPTH_STENCIL_READ
                     | wgt::TextureUses::DEPTH_STENCIL_WRITE
                     | wgt::TextureUses::COPY_SRC
@@ -1975,7 +1983,7 @@ fn texture_format_support(format: wgt::TextureFormat) -> Option<TextureFormatSup
         }),
         wgt::TextureFormat::Stencil8 => Some(TextureFormatSupport {
             image_format: dk::DkImageFormat::DkImageFormat_S8,
-            usage: TextureUsageRequirement::Intersects(
+            usage: TextureUsageRequirement::Contains(
                 wgt::TextureUses::DEPTH_STENCIL_READ
                     | wgt::TextureUses::DEPTH_STENCIL_WRITE
                     | wgt::TextureUses::COPY_SRC
@@ -2009,7 +2017,21 @@ fn deko3d_texture_format_capabilities(
                 | crate::TextureFormatCapabilities::COPY_SRC
                 | crate::TextureFormatCapabilities::COPY_DST
         }
+        wgt::TextureFormat::R8Unorm | wgt::TextureFormat::Rg8Unorm => {
+            crate::TextureFormatCapabilities::SAMPLED
+                | crate::TextureFormatCapabilities::COPY_SRC
+                | crate::TextureFormatCapabilities::COPY_DST
+        }
         _ => crate::TextureFormatCapabilities::empty(),
+    }
+}
+
+#[cfg(target_os = "horizon")]
+fn map_texture_image_format(format: wgt::TextureFormat) -> Option<dk::DkImageFormat> {
+    match format {
+        wgt::TextureFormat::R8Unorm => Some(dk::DkImageFormat::DkImageFormat_R8_Unorm),
+        wgt::TextureFormat::Rg8Unorm => Some(dk::DkImageFormat::DkImageFormat_RG8_Unorm),
+        _ => map_color_image_format(format),
     }
 }
 
@@ -4653,5 +4675,17 @@ mod tests {
     #[test]
     fn advertises_pipeline_cache_support() {
         assert!(supported_features().contains(wgt::Features::PIPELINE_CACHE));
+    }
+
+    #[test]
+    fn r8_and_rg8_formats_are_sampled_copy_only() {
+        for format in [wgt::TextureFormat::R8Unorm, wgt::TextureFormat::Rg8Unorm] {
+            let capabilities = deko3d_texture_format_capabilities(format);
+            assert!(capabilities.contains(crate::TextureFormatCapabilities::SAMPLED));
+            assert!(capabilities.contains(crate::TextureFormatCapabilities::COPY_SRC));
+            assert!(capabilities.contains(crate::TextureFormatCapabilities::COPY_DST));
+            assert!(!capabilities.contains(crate::TextureFormatCapabilities::COLOR_ATTACHMENT));
+            assert!(!capabilities.contains(crate::TextureFormatCapabilities::STORAGE_READ_ONLY));
+        }
     }
 }
