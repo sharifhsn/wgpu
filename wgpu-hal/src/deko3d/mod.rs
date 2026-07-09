@@ -2290,7 +2290,7 @@ impl BindGroupInner {
             return Err(crate::DeviceError::Lost);
         };
 
-        if *mip_level_count != 1 || *base_array_layer != 0 || *array_layer_count != 1 {
+        if *mip_level_count != 1 || *array_layer_count == 0 {
             return Err(crate::DeviceError::Lost);
         }
 
@@ -2298,10 +2298,13 @@ impl BindGroupInner {
 
         let mut image_descriptor = dk::DkImageDescriptor::zeroed();
         let mut image_view = dk::DkImageView::defaults(image.0);
+        if *array_layer_count > 1 {
+            image_view.type_ = dk::DkImageType::DkImageType_2DArray;
+        }
         image_view.mipLevelOffset = *base_mip_level;
         image_view.mipLevelCount = 1;
-        image_view.layerOffset = 0;
-        image_view.layerCount = 1;
+        image_view.layerOffset = *base_array_layer;
+        image_view.layerCount = *array_layer_count;
         unsafe {
             dk::dkImageDescriptorInitialize(&mut image_descriptor, &image_view, true, false);
         }
@@ -3421,7 +3424,7 @@ fn supported_storage_texture_binding_layout_kind(
         wgt::BindingType::StorageTexture {
             access: wgt::StorageTextureAccess::WriteOnly,
             format: wgt::TextureFormat::Rgba8Unorm,
-            view_dimension: wgt::TextureViewDimension::D2,
+            view_dimension: wgt::TextureViewDimension::D2 | wgt::TextureViewDimension::D2Array,
         } if (wgt::ShaderStages::VERTEX_FRAGMENT | wgt::ShaderStages::COMPUTE)
             .contains(entry.visibility) =>
         {
