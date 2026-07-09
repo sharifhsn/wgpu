@@ -690,11 +690,11 @@ impl SurfaceState {
         device: Arc<DeviceInner>,
         config: &crate::SurfaceConfiguration,
     ) -> Result<Self, crate::SurfaceError> {
-        if config.format != wgt::TextureFormat::Rgba8Unorm {
+        let Some(image_format) = map_color_image_format(config.format) else {
             return Err(crate::SurfaceError::Other(
-                "deko3d surface only supports Rgba8Unorm for now",
+                "deko3d surface only supports Rgba8Unorm/Rgba8UnormSrgb for now",
             ));
-        }
+        };
         if config.present_mode != wgt::PresentMode::Fifo {
             return Err(crate::SurfaceError::Other(
                 "deko3d surface only supports FIFO present mode for now",
@@ -719,7 +719,7 @@ impl SurfaceState {
         image_layout_maker.flags = dk::DkImageFlags_UsageRender
             | dk::DkImageFlags_UsagePresent
             | dk::DkImageFlags_HwCompression;
-        image_layout_maker.format = dk::DkImageFormat::DkImageFormat_RGBA8_Unorm;
+        image_layout_maker.format = image_format;
         image_layout_maker.dimensions[0] = config.extent.width;
         image_layout_maker.dimensions[1] = config.extent.height;
 
@@ -1125,7 +1125,7 @@ fn map_color_targets(
         let Some(color_target) = color_target else {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         };
-        if color_target.format != wgt::TextureFormat::Rgba8Unorm {
+        if map_color_image_format(color_target.format).is_none() {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         }
         let index = u32::try_from(index)
@@ -1291,14 +1291,16 @@ enum TextureUsageRequirement {
 #[cfg(target_os = "horizon")]
 fn texture_format_support(format: wgt::TextureFormat) -> Option<TextureFormatSupport> {
     match format {
-        wgt::TextureFormat::Rgba8Unorm => Some(TextureFormatSupport {
-            image_format: dk::DkImageFormat::DkImageFormat_RGBA8_Unorm,
-            usage: TextureUsageRequirement::Intersects(
-                wgt::TextureUses::RESOURCE
-                    | wgt::TextureUses::COPY_DST
-                    | wgt::TextureUses::COLOR_TARGET,
-            ),
-        }),
+        wgt::TextureFormat::Rgba8Unorm | wgt::TextureFormat::Rgba8UnormSrgb => {
+            Some(TextureFormatSupport {
+                image_format: map_color_image_format(format)?,
+                usage: TextureUsageRequirement::Intersects(
+                    wgt::TextureUses::RESOURCE
+                        | wgt::TextureUses::COPY_DST
+                        | wgt::TextureUses::COLOR_TARGET,
+                ),
+            })
+        }
         wgt::TextureFormat::Depth32Float => Some(TextureFormatSupport {
             image_format: dk::DkImageFormat::DkImageFormat_ZF32,
             usage: TextureUsageRequirement::Intersects(
@@ -1319,7 +1321,7 @@ fn deko3d_texture_format_capabilities(
     format: wgt::TextureFormat,
 ) -> crate::TextureFormatCapabilities {
     match format {
-        wgt::TextureFormat::Rgba8Unorm => {
+        wgt::TextureFormat::Rgba8Unorm | wgt::TextureFormat::Rgba8UnormSrgb => {
             crate::TextureFormatCapabilities::SAMPLED
                 | crate::TextureFormatCapabilities::COLOR_ATTACHMENT
                 | crate::TextureFormatCapabilities::COLOR_ATTACHMENT_BLEND
@@ -1330,6 +1332,17 @@ fn deko3d_texture_format_capabilities(
             crate::TextureFormatCapabilities::DEPTH_STENCIL_ATTACHMENT
         }
         _ => crate::TextureFormatCapabilities::empty(),
+    }
+}
+
+#[cfg(target_os = "horizon")]
+fn map_color_image_format(format: wgt::TextureFormat) -> Option<dk::DkImageFormat> {
+    match format {
+        wgt::TextureFormat::Rgba8Unorm => Some(dk::DkImageFormat::DkImageFormat_RGBA8_Unorm),
+        wgt::TextureFormat::Rgba8UnormSrgb => {
+            Some(dk::DkImageFormat::DkImageFormat_RGBA8_Unorm_sRGB)
+        }
+        _ => None,
     }
 }
 
@@ -2011,10 +2024,16 @@ impl crate::Adapter for Adapter {
 
     unsafe fn surface_capabilities(&self, surface: &Surface) -> Option<crate::SurfaceCapabilities> {
         Some(crate::SurfaceCapabilities {
-            formats: vec![wgt::SurfaceFormatCapabilities {
-                format: wgt::TextureFormat::Rgba8Unorm,
-                color_spaces: wgt::SurfaceColorSpaces::SRGB,
-            }],
+            formats: vec![
+                wgt::SurfaceFormatCapabilities {
+                    format: wgt::TextureFormat::Rgba8Unorm,
+                    color_spaces: wgt::SurfaceColorSpaces::SRGB,
+                },
+                wgt::SurfaceFormatCapabilities {
+                    format: wgt::TextureFormat::Rgba8UnormSrgb,
+                    color_spaces: wgt::SurfaceColorSpaces::SRGB,
+                },
+            ],
             maximum_frame_latency: 1..=2,
             current_extent: Some(wgt::Extent3d {
                 width: DEFAULT_WIDTH,
