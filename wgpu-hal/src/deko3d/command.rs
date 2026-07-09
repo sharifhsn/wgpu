@@ -1299,9 +1299,10 @@ fn texture_copy_view_type(
 #[cfg(target_os = "horizon")]
 fn copy_format_aspect(format: wgt::TextureFormat) -> DeviceResult<crate::FormatAspects> {
     match format {
-        wgt::TextureFormat::Rgba8Unorm | wgt::TextureFormat::Rgba8UnormSrgb => {
-            Ok(crate::FormatAspects::COLOR)
-        }
+        wgt::TextureFormat::Rgba8Unorm
+        | wgt::TextureFormat::Rgba8UnormSrgb
+        | wgt::TextureFormat::Bgra8Unorm
+        | wgt::TextureFormat::Bgra8UnormSrgb => Ok(crate::FormatAspects::COLOR),
         wgt::TextureFormat::Depth32Float => Ok(crate::FormatAspects::DEPTH),
         wgt::TextureFormat::Stencil8 => Ok(crate::FormatAspects::STENCIL),
         _ => Err(crate::DeviceError::Lost),
@@ -1337,7 +1338,10 @@ fn texture_copy_view(
 #[cfg(target_os = "horizon")]
 fn copy_texel_size(format: wgt::TextureFormat) -> DeviceResult<u32> {
     match format {
-        wgt::TextureFormat::Rgba8Unorm | wgt::TextureFormat::Rgba8UnormSrgb => Ok(4),
+        wgt::TextureFormat::Rgba8Unorm
+        | wgt::TextureFormat::Rgba8UnormSrgb
+        | wgt::TextureFormat::Bgra8Unorm
+        | wgt::TextureFormat::Bgra8UnormSrgb => Ok(4),
         wgt::TextureFormat::Rg8Unorm => Ok(2),
         wgt::TextureFormat::R8Unorm => Ok(1),
         wgt::TextureFormat::Depth32Float => Ok(4),

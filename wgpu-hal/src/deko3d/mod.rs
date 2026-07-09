@@ -1559,7 +1559,7 @@ impl SurfaceState {
     ) -> Result<Self, crate::SurfaceError> {
         let Some(image_format) = map_color_image_format(config.format) else {
             return Err(crate::SurfaceError::Other(
-                "deko3d surface only supports Rgba8Unorm/Rgba8UnormSrgb for now",
+                "deko3d surface only supports RGBA8/BGRA8 unorm and sRGB formats for now",
             ));
         };
         if config.present_mode != wgt::PresentMode::Fifo {
@@ -2227,19 +2227,28 @@ enum TextureUsageRequirement {
 #[cfg(target_os = "horizon")]
 fn texture_format_support(format: wgt::TextureFormat) -> Option<TextureFormatSupport> {
     match format {
-        wgt::TextureFormat::Rgba8Unorm | wgt::TextureFormat::Rgba8UnormSrgb => {
-            Some(TextureFormatSupport {
-                image_format: map_color_image_format(format)?,
-                usage: TextureUsageRequirement::Contains(
-                    wgt::TextureUses::RESOURCE
-                        | wgt::TextureUses::COPY_DST
-                        | wgt::TextureUses::STORAGE_READ_ONLY
-                        | wgt::TextureUses::STORAGE_WRITE_ONLY
-                        | wgt::TextureUses::STORAGE_READ_WRITE
-                        | wgt::TextureUses::COLOR_TARGET,
-                ),
-            })
-        }
+        wgt::TextureFormat::Rgba8Unorm => Some(TextureFormatSupport {
+            image_format: map_color_image_format(format)?,
+            usage: TextureUsageRequirement::Contains(
+                wgt::TextureUses::RESOURCE
+                    | wgt::TextureUses::COPY_DST
+                    | wgt::TextureUses::STORAGE_READ_ONLY
+                    | wgt::TextureUses::STORAGE_WRITE_ONLY
+                    | wgt::TextureUses::STORAGE_READ_WRITE
+                    | wgt::TextureUses::COLOR_TARGET,
+            ),
+        }),
+        wgt::TextureFormat::Rgba8UnormSrgb
+        | wgt::TextureFormat::Bgra8Unorm
+        | wgt::TextureFormat::Bgra8UnormSrgb => Some(TextureFormatSupport {
+            image_format: map_color_image_format(format)?,
+            usage: TextureUsageRequirement::Contains(
+                wgt::TextureUses::RESOURCE
+                    | wgt::TextureUses::COPY_DST
+                    | wgt::TextureUses::COPY_SRC
+                    | wgt::TextureUses::COLOR_TARGET,
+            ),
+        }),
         wgt::TextureFormat::R8Unorm | wgt::TextureFormat::Rg8Unorm => Some(TextureFormatSupport {
             image_format: map_texture_image_format(format)?,
             usage: TextureUsageRequirement::Contains(
@@ -2274,7 +2283,10 @@ fn deko3d_texture_format_capabilities(
     format: wgt::TextureFormat,
 ) -> crate::TextureFormatCapabilities {
     match format {
-        wgt::TextureFormat::Rgba8Unorm | wgt::TextureFormat::Rgba8UnormSrgb => {
+        wgt::TextureFormat::Rgba8Unorm
+        | wgt::TextureFormat::Rgba8UnormSrgb
+        | wgt::TextureFormat::Bgra8Unorm
+        | wgt::TextureFormat::Bgra8UnormSrgb => {
             crate::TextureFormatCapabilities::SAMPLED
                 | crate::TextureFormatCapabilities::COLOR_ATTACHMENT
                 | crate::TextureFormatCapabilities::COLOR_ATTACHMENT_BLEND
@@ -2317,6 +2329,10 @@ fn map_color_image_format(format: wgt::TextureFormat) -> Option<dk::DkImageForma
         wgt::TextureFormat::Rgba8Unorm => Some(dk::DkImageFormat::DkImageFormat_RGBA8_Unorm),
         wgt::TextureFormat::Rgba8UnormSrgb => {
             Some(dk::DkImageFormat::DkImageFormat_RGBA8_Unorm_sRGB)
+        }
+        wgt::TextureFormat::Bgra8Unorm => Some(dk::DkImageFormat::DkImageFormat_BGRA8_Unorm),
+        wgt::TextureFormat::Bgra8UnormSrgb => {
+            Some(dk::DkImageFormat::DkImageFormat_BGRA8_Unorm_sRGB)
         }
         _ => None,
     }
@@ -4492,6 +4508,14 @@ impl crate::Adapter for Adapter {
                     format: wgt::TextureFormat::Rgba8UnormSrgb,
                     color_spaces: wgt::SurfaceColorSpaces::SRGB,
                 },
+                wgt::SurfaceFormatCapabilities {
+                    format: wgt::TextureFormat::Bgra8Unorm,
+                    color_spaces: wgt::SurfaceColorSpaces::SRGB,
+                },
+                wgt::SurfaceFormatCapabilities {
+                    format: wgt::TextureFormat::Bgra8UnormSrgb,
+                    color_spaces: wgt::SurfaceColorSpaces::SRGB,
+                },
             ],
             maximum_frame_latency: 1..=2,
             current_extent: Some(wgt::Extent3d {
@@ -4977,6 +5001,22 @@ mod tests {
             assert!(capabilities.contains(crate::TextureFormatCapabilities::COPY_DST));
             assert!(!capabilities.contains(crate::TextureFormatCapabilities::COLOR_ATTACHMENT));
             assert!(!capabilities.contains(crate::TextureFormatCapabilities::STORAGE_READ_ONLY));
+        }
+    }
+
+    #[test]
+    fn bgra8_formats_are_color_copy_formats_without_storage() {
+        for format in [
+            wgt::TextureFormat::Bgra8Unorm,
+            wgt::TextureFormat::Bgra8UnormSrgb,
+        ] {
+            let capabilities = deko3d_texture_format_capabilities(format);
+            assert!(capabilities.contains(crate::TextureFormatCapabilities::SAMPLED));
+            assert!(capabilities.contains(crate::TextureFormatCapabilities::COLOR_ATTACHMENT));
+            assert!(capabilities.contains(crate::TextureFormatCapabilities::COPY_SRC));
+            assert!(capabilities.contains(crate::TextureFormatCapabilities::COPY_DST));
+            assert!(!capabilities.contains(crate::TextureFormatCapabilities::STORAGE_READ_ONLY));
+            assert!(!capabilities.contains(crate::TextureFormatCapabilities::STORAGE_WRITE_ONLY));
         }
     }
 
