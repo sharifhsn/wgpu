@@ -1209,8 +1209,7 @@ fn texture_copy_rect(
     base: &crate::TextureCopyBase,
     size: crate::CopyExtent,
 ) -> DeviceResult<dk::DkImageRect> {
-    if base.origin.z != 0 || base.aspect != copy_format_aspect(texture.format())? || size.depth == 0
-    {
+    if base.aspect != copy_format_aspect(texture.format())? || size.depth == 0 {
         return Err(crate::DeviceError::Lost);
     }
 
@@ -1225,25 +1224,59 @@ fn texture_copy_rect(
         .y
         .checked_add(size.height)
         .ok_or(crate::DeviceError::Lost)?;
-    let end_layer = base
-        .array_layer
-        .checked_add(size.depth)
-        .ok_or(crate::DeviceError::Lost)?;
     if end_x > extent.width || end_y > extent.height {
         return Err(crate::DeviceError::Lost);
     }
-    if end_layer > extent.depth_or_array_layers {
-        return Err(crate::DeviceError::Lost);
-    }
+
+    let z = if texture.dimension() == wgt::TextureDimension::D3 {
+        if base.array_layer != 0 {
+            return Err(crate::DeviceError::Lost);
+        }
+        let end_z = base
+            .origin
+            .z
+            .checked_add(size.depth)
+            .ok_or(crate::DeviceError::Lost)?;
+        if end_z > extent.depth_or_array_layers {
+            return Err(crate::DeviceError::Lost);
+        }
+        base.origin.z
+    } else {
+        if base.origin.z != 0 {
+            return Err(crate::DeviceError::Lost);
+        }
+        let end_layer = base
+            .array_layer
+            .checked_add(size.depth)
+            .ok_or(crate::DeviceError::Lost)?;
+        if end_layer > extent.depth_or_array_layers {
+            return Err(crate::DeviceError::Lost);
+        }
+        0
+    };
 
     Ok(dk::DkImageRect {
         x: base.origin.x,
         y: base.origin.y,
-        z: 0,
+        z,
         width: size.width,
         height: size.height,
         depth: size.depth,
     })
+}
+
+#[cfg(target_os = "horizon")]
+fn texture_copy_view_type(
+    texture: &TextureInner,
+    extent: wgt::Extent3d,
+) -> Option<dk::DkImageType> {
+    match texture.dimension() {
+        wgt::TextureDimension::D2 if extent.depth_or_array_layers > 1 => {
+            Some(dk::DkImageType::DkImageType_2DArray)
+        }
+        wgt::TextureDimension::D3 => Some(dk::DkImageType::DkImageType_3D),
+        _ => None,
+    }
 }
 
 #[cfg(target_os = "horizon")]
@@ -1269,13 +1302,15 @@ fn texture_copy_view(
     }
     let extent = texture.mip_extent(base.mip_level)?;
     let mut view = dk::DkImageView::defaults(texture.raw_image().0);
-    if extent.depth_or_array_layers > 1 {
-        view.type_ = dk::DkImageType::DkImageType_2DArray;
+    if let Some(view_type) = texture_copy_view_type(texture, extent) {
+        view.type_ = view_type;
     }
     view.mipLevelOffset = u8::try_from(base.mip_level).map_err(|_| crate::DeviceError::Lost)?;
     view.mipLevelCount = 1;
-    view.layerOffset = u16::try_from(base.array_layer).map_err(|_| crate::DeviceError::Lost)?;
-    view.layerCount = u16::try_from(layer_count).map_err(|_| crate::DeviceError::Lost)?;
+    if texture.dimension() != wgt::TextureDimension::D3 {
+        view.layerOffset = u16::try_from(base.array_layer).map_err(|_| crate::DeviceError::Lost)?;
+        view.layerCount = u16::try_from(layer_count).map_err(|_| crate::DeviceError::Lost)?;
+    }
     if texture.format() == wgt::TextureFormat::Stencil8 {
         view.dsSource = dk::DkDsSource::DkDsSource_Stencil;
     }
@@ -1314,11 +1349,20 @@ fn buffer_copy_region(
     if rows_per_image < region.size.height {
         return Err(crate::DeviceError::Lost);
     }
-    let required_bytes = if region.size.height == 0 {
+    let depth = region.size.depth.max(1);
+    let required_bytes = if region.size.height == 0 || region.size.width == 0 {
         0
     } else {
-        u64::from(bytes_per_row)
-            .checked_mul(u64::from(region.size.height - 1))
+        let image_stride = u64::from(bytes_per_row)
+            .checked_mul(u64::from(rows_per_image))
+            .ok_or(crate::DeviceError::Lost)?;
+        image_stride
+            .checked_mul(u64::from(depth - 1))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::from(bytes_per_row).checked_mul(u64::from(region.size.height - 1))?,
+                )
+            })
             .and_then(|bytes| bytes.checked_add(u64::from(row_bytes)))
             .ok_or(crate::DeviceError::Lost)?
     };

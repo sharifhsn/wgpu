@@ -287,6 +287,7 @@ pub(super) struct ComputePipelineInnerRaw {
 struct TextureInnerRaw {
     mem_block: dk::DkMemBlock,
     image: dk::DkImage,
+    dimension: wgt::TextureDimension,
     extent: wgt::Extent3d,
     format: wgt::TextureFormat,
     mip_level_count: u32,
@@ -761,6 +762,17 @@ impl TextureInner {
     }
 
     #[cfg(target_os = "horizon")]
+    pub(super) fn dimension(&self) -> wgt::TextureDimension {
+        self.inner.dimension
+    }
+
+    #[cfg(not(target_os = "horizon"))]
+    #[allow(dead_code)]
+    pub(super) fn dimension(&self) -> wgt::TextureDimension {
+        wgt::TextureDimension::D2
+    }
+
+    #[cfg(target_os = "horizon")]
     pub(super) fn mip_level_count(&self) -> u32 {
         self.inner.mip_level_count
     }
@@ -778,7 +790,11 @@ impl TextureInner {
         Ok(wgt::Extent3d {
             width: mip_dimension(self.inner.extent.width, mip_level),
             height: mip_dimension(self.inner.extent.height, mip_level),
-            depth_or_array_layers: self.inner.extent.depth_or_array_layers,
+            depth_or_array_layers: if self.inner.dimension == wgt::TextureDimension::D3 {
+                mip_dimension(self.inner.extent.depth_or_array_layers, mip_level)
+            } else {
+                self.inner.extent.depth_or_array_layers
+            },
         })
     }
 
@@ -1815,20 +1831,37 @@ impl TextureInner {
     unsafe fn new(raw_device: dk::DkDevice, desc: &crate::TextureDescriptor) -> DeviceResult<Self> {
         let format_support = texture_format_support(desc.format).ok_or(crate::DeviceError::Lost)?;
         let ms_mode = map_sample_count(desc.sample_count)?;
-        if desc.dimension != wgt::TextureDimension::D2
-            || desc.mip_level_count == 0
+        if !matches!(
+            desc.dimension,
+            wgt::TextureDimension::D2 | wgt::TextureDimension::D3
+        ) || desc.mip_level_count == 0
             || desc.mip_level_count > u32::from(u8::MAX)
             || desc.size.width == 0
             || desc.size.height == 0
             || desc.size.depth_or_array_layers == 0
+            || (desc.dimension == wgt::TextureDimension::D3 && desc.sample_count != 1)
             || (desc.size.depth_or_array_layers != 1 && desc.sample_count != 1)
             || !format_support.supports_usage(desc.usage)
         {
             return Err(crate::DeviceError::Lost);
         }
+        if desc.dimension == wgt::TextureDimension::D3
+            && desc.usage.intersects(
+                wgt::TextureUses::COLOR_TARGET
+                    | wgt::TextureUses::DEPTH_STENCIL_READ
+                    | wgt::TextureUses::DEPTH_STENCIL_WRITE
+                    | wgt::TextureUses::STORAGE_READ_ONLY
+                    | wgt::TextureUses::STORAGE_WRITE_ONLY
+                    | wgt::TextureUses::STORAGE_READ_WRITE,
+            )
+        {
+            return Err(crate::DeviceError::Lost);
+        }
 
         let mut image_layout_maker = dk::DkImageLayoutMaker::defaults(raw_device);
-        if desc.size.depth_or_array_layers > 1 {
+        if desc.dimension == wgt::TextureDimension::D3 {
+            image_layout_maker.type_ = dk::DkImageType::DkImageType_3D;
+        } else if desc.size.depth_or_array_layers > 1 {
             image_layout_maker.type_ = dk::DkImageType::DkImageType_2DArray;
         }
         image_layout_maker.format = format_support.image_format;
@@ -1880,6 +1913,7 @@ impl TextureInner {
             inner: TextureInnerRaw {
                 mem_block,
                 image,
+                dimension: desc.dimension,
                 extent: desc.size,
                 format: desc.format,
                 mip_level_count: desc.mip_level_count,
@@ -1989,10 +2023,28 @@ fn map_texture_view_dimension(
 ) -> DeviceResult<Option<dk::DkImageType>> {
     match dimension {
         wgt::TextureViewDimension::D2 => Ok(None),
+        wgt::TextureViewDimension::D3 => Ok(Some(dk::DkImageType::DkImageType_3D)),
         wgt::TextureViewDimension::D2Array => Ok(Some(dk::DkImageType::DkImageType_2DArray)),
         wgt::TextureViewDimension::Cube => Ok(Some(dk::DkImageType::DkImageType_Cubemap)),
         wgt::TextureViewDimension::CubeArray => Ok(Some(dk::DkImageType::DkImageType_CubemapArray)),
         _ => Err(crate::DeviceError::Lost),
+    }
+}
+
+fn texture_view_dimension_matches(
+    texture: wgt::TextureDimension,
+    view: wgt::TextureViewDimension,
+) -> bool {
+    match texture {
+        wgt::TextureDimension::D2 => matches!(
+            view,
+            wgt::TextureViewDimension::D2
+                | wgt::TextureViewDimension::D2Array
+                | wgt::TextureViewDimension::Cube
+                | wgt::TextureViewDimension::CubeArray
+        ),
+        wgt::TextureDimension::D3 => view == wgt::TextureViewDimension::D3,
+        _ => false,
     }
 }
 
@@ -3397,6 +3449,7 @@ fn supported_texture_bind_group_layout_kind(
                     sample_type: wgt::TextureSampleType::Float { .. },
                     view_dimension:
                         wgt::TextureViewDimension::D2
+                        | wgt::TextureViewDimension::D3
                         | wgt::TextureViewDimension::D2Array
                         | wgt::TextureViewDimension::Cube
                         | wgt::TextureViewDimension::CubeArray,
@@ -3505,6 +3558,7 @@ fn supported_buffer_texture_sampler_storage_texture_bind_group_layout_kind_group
                 sample_type: wgt::TextureSampleType::Float { .. },
                 view_dimension:
                     wgt::TextureViewDimension::D2
+                    | wgt::TextureViewDimension::D3
                     | wgt::TextureViewDimension::D2Array
                     | wgt::TextureViewDimension::Cube
                     | wgt::TextureViewDimension::CubeArray,
@@ -3584,6 +3638,7 @@ fn supported_buffer_texture_sampler_bind_group_layout_kind_group(
                 sample_type: wgt::TextureSampleType::Float { .. },
                 view_dimension:
                     wgt::TextureViewDimension::D2
+                    | wgt::TextureViewDimension::D3
                     | wgt::TextureViewDimension::D2Array
                     | wgt::TextureViewDimension::Cube
                     | wgt::TextureViewDimension::CubeArray,
@@ -4298,13 +4353,16 @@ impl crate::Device for Device {
                 if !matches!(
                     desc.dimension,
                     wgt::TextureViewDimension::D2
+                        | wgt::TextureViewDimension::D3
                         | wgt::TextureViewDimension::D2Array
                         | wgt::TextureViewDimension::Cube
                         | wgt::TextureViewDimension::CubeArray
                 ) || (desc.dimension == wgt::TextureViewDimension::D2 && array_layer_count != 1)
+                    || (desc.dimension == wgt::TextureViewDimension::D3 && array_layer_count != 1)
                     || (desc.dimension == wgt::TextureViewDimension::Cube && array_layer_count != 6)
                     || (desc.dimension == wgt::TextureViewDimension::CubeArray
                         && array_layer_count % 6 != 0)
+                    || !texture_view_dimension_matches(texture.dimension(), desc.dimension)
                     || mip_level_count == 0
                     || desc
                         .range
