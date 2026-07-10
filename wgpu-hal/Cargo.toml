@@ -319,7 +319,7 @@ ndk-sys = { workspace = true, optional = true }
 ########################
 
 [target.'cfg(target_os = "horizon")'.dependencies]
-deko3d-sys = { path = "/Users/sharif/Code/switch/experiments/switch1-deko3d-wgpu/crates/deko3d-sys", optional = true }
+deko3d-sys = { path = "deko3d-sys", optional = true }
 
 #############################
 ### Platform: Webassembly ###

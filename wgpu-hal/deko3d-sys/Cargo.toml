@@ -1,0 +1,16 @@
+[package]
+name = "deko3d-sys"
+version = "0.1.0"
+edition = "2024"
+links = "deko3d"
+build = "build.rs"
+description = "Minimal raw Rust FFI smoke bindings for public Switch homebrew deko3d/libnx."
+license = "Zlib"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = ["debug-deko3d"]
+debug-deko3d = []
+release-deko3d = []

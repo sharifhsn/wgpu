@@ -196,3 +196,13 @@ When implementing WGSL built-in functions:
 2. **Check parameterization**: The spec lists exactly which type combinations are valid
 3. **Don't assume types**: For bitcast, only `i32`, `u32`, `f32` are specified - not 64-bit types
 4. **AbstractInt special cases**: Some operations have special handling for abstract integers
+
+## Deko3D Fork Workflow
+
+This fork is the canonical implementation home for the experimental Deko3D backend. Make backend, public API, Naga, and FFI changes here as normal Git commits on the fork branch. Do not create or replay a parallel patch series in the sibling Switch repository.
+
+`wgpu-hal/deko3d-sys` is the backend-owned raw Deko3D/libnx binding crate. Keep its path dependency relative to this checkout; no backend manifest may depend on an absolute path into another repository.
+
+The sibling `switch/experiments/switch1-deko3d-wgpu` tree is an external homebrew integration harness. When using its build scripts from this checkout, set `WGPU_DEKO3D_DIR` to this repository root. Harness-only edits belong there; implementation changes belong here.
+
+Use `origin` for `sharifhsn/wgpu` and `upstream` for `gfx-rs/wgpu`. Before committing a Deko3D backend change, run `cargo fmt -p wgpu-hal` and the focused host `wgpu-hal` Deko3D check/tests. Run the Horizon harness when the affected surface crosses the FFI or target boundary.
