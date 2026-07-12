@@ -53,6 +53,8 @@ Bottom level categories:
   provider at pipeline creation.
 - The experimental Deko3D HAL supports standard alpha blending, color write masks, and common
   normalized, integer, and half-float vertex formats used by UI and sprites.
+- Deko3D static bind groups support up to four sampled texture/sampler pairs and multiple static
+  uniform buffers with explicit physical slot mapping.
 
 ## v29.0.4 (2026-07-01)
 

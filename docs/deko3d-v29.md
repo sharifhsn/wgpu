@@ -40,6 +40,12 @@ set-once, shared by `Device` clones, and invoked outside wgpu's provider lock. W
 manifest key on Deko3D: the stage-specific DKSH is selected when a pipeline is created.
 This does not add a general runtime WGSL compiler or broaden the single-program DKSH contract.
 
+Static bind groups accept up to four sampled 2D texture/sampler pairs at consecutive binding
+slots `(0,1)`, `(2,3)`, `(4,5)`, and `(6,7)`, plus static uniform buffers at bindings below 16.
+The texture binding is the physical Deko texture slot and each pair uses its matching descriptor
+index. Binding arrays, dynamic offsets, storage buffers, and every other descriptor form remain
+rejected.
+
 ## DKSH validation fixture
 
 Forced-host unit tests validate the single-program DKSH container without a Switch toolchain. The
@@ -78,4 +84,4 @@ behavior, but do not claim that target build or presentation validation.
 
 The explicit triangle was built on 2026-07-12 against the public devkitPro prefix at
 `/tmp/devkitpro-switch1/opt/devkitpro`; its NRO SHA-256 was
-`35c812fa844a157b66d4dc41d2342c2bb57db4ecfa2ef41966da03a5549643b9`.
+`9927e074c94cd6cf63635b42af3b0ae7f26c980187b094f03633f2d7f1960071`.
