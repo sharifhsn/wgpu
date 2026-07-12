@@ -123,6 +123,8 @@ impl Instance {
         this.try_add_hal(hal::api::Dx12, &instance_desc, telemetry);
         #[cfg(gles)]
         this.try_add_hal(hal::api::Gles, &instance_desc, telemetry);
+        #[cfg(deko3d)]
+        this.try_add_hal(hal::api::Deko3d, &instance_desc, telemetry);
         #[cfg(feature = "noop")]
         this.try_add_hal(hal::api::Noop, &instance_desc, telemetry);
 
@@ -212,6 +214,24 @@ impl Instance {
                 .downcast_ref()
                 // This should be impossible. It would mean that backend instance and enum type are mismatching.
                 .expect("Stored instance is not of the correct type")
+        })
+    }
+
+    #[cfg(deko3d)]
+    pub fn create_deko3d_default_surface(&self) -> Result<Surface, CreateSurfaceError> {
+        let instance = unsafe { self.as_hal::<hal::deko3d::Api>() }
+            .ok_or(CreateSurfaceError::BackendNotEnabled(Backend::Deko3d))?;
+        let raw = instance.create_default_surface().map_err(|error| {
+            CreateSurfaceError::FailedToCreateSurfaceForAnyBackend(
+                [(Backend::Deko3d, error)].into_iter().collect(),
+            )
+        })?;
+        let mut surface_per_backend = HashMap::default();
+        let raw: Box<dyn hal::DynSurface> = Box::new(raw);
+        surface_per_backend.insert(Backend::Deko3d, raw);
+        Ok(Surface {
+            presentation: Mutex::new(rank::SURFACE_PRESENTATION, None),
+            surface_per_backend,
         })
     }
 
@@ -952,6 +972,16 @@ pub enum CreateSurfaceError {
 }
 
 impl Global {
+    #[cfg(deko3d)]
+    pub fn instance_create_deko3d_default_surface(
+        &self,
+        id_in: Option<SurfaceId>,
+    ) -> Result<SurfaceId, CreateSurfaceError> {
+        let surface = self.instance.create_deko3d_default_surface()?;
+        let id = self.surfaces.prepare(id_in).assign(Arc::new(surface));
+        Ok(id)
+    }
+
     /// Creates a new surface targeting the given display/window handles.
     ///
     /// Internally attempts to create hal surfaces for all enabled backends.
@@ -1244,5 +1274,36 @@ impl Global {
         resource_log!("Created Queue {:?}", queue_id);
 
         Ok((device_id, queue_id))
+    }
+}
+
+#[cfg(all(test, deko3d, not(target_os = "horizon")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forced_host_deko3d_stub_requires_explicit_selection() {
+        let attempts = hal::deko3d::forced_host_instance_init_attempts();
+
+        let default_instance = Instance::new(
+            "deko3d default selection test",
+            wgt::InstanceDescriptor::new_without_display_handle(),
+            None,
+        );
+        assert!(!Backends::all().contains(Backends::DEKO3D));
+        assert!(!default_instance
+            .requested_backends
+            .contains(Backends::DEKO3D));
+        assert_eq!(hal::deko3d::forced_host_instance_init_attempts(), attempts);
+
+        let mut explicit = wgt::InstanceDescriptor::new_without_display_handle();
+        explicit.backends = Backends::DEKO3D;
+        let explicit_instance = Instance::new("deko3d explicit selection test", explicit, None);
+        assert_eq!(explicit_instance.requested_backends, Backends::DEKO3D);
+        assert_eq!(
+            hal::deko3d::forced_host_instance_init_attempts(),
+            attempts + 1
+        );
+        assert!(explicit_instance.raw(Backend::Deko3d).is_none());
     }
 }

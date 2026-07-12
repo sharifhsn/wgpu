@@ -30,6 +30,7 @@ fn main() {
             all(target_vendor = "apple", feature = "angle")
         ) },
         noop: { feature = "noop" },
+        deko3d: { all(target_os = "horizon", feature = "deko3d") },
 
         wgpu_core: {
             any(

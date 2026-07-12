@@ -108,6 +108,8 @@ pub struct CreateShaderModuleDescriptorPassthrough<'a, L> {
 
     /// Binary SPIR-V data, in 4-byte words.
     pub spirv: Option<Cow<'a, [u32]>>,
+    /// Binary Deko3D DKSH data, as produced by the offline deko3d shader compiler.
+    pub deko3d_dksh: Option<Cow<'a, [u8]>>,
     /// Shader DXIL source.
     pub dxil: Option<Cow<'a, [u8]>>,
     /// Shader HLSL source.
@@ -130,6 +132,7 @@ impl<'a, L: Default> Default for CreateShaderModuleDescriptorPassthrough<'a, L> 
             label: Default::default(),
             num_workgroups: (0, 0, 0),
             spirv: None,
+            deko3d_dksh: None,
             dxil: None,
             metallib: None,
             msl: None,
@@ -150,6 +153,7 @@ impl<'a, L> CreateShaderModuleDescriptorPassthrough<'a, L> {
             label: fun(&self.label),
             num_workgroups: self.num_workgroups,
             spirv: self.spirv.clone(),
+            deko3d_dksh: self.deko3d_dksh.clone(),
             metallib: self.metallib.clone(),
             dxil: self.dxil.clone(),
             msl: self.msl.clone(),
@@ -164,6 +168,8 @@ impl<'a, L> CreateShaderModuleDescriptorPassthrough<'a, L> {
     pub fn trace_data(&self) -> &[u8] {
         if let Some(spirv) = &self.spirv {
             bytemuck::cast_slice(spirv)
+        } else if let Some(deko3d_dksh) = &self.deko3d_dksh {
+            deko3d_dksh
         } else if let Some(metallib) = &self.metallib {
             metallib
         } else if let Some(msl) = &self.msl {
@@ -186,6 +192,8 @@ impl<'a, L> CreateShaderModuleDescriptorPassthrough<'a, L> {
     pub fn trace_binary_ext(&self) -> &'static str {
         if self.spirv.is_some() {
             "spv"
+        } else if self.deko3d_dksh.is_some() {
+            "dksh"
         } else if self.metallib.is_some() {
             "metallib"
         } else if self.msl.is_some() {

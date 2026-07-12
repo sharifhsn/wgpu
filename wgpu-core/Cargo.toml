@@ -152,6 +152,8 @@ renderdoc = ["wgpu-core-deps-windows-linux-android/renderdoc"]
 ## Enable the `noop` backend.
 # TODO(https://github.com/gfx-rs/wgpu/issues/7120): there should be a hal feature
 noop = []
+## Reserves the Deko3D backend path for original Nintendo Switch homebrew.
+deko3d = ["wgpu-hal/deko3d"]
 
 # The target limitation here isn't needed, but prevents more than one of these
 # platform crates from being included in the build at a time, preventing users

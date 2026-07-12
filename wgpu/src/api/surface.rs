@@ -312,6 +312,14 @@ pub enum SurfaceTarget<'window> {
     OffscreenCanvas(web_sys::OffscreenCanvas),
 }
 
+/// The one default Switch window owned by Horizon/libnx for the Deko3D backend.
+///
+/// This target is intentionally separate from [`SurfaceTarget`] because it is not backed by a
+/// `raw-window-handle` object.
+#[cfg(deko3d)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Deko3dDefaultSurface;
+
 impl<'a> SurfaceTarget<'a> {
     /// Constructor for [`Self::Window`] without consuming a display handle
     pub fn from_window_without_display(window: impl WindowHandle + 'a) -> Self {
@@ -473,6 +481,9 @@ pub(crate) enum CreateSurfaceErrorKind {
     #[cfg_attr(not(webgpu), expect(dead_code))]
     Web(String),
 
+    #[cfg(deko3d)]
+    Deko3d(String),
+
     /// Error when trying to get a [`RawDisplayHandle`][rdh] or a
     /// [`RawWindowHandle`][rwh] from a [`SurfaceTarget`].
     ///
@@ -488,6 +499,8 @@ impl fmt::Display for CreateSurfaceError {
             #[cfg(wgpu_core)]
             CreateSurfaceErrorKind::Hal(e) => e.fmt(f),
             CreateSurfaceErrorKind::Web(e) => e.fmt(f),
+            #[cfg(deko3d)]
+            CreateSurfaceErrorKind::Deko3d(e) => e.fmt(f),
             CreateSurfaceErrorKind::RawHandle(e) => e.fmt(f),
         }
     }
@@ -499,6 +512,8 @@ impl error::Error for CreateSurfaceError {
             #[cfg(wgpu_core)]
             CreateSurfaceErrorKind::Hal(e) => e.source(),
             CreateSurfaceErrorKind::Web(_) => None,
+            #[cfg(deko3d)]
+            CreateSurfaceErrorKind::Deko3d(_) => None,
             #[cfg(feature = "std")]
             CreateSurfaceErrorKind::RawHandle(e) => e.source(),
             #[cfg(not(feature = "std"))]

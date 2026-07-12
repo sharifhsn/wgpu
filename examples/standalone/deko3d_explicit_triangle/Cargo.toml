@@ -1,0 +1,13 @@
+[package]
+name = "wgpu-example-deko3d-explicit-triangle"
+edition = "2021"
+rust-version = "1.87"
+publish = false
+
+[features]
+deko3d = ["wgpu/deko3d"]
+
+[dependencies]
+bytemuck.workspace = true
+pollster = "0.4"
+wgpu = { path = "../../../wgpu", default-features = false, features = ["std", "deko3d"] }

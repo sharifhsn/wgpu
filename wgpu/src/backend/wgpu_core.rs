@@ -853,6 +853,20 @@ impl dispatch::InstanceInterface for ContextWgpuCore {
         .into())
     }
 
+    #[cfg(deko3d)]
+    fn create_deko3d_default_surface(
+        &self,
+    ) -> Result<dispatch::DispatchSurface, crate::CreateSurfaceError> {
+        let id = self.0.instance_create_deko3d_default_surface(None)?;
+        Ok(CoreSurface {
+            context: self.clone(),
+            id,
+            configured_device: Mutex::default(),
+            error_sink: Mutex::default(),
+        }
+        .into())
+    }
+
     fn request_adapter(
         &self,
         options: &crate::api::RequestAdapterOptions<'_, '_>,

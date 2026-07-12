@@ -243,10 +243,13 @@
 extern crate alloc;
 extern crate wgpu_types as wgt;
 // Each of these backends needs `std` in some fashion; usually `std::thread` functions.
-#[cfg(any(dx12, gles_with_std, metal, vulkan))]
+#[cfg(any(deko3d, dx12, gles_with_std, metal, vulkan))]
 #[macro_use]
 extern crate std;
 
+/// Deko3D API internals.
+#[cfg(deko3d)]
+pub mod deko3d;
 /// DirectX12 API internals.
 #[cfg(dx12)]
 pub mod dx12;
@@ -265,6 +268,8 @@ pub mod vulkan;
 
 pub mod auxil;
 pub mod api {
+    #[cfg(deko3d)]
+    pub use super::deko3d::Api as Deko3d;
     #[cfg(dx12)]
     pub use super::dx12::Api as Dx12;
     #[cfg(gles)]
@@ -2368,6 +2373,7 @@ pub enum ShaderInput<'a> {
         num_workgroups: (u32, u32, u32),
     },
     SpirV(&'a [u32]),
+    Deko3dDksh(&'a [u8]),
     Dxil {
         shader: &'a [u8],
         num_workgroups: (u32, u32, u32),

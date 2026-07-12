@@ -2446,6 +2446,12 @@ impl Device {
                     .ok_or(pipeline::CreateShaderModuleError::NotCompiledForBackend)?,
                 num_workgroups: descriptor.num_workgroups,
             },
+            wgt::Backend::Deko3d => hal::ShaderInput::Deko3dDksh(
+                descriptor
+                    .deko3d_dksh
+                    .as_deref()
+                    .ok_or(pipeline::CreateShaderModuleError::NotCompiledForBackend)?,
+            ),
             wgt::Backend::Noop => {
                 return Err(pipeline::CreateShaderModuleError::NotCompiledForBackend)
             }

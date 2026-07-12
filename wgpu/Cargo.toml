@@ -93,6 +93,9 @@ webgl = ["web", "wgpu-core/webgl", "dep:wgpu-hal", "dep:smallvec"]
 ## through `NoopBackendOptions`.
 noop = ["wgpu-core/noop", "dep:wgpu-hal", "dep:smallvec"]
 
+## Reserves the Deko3D backend path for original Nintendo Switch homebrew.
+deko3d = ["wgpu-core?/deko3d"]
+
 #! **Note:** In the documentation, if you see that an item depends on a backend,
 #! it means that the item is only available when that backend is enabled _and_ the backend
 #! is supported on the current platform.

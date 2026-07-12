@@ -49,10 +49,14 @@ pub enum Backend {
     Gl = 4,
     /// WebGPU in the browser
     BrowserWebGpu = 5,
+    /// Nintendo Switch homebrew through Deko3D.
+    ///
+    /// This experimental backend becomes selectable once its native v29 HAL implementation lands.
+    Deko3d = 6,
 }
 
 impl Backend {
-    /// Array of all [`Backend`] values, corresponding to [`Backends::all()`].
+    /// Array of selectable [`Backend`] values, corresponding to [`Backends::all()`].
     pub const ALL: [Backend; Backends::all().bits().count_ones() as usize] = [
         Self::Noop,
         Self::Vulkan,
@@ -72,6 +76,7 @@ impl Backend {
             Backend::Dx12 => "dx12",
             Backend::Gl => "gl",
             Backend::BrowserWebGpu => "webgpu",
+            Backend::Deko3d => "deko3d",
         }
     }
 }
@@ -145,11 +150,17 @@ impl Default for Backends {
 
 impl From<Backend> for Backends {
     fn from(backend: Backend) -> Self {
-        Self::from_bits(1 << backend as u32).unwrap()
+        Self::from_bits_retain(1 << backend as u32)
     }
 }
 
 impl Backends {
+    /// [`Backend::Deko3d`].
+    ///
+    /// This experimental backend is recognized for configuration but is not selectable until its
+    /// runtime implementation lands.
+    pub const DEKO3D: Self = Self::from_bits_retain(1 << Backend::Deko3d as u32);
+
     /// Gets a set of backends from the environment variable `WGPU_BACKEND`.
     ///
     /// See [`Self::from_comma_list()`] for the format of the string.
@@ -179,6 +190,7 @@ impl Backends {
     /// - metal  = "metal" or "mtl"
     /// - gles   = "opengl" or "gles" or "gl"
     /// - webgpu = "webgpu"
+    /// - deko3d = "deko3d" or "deko" or "dk"
     pub fn from_comma_list(string: &str) -> Self {
         let mut backends = Self::empty();
         for backend in string.to_lowercase().split(',') {
@@ -189,6 +201,7 @@ impl Backends {
                 "opengl" | "gles" | "gl" => Self::GL,
                 "webgpu" => Self::BROWSER_WEBGPU,
                 "noop" => Self::NOOP,
+                "deko3d" | "deko" | "dk" => Self::DEKO3D,
                 b => {
                     log::warn!("unknown backend string '{b}'");
                     continue;
@@ -201,6 +214,25 @@ impl Backends {
         }
 
         backends
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Backend, Backends};
+
+    #[test]
+    fn parses_deko3d_backend_names() {
+        assert_eq!(Backend::Deko3d.to_str(), "deko3d");
+        assert_eq!(
+            Backends::from_comma_list("deko3d,deko,dk"),
+            Backends::DEKO3D
+        );
+        assert_eq!(Backends::from(Backend::Deko3d), Backends::DEKO3D);
+        assert!(!Backends::all().contains(Backends::DEKO3D));
+        assert!(!Backends::default().contains(Backends::DEKO3D));
+        assert!(!Backends::SECONDARY.contains(Backends::DEKO3D));
+        assert!(!Backend::ALL.contains(&Backend::Deko3d));
     }
 }
 

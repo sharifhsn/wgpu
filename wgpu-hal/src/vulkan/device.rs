@@ -1772,6 +1772,7 @@ impl crate::Device for super::Device {
                 super::ShaderModule::Raw(self.create_shader_module_impl(data, &desc.label)?)
             }
             crate::ShaderInput::MetalLib { .. }
+            | crate::ShaderInput::Deko3dDksh(_)
             | crate::ShaderInput::Msl { .. }
             | crate::ShaderInput::Dxil { .. }
             | crate::ShaderInput::Hlsl { .. }

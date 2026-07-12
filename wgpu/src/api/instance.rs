@@ -123,6 +123,9 @@ impl Instance {
         if cfg!(dx12) {
             backends = backends.union(Backends::DX12);
         }
+        if cfg!(deko3d) {
+            backends = backends.union(Backends::DEKO3D);
+        }
         if cfg!(webgpu) {
             backends = backends.union(Backends::BROWSER_WEBGPU);
         }
@@ -275,6 +278,24 @@ impl Instance {
         Ok(Surface {
             _handle_source: None,
             inner: surface,
+            config: Mutex::new(None),
+        })
+    }
+
+    /// Creates a surface for the one default Switch window supplied by Horizon/libnx.
+    ///
+    /// This does not create or reinterpret raw window/display handles. It is available only when
+    /// the Deko3D backend feature is compiled in, and succeeds only for a context that contains a
+    /// concrete Deko3D HAL instance.
+    #[cfg(deko3d)]
+    pub fn create_surface_deko3d_default(
+        &self,
+        _target: Deko3dDefaultSurface,
+    ) -> Result<Surface<'static>, CreateSurfaceError> {
+        let inner = self.inner.create_deko3d_default_surface()?;
+        Ok(Surface {
+            _handle_source: None,
+            inner,
             config: Mutex::new(None),
         })
     }
@@ -437,5 +458,20 @@ impl Instance {
     /// Returns custom implementation of Instance (if custom backend and is internally T)
     pub fn as_custom<T: custom::InstanceInterface>(&self) -> Option<&T> {
         self.inner.as_custom()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deko3d_backend_is_advertised_only_when_compiled() {
+        assert_eq!(
+            Instance::enabled_backend_features().contains(Backends::DEKO3D),
+            cfg!(deko3d)
+        );
+        assert!(!Backends::all().contains(Backends::DEKO3D));
+        assert!(!Backends::SECONDARY.contains(Backends::DEKO3D));
     }
 }

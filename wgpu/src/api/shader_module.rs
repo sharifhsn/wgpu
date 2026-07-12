@@ -6,8 +6,9 @@ use crate::*;
 /// Handle to a compiled shader module.
 ///
 /// A `ShaderModule` represents a compiled shader module on the GPU. It can be created by passing
-/// source code to [`Device::create_shader_module`]. MSL shader or SPIR-V binary can also be passed
-/// directly using [`Device::create_shader_module_passthrough`]. Shader modules are used to define
+/// source code to [`Device::create_shader_module`]. MSL shader, SPIR-V binary, or Deko3D DKSH
+/// binary can also be passed directly using [`Device::create_shader_module_passthrough`]. Shader
+/// modules are used to define
 /// programmable stages of a pipeline.
 ///
 /// Corresponds to [WebGPU `GPUShaderModule`](https://gpuweb.github.io/gpuweb/#shader-module).
@@ -235,3 +236,15 @@ static_assertions::assert_impl_all!(ShaderModuleDescriptor<'_>: Send, Sync);
 /// only WGSL source code strings are accepted.
 pub type ShaderModuleDescriptorPassthrough<'a> =
     wgt::CreateShaderModuleDescriptorPassthrough<'a, Label<'a>>;
+
+/// Descriptor for a Deko3D shader module backed by offline-compiled DKSH bytes.
+#[derive(Clone, Debug)]
+pub struct Deko3dDkshShaderModuleDescriptor<'a> {
+    /// Debug label of the shader module. This will show up in graphics debuggers for easy identification.
+    pub label: Label<'a>,
+    /// Number of workgroups in each dimension x, y and z. Unused for graphics shaders.
+    pub num_workgroups: (u32, u32, u32),
+    /// Binary Deko3D DKSH data, as produced by the offline deko3d shader compiler.
+    pub dksh: alloc::borrow::Cow<'a, [u8]>,
+}
+static_assertions::assert_impl_all!(Deko3dDkshShaderModuleDescriptor<'_>: Send, Sync);

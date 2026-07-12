@@ -864,6 +864,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "deko3d-sys"
+version = "0.1.0"
+
+[[package]]
 name = "deno_console"
 version = "0.214.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4695,6 +4699,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgpu-example-deko3d-explicit-triangle"
+version = "0.0.0"
+dependencies = [
+ "bytemuck",
+ "pollster",
+ "wgpu",
+]
+
+[[package]]
 name = "wgpu-examples"
 version = "29.0.4"
 dependencies = [
@@ -4738,6 +4751,7 @@ dependencies = [
  "bytemuck",
  "cfg-if",
  "cfg_aliases",
+ "deko3d-sys",
  "env_logger",
  "glam",
  "glow",

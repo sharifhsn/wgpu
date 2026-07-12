@@ -132,6 +132,8 @@ gles = [
     "windows/Win32_System_LibraryLoader",
     "windows/Win32_UI_WindowsAndMessaging",
 ]
+## Reserves the release Deko3D backend path for original Nintendo Switch homebrew.
+deko3d = ["dep:deko3d-sys", "deko3d-sys/release-deko3d"]
 ## Enables the DX12 backend when targeting Windows.
 dx12 = [
     "dep:arrayvec",
@@ -202,6 +204,8 @@ required-features = ["gles"]
 #####################
 
 [dependencies]
+deko3d-sys = { version = "0.1.0", path = "deko3d-sys", default-features = false, optional = true }
+
 naga.workspace = true
 wgpu-naga-bridge.workspace = true
 wgpu-types = { workspace = true, default-features = false }
@@ -302,6 +306,10 @@ raw-window-metal = { workspace = true, optional = true }
 [target.'cfg(target_os = "android")'.dependencies]
 android_system_properties = { workspace = true, optional = true }
 ndk-sys = { workspace = true, optional = true }
+
+########################
+### Platform: Horizon ###
+########################
 
 #############################
 ### Platform: Webassembly ###

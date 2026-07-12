@@ -21,6 +21,7 @@ members = [
     "wgpu-core",
     "wgpu-core/platform-deps/*",
     "wgpu-hal",
+    "wgpu-hal/deko3d-sys",
     "wgpu-info",
     "wgpu-macros",
     "wgpu-naga-bridge",

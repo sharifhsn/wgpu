@@ -99,6 +99,15 @@ pub trait InstanceInterface: CommonTraits {
         target: crate::SurfaceTargetUnsafe,
     ) -> Result<DispatchSurface, crate::CreateSurfaceError>;
 
+    #[cfg(deko3d)]
+    fn create_deko3d_default_surface(&self) -> Result<DispatchSurface, crate::CreateSurfaceError> {
+        Err(crate::CreateSurfaceError {
+            inner: crate::CreateSurfaceErrorKind::Deko3d(
+                "the active context does not expose a Deko3D default Switch surface".into(),
+            ),
+        })
+    }
+
     fn request_adapter(
         &self,
         options: &crate::RequestAdapterOptions<'_, '_>,

@@ -21,6 +21,7 @@ fn main() {
             all(target_vendor = "apple", feature = "vulkan-portability") // Vulkan Portability on Apple
         ) },
         metal: { all(target_vendor = "apple", feature = "metal") },
+        deko3d: { all(target_os = "horizon", feature = "deko3d") },
 
         supports_64bit_atomics: { target_has_atomic = "64" }
     }

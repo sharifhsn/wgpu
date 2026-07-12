@@ -13,6 +13,7 @@ be cloned out of the repository to serve as a starting point for your own projec
 | ---    | Introductory Examples | --- |
 | [1. hello compute](standalone/01_hello_compute/) | Simplest example and shows how to run a compute shader on a given set of input data and get the results back. | Native-Only |
 | [2. hello window](standalone/02_hello_window/) | Shows how to create a window and render into it. | Native-Only |
+| [Deko3D explicit triangle](standalone/deko3d_explicit_triangle/) | Source-only Horizon proof: explicit Deko3D selection, default surface, DKSH shaders, mapped vertices, one submitted frame. Requires the external Switch target toolchain. | Horizon |
 | --- | Special Examples | --- |
 | [custom backend](standalone/custom_backend/) | Shows how to implement and use custom wgpu context | All |
 
