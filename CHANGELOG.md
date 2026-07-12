@@ -51,6 +51,8 @@ Bottom level categories:
   viewport/scissor state.
 - Deko3D can resolve captured WGSL through a trusted, set-once, stage-specific DKSH artifact
   provider at pipeline creation.
+- The experimental Deko3D HAL supports standard alpha blending, color write masks, and common
+  normalized, integer, and half-float vertex formats used by UI and sprites.
 
 ## v29.0.4 (2026-07-01)
 

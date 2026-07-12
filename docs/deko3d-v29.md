@@ -24,9 +24,14 @@ the release `deko3d` feature. This keeps ordinary builds and default backend sel
    `Rgba8UnormSrgb` sampled texture, a filtering sampler, one static texture/sampler bind
    group with an optional uniform (or a separate uniform bind group), `Float32x2`/`x3`/`x4`
    and `Uint32` vertex attributes,
-   cull/front-face state, and no-blend color output. `Depth32Float` supports clear/load,
+   cull/front-face state, and opaque color output. `Depth32Float` supports clear/load,
    depth compare, and writes. Dynamic viewport and scissor state are recorded. Every other
    texture format, blend mode, depth/stencil mode, topology, and binding form remains rejected.
+
+The same path accepts standard straight and premultiplied alpha blending and per-channel color
+write masks for sprites and UI. It also accepts common 8/16-bit normalized and integer mesh
+attributes plus half floats. RGBA8 texture uploads accept WebGPU's padded rows; readback and
+non-RGBA8 texture transfer remain unsupported.
 
 For captured WGSL, install one [`Deko3dWgslArtifactProvider`] on the `Device` before pipeline
 creation. The provider receives the exact WGSL bytes and SHA-256 digest plus the requested
@@ -73,4 +78,4 @@ behavior, but do not claim that target build or presentation validation.
 
 The explicit triangle was built on 2026-07-12 against the public devkitPro prefix at
 `/tmp/devkitpro-switch1/opt/devkitpro`; its NRO SHA-256 was
-`87e5d05b107b2e012a0b0f91dd281337703a1b64f06cd39d857f79f3090887a0`.
+`35c812fa844a157b66d4dc41d2342c2bb57db4ecfa2ef41966da03a5549643b9`.

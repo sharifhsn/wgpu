@@ -1138,6 +1138,12 @@ unsafe extern "C" {
     pub fn dkCmdBufBindRasterizerState(obj: DkCmdBuf, state: *const DkRasterizerState);
     pub fn dkCmdBufBindColorState(obj: DkCmdBuf, state: *const DkColorState);
     pub fn dkCmdBufBindColorWriteState(obj: DkCmdBuf, state: *const DkColorWriteState);
+    pub fn dkCmdBufBindBlendStates(
+        obj: DkCmdBuf,
+        firstId: u32,
+        states: *const DkBlendState,
+        numStates: u32,
+    );
     pub fn dkCmdBufBindDepthStencilState(obj: DkCmdBuf, state: *const DkDepthStencilState);
     pub fn dkCmdBufPushData(obj: DkCmdBuf, addr: DkGpuAddr, data: *const c_void, size: u32);
     pub fn dkCmdBufBindTextures(
@@ -1260,6 +1266,10 @@ pub unsafe fn dkCmdBufClearColorFloat(
 ) {
     let data = [red, green, blue, alpha];
     unsafe { dkCmdBufClearColor(obj, targetId, clearMask, data.as_ptr().cast()) };
+}
+
+pub unsafe fn dkCmdBufBindBlendState(obj: DkCmdBuf, id: u32, state: *const DkBlendState) {
+    unsafe { dkCmdBufBindBlendStates(obj, id, state, 1) };
 }
 
 pub unsafe fn dkCmdBufBindVtxBuffer(obj: DkCmdBuf, id: u32, bufAddr: DkGpuAddr, bufSize: u32) {

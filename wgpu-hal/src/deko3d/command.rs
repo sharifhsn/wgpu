@@ -873,6 +873,12 @@ unsafe fn submit_copy_buffer_to_texture(
     dst: &TextureInner,
     regions: &[crate::BufferTextureCopy],
 ) -> DeviceResult<()> {
+    if !matches!(
+        dst.format(),
+        wgt::TextureFormat::Rgba8Unorm | wgt::TextureFormat::Rgba8UnormSrgb
+    ) {
+        return Err(crate::DeviceError::Lost);
+    }
     unsafe {
         submit_deko_commands(queue, surface_queue, |cmdbuf| {
             let dst_view = dk::DkImageView::defaults(dst.raw_image().0);
@@ -1145,6 +1151,7 @@ unsafe fn submit_deko_draw(
             dk::dkCmdBufBindRasterizerState(cmdbuf, &pipeline.rasterizer_state);
             dk::dkCmdBufBindColorState(cmdbuf, &pipeline.color_state);
             dk::dkCmdBufBindColorWriteState(cmdbuf, &pipeline.color_write_state);
+            dk::dkCmdBufBindBlendState(cmdbuf, 0, &pipeline.blend_state);
             if pipeline.uses_depth_stencil && target.depth.is_none() {
                 return Err(crate::DeviceError::Lost);
             }

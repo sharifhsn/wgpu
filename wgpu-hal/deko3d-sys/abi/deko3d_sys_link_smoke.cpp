@@ -12,6 +12,7 @@ int main() {
         reinterpret_cast<std::uintptr_t>(&dkCmdBufCreate),
         reinterpret_cast<std::uintptr_t>(&dkCmdBufDestroy),
         reinterpret_cast<std::uintptr_t>(&dkCmdBufFinishList),
+        reinterpret_cast<std::uintptr_t>(&dkCmdBufBindBlendStates),
         reinterpret_cast<std::uintptr_t>(&dkCmdBufClearDepthStencil),
         reinterpret_cast<std::uintptr_t>(&dkCmdBufBindDepthStencilState),
         reinterpret_cast<std::uintptr_t>(&dkQueueCreate),

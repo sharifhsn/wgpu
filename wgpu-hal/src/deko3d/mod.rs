@@ -239,6 +239,7 @@ pub(super) struct RenderPipelineInnerRaw {
     rasterizer_state: dk::DkRasterizerState,
     color_state: dk::DkColorState,
     color_write_state: dk::DkColorWriteState,
+    blend_state: dk::DkBlendState,
     depth_stencil_state: dk::DkDepthStencilState,
     uses_depth_stencil: bool,
 }
@@ -1074,12 +1075,11 @@ impl RenderPipelineInner {
         let Some(color_target) = &desc.color_targets[0] else {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         };
-        if color_target.format != wgt::TextureFormat::Rgba8Unorm
-            || color_target.blend.is_some()
-            || color_target.write_mask != wgt::ColorWrites::ALL
-        {
+        if color_target.format != wgt::TextureFormat::Rgba8Unorm {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         }
+        let (color_state, blend_state) = map_blend_state(color_target.blend)?;
+        let color_write_state = map_color_write_state(color_target.write_mask);
 
         let crate::VertexProcessor::Standard {
             vertex_buffers,
@@ -1159,8 +1159,9 @@ impl RenderPipelineInner {
                 vertex_buffers: vertex_buffer_states,
                 vertex_attributes,
                 rasterizer_state,
-                color_state: dk::DkColorState::defaults(),
-                color_write_state: dk::DkColorWriteState::defaults(),
+                color_state,
+                color_write_state,
+                blend_state,
                 depth_stencil_state,
                 uses_depth_stencil,
             },
@@ -1467,8 +1468,183 @@ fn map_vertex_format(
             dk::DkVtxAttribSize::DkVtxAttribSize_4x32,
             dk::DkVtxAttribType::DkVtxAttribType_Uint,
         )),
+        wgt::VertexFormat::Sint32 => Ok((
+            dk::DkVtxAttribSize::DkVtxAttribSize_1x32,
+            dk::DkVtxAttribType::DkVtxAttribType_Sint,
+        )),
+        wgt::VertexFormat::Sint32x2 => Ok((
+            dk::DkVtxAttribSize::DkVtxAttribSize_2x32,
+            dk::DkVtxAttribType::DkVtxAttribType_Sint,
+        )),
+        wgt::VertexFormat::Sint32x3 => Ok((
+            dk::DkVtxAttribSize::DkVtxAttribSize_3x32,
+            dk::DkVtxAttribType::DkVtxAttribType_Sint,
+        )),
+        wgt::VertexFormat::Sint32x4 => Ok((
+            dk::DkVtxAttribSize::DkVtxAttribSize_4x32,
+            dk::DkVtxAttribType::DkVtxAttribType_Sint,
+        )),
+        wgt::VertexFormat::Float16 => Ok((
+            dk::DkVtxAttribSize::DkVtxAttribSize_1x16,
+            dk::DkVtxAttribType::DkVtxAttribType_Float,
+        )),
+        wgt::VertexFormat::Float16x2 => Ok((
+            dk::DkVtxAttribSize::DkVtxAttribSize_2x16,
+            dk::DkVtxAttribType::DkVtxAttribType_Float,
+        )),
+        wgt::VertexFormat::Float16x4 => Ok((
+            dk::DkVtxAttribSize::DkVtxAttribSize_4x16,
+            dk::DkVtxAttribType::DkVtxAttribType_Float,
+        )),
+        wgt::VertexFormat::Uint16 | wgt::VertexFormat::Uint16x2 | wgt::VertexFormat::Uint16x4 => {
+            Ok((
+                match format {
+                    wgt::VertexFormat::Uint16 => dk::DkVtxAttribSize::DkVtxAttribSize_1x16,
+                    wgt::VertexFormat::Uint16x2 => dk::DkVtxAttribSize::DkVtxAttribSize_2x16,
+                    _ => dk::DkVtxAttribSize::DkVtxAttribSize_4x16,
+                },
+                dk::DkVtxAttribType::DkVtxAttribType_Uint,
+            ))
+        }
+        wgt::VertexFormat::Sint16 | wgt::VertexFormat::Sint16x2 | wgt::VertexFormat::Sint16x4 => {
+            Ok((
+                match format {
+                    wgt::VertexFormat::Sint16 => dk::DkVtxAttribSize::DkVtxAttribSize_1x16,
+                    wgt::VertexFormat::Sint16x2 => dk::DkVtxAttribSize::DkVtxAttribSize_2x16,
+                    _ => dk::DkVtxAttribSize::DkVtxAttribSize_4x16,
+                },
+                dk::DkVtxAttribType::DkVtxAttribType_Sint,
+            ))
+        }
+        wgt::VertexFormat::Unorm16
+        | wgt::VertexFormat::Unorm16x2
+        | wgt::VertexFormat::Unorm16x4 => Ok((
+            match format {
+                wgt::VertexFormat::Unorm16 => dk::DkVtxAttribSize::DkVtxAttribSize_1x16,
+                wgt::VertexFormat::Unorm16x2 => dk::DkVtxAttribSize::DkVtxAttribSize_2x16,
+                _ => dk::DkVtxAttribSize::DkVtxAttribSize_4x16,
+            },
+            dk::DkVtxAttribType::DkVtxAttribType_Unorm,
+        )),
+        wgt::VertexFormat::Snorm16
+        | wgt::VertexFormat::Snorm16x2
+        | wgt::VertexFormat::Snorm16x4 => Ok((
+            match format {
+                wgt::VertexFormat::Snorm16 => dk::DkVtxAttribSize::DkVtxAttribSize_1x16,
+                wgt::VertexFormat::Snorm16x2 => dk::DkVtxAttribSize::DkVtxAttribSize_2x16,
+                _ => dk::DkVtxAttribSize::DkVtxAttribSize_4x16,
+            },
+            dk::DkVtxAttribType::DkVtxAttribType_Snorm,
+        )),
+        wgt::VertexFormat::Uint8 | wgt::VertexFormat::Uint8x2 | wgt::VertexFormat::Uint8x4 => Ok((
+            match format {
+                wgt::VertexFormat::Uint8 => dk::DkVtxAttribSize::DkVtxAttribSize_1x8,
+                wgt::VertexFormat::Uint8x2 => dk::DkVtxAttribSize::DkVtxAttribSize_2x8,
+                _ => dk::DkVtxAttribSize::DkVtxAttribSize_4x8,
+            },
+            dk::DkVtxAttribType::DkVtxAttribType_Uint,
+        )),
+        wgt::VertexFormat::Sint8 | wgt::VertexFormat::Sint8x2 | wgt::VertexFormat::Sint8x4 => Ok((
+            match format {
+                wgt::VertexFormat::Sint8 => dk::DkVtxAttribSize::DkVtxAttribSize_1x8,
+                wgt::VertexFormat::Sint8x2 => dk::DkVtxAttribSize::DkVtxAttribSize_2x8,
+                _ => dk::DkVtxAttribSize::DkVtxAttribSize_4x8,
+            },
+            dk::DkVtxAttribType::DkVtxAttribType_Sint,
+        )),
+        wgt::VertexFormat::Unorm8 | wgt::VertexFormat::Unorm8x2 | wgt::VertexFormat::Unorm8x4 => {
+            Ok((
+                match format {
+                    wgt::VertexFormat::Unorm8 => dk::DkVtxAttribSize::DkVtxAttribSize_1x8,
+                    wgt::VertexFormat::Unorm8x2 => dk::DkVtxAttribSize::DkVtxAttribSize_2x8,
+                    _ => dk::DkVtxAttribSize::DkVtxAttribSize_4x8,
+                },
+                dk::DkVtxAttribType::DkVtxAttribType_Unorm,
+            ))
+        }
+        wgt::VertexFormat::Snorm8 | wgt::VertexFormat::Snorm8x2 | wgt::VertexFormat::Snorm8x4 => {
+            Ok((
+                match format {
+                    wgt::VertexFormat::Snorm8 => dk::DkVtxAttribSize::DkVtxAttribSize_1x8,
+                    wgt::VertexFormat::Snorm8x2 => dk::DkVtxAttribSize::DkVtxAttribSize_2x8,
+                    _ => dk::DkVtxAttribSize::DkVtxAttribSize_4x8,
+                },
+                dk::DkVtxAttribType::DkVtxAttribType_Snorm,
+            ))
+        }
         _ => Err(crate::PipelineError::Device(crate::DeviceError::Lost)),
     }
+}
+
+#[cfg(any(target_os = "horizon", test))]
+fn map_blend_state(
+    blend: Option<wgt::BlendState>,
+) -> Result<(dk::DkColorState, dk::DkBlendState), crate::PipelineError> {
+    let mut color_state = dk::DkColorState::defaults();
+    let mut blend_state = dk::DkBlendState::defaults();
+    let Some(blend) = blend else {
+        return Ok((color_state, blend_state));
+    };
+    let (color_src, color_dst) = match blend.color {
+        wgt::BlendComponent {
+            src_factor: wgt::BlendFactor::SrcAlpha,
+            dst_factor: wgt::BlendFactor::OneMinusSrcAlpha,
+            operation: wgt::BlendOperation::Add,
+        } => (
+            dk::DkBlendFactor::DkBlendFactor_SrcAlpha,
+            dk::DkBlendFactor::DkBlendFactor_InvSrcAlpha,
+        ),
+        wgt::BlendComponent {
+            src_factor: wgt::BlendFactor::One,
+            dst_factor: wgt::BlendFactor::OneMinusSrcAlpha,
+            operation: wgt::BlendOperation::Add,
+        } => (
+            dk::DkBlendFactor::DkBlendFactor_One,
+            dk::DkBlendFactor::DkBlendFactor_InvSrcAlpha,
+        ),
+        wgt::BlendComponent::REPLACE if blend.alpha == wgt::BlendComponent::REPLACE => {
+            return Ok((color_state, blend_state));
+        }
+        _ => return Err(crate::PipelineError::Device(crate::DeviceError::Lost)),
+    };
+    if blend.alpha
+        != (wgt::BlendComponent {
+            src_factor: wgt::BlendFactor::One,
+            dst_factor: wgt::BlendFactor::OneMinusSrcAlpha,
+            operation: wgt::BlendOperation::Add,
+        })
+    {
+        return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+    }
+    color_state.set_blend_enable(0, true);
+    blend_state.set_ops(dk::DkBlendOp::DkBlendOp_Add, dk::DkBlendOp::DkBlendOp_Add);
+    blend_state.set_factors(
+        color_src,
+        color_dst,
+        dk::DkBlendFactor::DkBlendFactor_One,
+        dk::DkBlendFactor::DkBlendFactor_InvSrcAlpha,
+    );
+    Ok((color_state, blend_state))
+}
+
+#[cfg(any(target_os = "horizon", test))]
+fn map_color_write_state(mask: wgt::ColorWrites) -> dk::DkColorWriteState {
+    let mut result = dk::DkColorWriteState::defaults();
+    let mut deko_mask = 0;
+    if mask.contains(wgt::ColorWrites::RED) {
+        deko_mask |= dk::DkColorMask_R;
+    }
+    if mask.contains(wgt::ColorWrites::GREEN) {
+        deko_mask |= dk::DkColorMask_G;
+    }
+    if mask.contains(wgt::ColorWrites::BLUE) {
+        deko_mask |= dk::DkColorMask_B;
+    }
+    if mask.contains(wgt::ColorWrites::ALPHA) {
+        deko_mask |= dk::DkColorMask_A;
+    }
+    result.set_mask(0, deko_mask);
+    result
 }
 
 #[cfg(any(target_os = "horizon", test))]
@@ -1691,6 +1867,14 @@ mod tests {
             wgt::VertexFormat::Float32x2,
             wgt::VertexFormat::Float32x3,
             wgt::VertexFormat::Float32x4,
+            wgt::VertexFormat::Float16x2,
+            wgt::VertexFormat::Float16x4,
+            wgt::VertexFormat::Unorm8x4,
+            wgt::VertexFormat::Snorm8x4,
+            wgt::VertexFormat::Uint16x4,
+            wgt::VertexFormat::Sint16x4,
+            wgt::VertexFormat::Unorm16x4,
+            wgt::VertexFormat::Snorm16x4,
             wgt::VertexFormat::Uint32,
             wgt::VertexFormat::Uint32x2,
             wgt::VertexFormat::Uint32x3,
@@ -1698,7 +1882,7 @@ mod tests {
         ] {
             assert!(map_vertex_format(format).is_ok(), "{format:?}");
         }
-        assert!(map_vertex_format(wgt::VertexFormat::Sint16x4).is_err());
+        assert!(map_vertex_format(wgt::VertexFormat::Float64x4).is_err());
         assert!(map_depth_stencil_state(&wgt::DepthStencilState {
             format: wgt::TextureFormat::Depth32Float,
             depth_write_enabled: Some(true),
@@ -1717,6 +1901,22 @@ mod tests {
         .is_err());
         let disabled = depth_stencil_disabled_state();
         assert_eq!(disabled.depth_bits & 0b11, 0);
+    }
+
+    #[test]
+    fn ui_blend_and_color_write_states_are_conservative() {
+        let (straight, _) = map_blend_state(Some(wgt::BlendState::ALPHA_BLENDING)).unwrap();
+        let (premultiplied, _) =
+            map_blend_state(Some(wgt::BlendState::PREMULTIPLIED_ALPHA_BLENDING)).unwrap();
+        assert_ne!(straight.bits & 1, 0);
+        assert_ne!(premultiplied.bits & 1, 0);
+        assert!(map_blend_state(Some(wgt::BlendState {
+            color: wgt::BlendComponent::REPLACE,
+            alpha: wgt::BlendComponent::OVER,
+        }))
+        .is_err());
+        let writes = map_color_write_state(wgt::ColorWrites::RED | wgt::ColorWrites::ALPHA);
+        assert_eq!(writes.masks & 0xF, dk::DkColorMask_R | dk::DkColorMask_A);
     }
 
     #[test]
