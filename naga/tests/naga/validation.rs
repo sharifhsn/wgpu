@@ -536,6 +536,385 @@ fn no_flat_first_in_glsl() {
     ));
 }
 
+#[test]
+fn glsl_writes_bounded_sampled_binding_arrays() {
+    let module = naga::front::wgsl::parse_str(
+        "enable wgpu_binding_array;\n\
+         @group(0) @binding(0)\n\
+         var textures: binding_array<texture_2d<f32>, 2>;\n\
+         @group(0) @binding(1)\n\
+         var samplers: binding_array<sampler, 2>;\n\
+         @fragment\n\
+         fn main() -> @location(0) vec4<f32> {\n\
+             return textureSampleLevel(textures[1], samplers[1], vec2<f32>(0.5, 0.5), 0.0);\n\
+         }",
+    )
+    .unwrap();
+    let module_info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::TEXTURE_AND_SAMPLER_BINDING_ARRAY,
+    )
+    .validate(&module)
+    .unwrap();
+    let mut options = naga::back::glsl::Options {
+        version: naga::back::glsl::Version::Desktop(460),
+        ..Default::default()
+    };
+    options.binding_map.insert(
+        naga::ResourceBinding {
+            group: 0,
+            binding: 0,
+        },
+        0,
+    );
+    options.binding_map.insert(
+        naga::ResourceBinding {
+            group: 0,
+            binding: 1,
+        },
+        1,
+    );
+    let pipeline_options = naga::back::glsl::PipelineOptions {
+        shader_stage: naga::ShaderStage::Fragment,
+        entry_point: String::from("main"),
+        multiview: None,
+    };
+    let mut output = String::new();
+    let mut writer = naga::back::glsl::Writer::new(
+        &mut output,
+        &module,
+        &module_info,
+        &options,
+        &pipeline_options,
+        Default::default(),
+    )
+    .unwrap();
+    writer.write().unwrap();
+
+    assert!(output.contains("layout(binding = 0) uniform sampler2D _group_0_binding_0_fs[2];"));
+    assert!(output.contains("_group_0_binding_0_fs[1]"));
+}
+
+#[test]
+fn glsl_writes_depth_texture_load_as_texel_fetch() {
+    let module = naga::front::wgsl::parse_str(
+        "@group(0) @binding(2)\n\
+         var depth_texture: texture_depth_2d;\n\
+         @group(2) @binding(3)\n\
+         var<storage, read_write> output: f32;\n\
+         @compute @workgroup_size(1)\n\
+         fn main() {\n\
+             output = textureLoad(depth_texture, vec2<i32>(0, 0), 0);\n\
+         }",
+    )
+    .unwrap();
+    let module_info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+    let mut options = naga::back::glsl::Options {
+        version: naga::back::glsl::Version::Desktop(460),
+        ..Default::default()
+    };
+    options.binding_map.insert(
+        naga::ResourceBinding {
+            group: 0,
+            binding: 2,
+        },
+        2,
+    );
+    options.binding_map.insert(
+        naga::ResourceBinding {
+            group: 2,
+            binding: 3,
+        },
+        3,
+    );
+    let pipeline_options = naga::back::glsl::PipelineOptions {
+        shader_stage: naga::ShaderStage::Compute,
+        entry_point: String::from("main"),
+        multiview: None,
+    };
+    let mut output = String::new();
+    let mut writer = naga::back::glsl::Writer::new(
+        &mut output,
+        &module,
+        &module_info,
+        &options,
+        &pipeline_options,
+        Default::default(),
+    )
+    .unwrap();
+    writer.write().unwrap();
+
+    assert!(output.contains("layout(binding = 2) uniform sampler2D _group_0_binding_2_cs;"));
+    assert!(output.contains("texelFetch(_group_0_binding_2_cs, ivec2(0, 0), 0).x"));
+}
+
+#[test]
+fn glsl_traces_depth_texture_load_through_function_arguments() {
+    let module = naga::front::wgsl::parse_str(
+        "@group(0) @binding(0) var depth_texture: texture_depth_2d;\n\
+         fn fetch_depth(texture: texture_depth_2d) -> f32 {\n\
+             return textureLoad(texture, vec2<i32>(0, 0), 0);\n\
+         }\n\
+         fn forward_depth(texture: texture_depth_2d) -> f32 {\n\
+             return fetch_depth(texture);\n\
+         }\n\
+         @fragment fn main() -> @location(0) f32 {\n\
+             return forward_depth(depth_texture);\n\
+         }",
+    )
+    .unwrap();
+    let module_info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+    let mut options = naga::back::glsl::Options {
+        version: naga::back::glsl::Version::Desktop(460),
+        ..Default::default()
+    };
+    options.binding_map.insert(
+        naga::ResourceBinding {
+            group: 0,
+            binding: 0,
+        },
+        0,
+    );
+    let pipeline_options = naga::back::glsl::PipelineOptions {
+        shader_stage: naga::ShaderStage::Fragment,
+        entry_point: String::from("main"),
+        multiview: None,
+    };
+    let mut output = String::new();
+    naga::back::glsl::Writer::new(
+        &mut output,
+        &module,
+        &module_info,
+        &options,
+        &pipeline_options,
+        Default::default(),
+    )
+    .unwrap()
+    .write()
+    .unwrap();
+
+    assert!(output.contains("layout(binding = 0) uniform sampler2D _group_0_binding_0_fs;"));
+    assert!(!output.contains("sampler2DShadow _group_0_binding_0_fs"));
+    assert!(output.contains("texelFetch("));
+}
+
+#[test]
+fn glsl_traces_depth_texture_load_through_binding_array_access() {
+    let module = naga::front::wgsl::parse_str(
+        "enable wgpu_binding_array;\n\
+         @group(0) @binding(0) var depth_textures: binding_array<texture_depth_2d, 2>;\n\
+         @fragment fn main() -> @location(0) f32 {\n\
+             return textureLoad(depth_textures[1], vec2<i32>(0, 0), 0);\n\
+         }",
+    )
+    .unwrap();
+    let module_info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::TEXTURE_AND_SAMPLER_BINDING_ARRAY,
+    )
+    .validate(&module)
+    .unwrap();
+    let mut options = naga::back::glsl::Options {
+        version: naga::back::glsl::Version::Desktop(460),
+        ..Default::default()
+    };
+    options.binding_map.insert(
+        naga::ResourceBinding {
+            group: 0,
+            binding: 0,
+        },
+        0,
+    );
+    let pipeline_options = naga::back::glsl::PipelineOptions {
+        shader_stage: naga::ShaderStage::Fragment,
+        entry_point: String::from("main"),
+        multiview: None,
+    };
+    let mut output = String::new();
+    naga::back::glsl::Writer::new(
+        &mut output,
+        &module,
+        &module_info,
+        &options,
+        &pipeline_options,
+        Default::default(),
+    )
+    .unwrap()
+    .write()
+    .unwrap();
+
+    assert!(output.contains("layout(binding = 0) uniform sampler2D _group_0_binding_0_fs[2];"));
+    assert!(!output.contains("sampler2DShadow _group_0_binding_0_fs"));
+    assert!(output.contains("texelFetch(_group_0_binding_0_fs[1]"));
+}
+
+#[test]
+fn glsl_rejects_depth_load_and_sampling_mixed_through_calls() {
+    let module = naga::front::wgsl::parse_str(
+        "@group(0) @binding(0) var depth_texture: texture_depth_2d;\n\
+         @group(0) @binding(1) var comparison_sampler: sampler_comparison;\n\
+         fn load_depth(texture: texture_depth_2d) -> f32 {\n\
+             return textureLoad(texture, vec2<i32>(0, 0), 0);\n\
+         }\n\
+         fn sample_depth(texture: texture_depth_2d, sampler_arg: sampler_comparison) -> f32 {\n\
+             return textureSampleCompareLevel(texture, sampler_arg, vec2<f32>(0.5), 0.5);\n\
+         }\n\
+         @fragment fn main() -> @location(0) f32 {\n\
+             return load_depth(depth_texture) + sample_depth(depth_texture, comparison_sampler);\n\
+         }",
+    )
+    .unwrap();
+    let module_info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+    let options = naga::back::glsl::Options {
+        version: naga::back::glsl::Version::Desktop(460),
+        ..Default::default()
+    };
+    let pipeline_options = naga::back::glsl::PipelineOptions {
+        shader_stage: naga::ShaderStage::Fragment,
+        entry_point: String::from("main"),
+        multiview: None,
+    };
+    let result = naga::back::glsl::Writer::new(
+        String::new(),
+        &module,
+        &module_info,
+        &options,
+        &pipeline_options,
+        Default::default(),
+    );
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("mixed depth load and sampling unexpectedly succeeded"),
+    };
+
+    assert!(matches!(error, naga::back::glsl::Error::Custom(_)));
+}
+
+#[test]
+fn glsl_writes_multisampled_depth_texture_load_as_texel_fetch() {
+    let module = naga::front::wgsl::parse_str(
+        "@group(0) @binding(11)\n\
+         var depth_texture: texture_depth_multisampled_2d;\n\
+         @group(2) @binding(12)\n\
+         var<storage, read_write> output: f32;\n\
+         @compute @workgroup_size(1)\n\
+         fn main() {\n\
+             output = textureLoad(depth_texture, vec2<i32>(0, 0), 0);\n\
+         }",
+    )
+    .unwrap();
+    let module_info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap();
+    let mut options = naga::back::glsl::Options {
+        version: naga::back::glsl::Version::Desktop(460),
+        ..Default::default()
+    };
+    options.binding_map.insert(
+        naga::ResourceBinding {
+            group: 0,
+            binding: 11,
+        },
+        11,
+    );
+    options.binding_map.insert(
+        naga::ResourceBinding {
+            group: 2,
+            binding: 12,
+        },
+        12,
+    );
+    let pipeline_options = naga::back::glsl::PipelineOptions {
+        shader_stage: naga::ShaderStage::Compute,
+        entry_point: String::from("main"),
+        multiview: None,
+    };
+    let mut output = String::new();
+    let mut writer = naga::back::glsl::Writer::new(
+        &mut output,
+        &module,
+        &module_info,
+        &options,
+        &pipeline_options,
+        Default::default(),
+    )
+    .unwrap();
+    writer.write().unwrap();
+
+    assert!(output.contains("layout(binding = 11) uniform sampler2DMS _group_0_binding_11_cs;"));
+    assert!(output.contains("texelFetch(_group_0_binding_11_cs, ivec2(0, 0), 0).x"));
+}
+
+#[test]
+fn glsl_writes_immediates_as_a_bound_std140_block() {
+    let module = naga::front::wgsl::parse_str(
+        "struct ImmediateData { value: u32, }\n\
+         var<immediate> immediates: ImmediateData;\n\
+         @group(2) @binding(0)\n\
+         var<storage, read_write> output: u32;\n\
+         @compute @workgroup_size(1)\n\
+         fn main() {\n\
+             output = immediates.value;\n\
+         }",
+    )
+    .unwrap();
+    let module_info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::IMMEDIATES,
+    )
+    .validate(&module)
+    .unwrap();
+    let mut options = naga::back::glsl::Options {
+        version: naga::back::glsl::Version::Desktop(460),
+        immediates_binding: Some(15),
+        ..Default::default()
+    };
+    options.binding_map.insert(
+        naga::ResourceBinding {
+            group: 2,
+            binding: 0,
+        },
+        0,
+    );
+    let pipeline_options = naga::back::glsl::PipelineOptions {
+        shader_stage: naga::ShaderStage::Compute,
+        entry_point: String::from("main"),
+        multiview: None,
+    };
+    let mut output = String::new();
+    let mut writer = naga::back::glsl::Writer::new(
+        &mut output,
+        &module,
+        &module_info,
+        &options,
+        &pipeline_options,
+        Default::default(),
+    )
+    .unwrap();
+    writer.write().unwrap();
+
+    assert!(output.contains("layout(std140, binding = 15) uniform"));
+    assert!(output.contains("_immediates_binding_cs.value"));
+}
+
 mod dummy_interpolation_shader {
     pub struct DummyInterpolationShader {
         pub source: String,

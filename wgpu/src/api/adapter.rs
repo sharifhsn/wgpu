@@ -61,9 +61,15 @@ impl Adapter {
     ) -> impl Future<Output = Result<(Device, Queue), RequestDeviceError>> + WasmNotSend {
         let device = self.inner.request_device(desc);
         async move {
-            device
-                .await
-                .map(|(device, queue)| (Device { inner: device }, Queue { inner: queue }))
+            device.await.map(|(device, queue)| {
+                (
+                    Device {
+                        inner: device,
+                        deko3d_shader_artifact_provider: Default::default(),
+                    },
+                    Queue { inner: queue },
+                )
+            })
         }
     }
 
@@ -89,6 +95,7 @@ impl Adapter {
         Ok((
             Device {
                 inner: device.into(),
+                deko3d_shader_artifact_provider: Default::default(),
             },
             Queue {
                 inner: queue.into(),

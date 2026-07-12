@@ -42,6 +42,57 @@ Bottom level categories:
 
 ## Unreleased
 
+### Added/New Features
+
+#### Hal
+
+- Added a trusted Deko3D shader-artifact provider that lets ordinary WGSL shader-module creation resolve embedded, reflected, multi-entry DKSH bundles.
+- Added instance-rate vertex-buffer support to the experimental Deko3D backend.
+- Added native 8-, 16-, and 32-bit integer, normalized, half-float, packed 10:10:10:2, and BGRA vertex formats to the experimental Deko3D backend; 64-bit attributes remain gated.
+- Added render-pipeline depth bias, slope scale, and clamp support to the experimental Deko3D backend.
+- Added alpha-to-coverage multisampling and indexed strip primitive-restart support to the experimental Deko3D backend.
+- Added native anisotropic sampler filtering and the corresponding downlevel capability to the experimental Deko3D backend.
+- Fixed nearest mipmap filtering on the experimental Deko3D backend so it selects the nearest mip instead of disabling mipmapping.
+- Added sampled, blendable render-target, storage-texture, and copy support for `Rgba16Float` on the experimental Deko3D backend.
+- Added occlusion queries and deterministic query-slot reset behavior to the experimental Deko3D backend.
+- Added timestamp writes inside command encoders and compute/render passes to the experimental Deko3D backend.
+- Added native graphics pipeline-statistics counter plumbing to the experimental Deko3D backend.
+- Added sampled and copy support for `R16Float` and `Rg16Float` on the experimental Deko3D backend.
+- Added `Rgba8Uint` and `Rgba8Sint` render-target and copy support to the experimental Deko3D backend.
+- Added bounded sampled texture/sampler binding arrays to the experimental Deko3D backend.
+- Added up to eight color attachments to the experimental Deko3D backend.
+- Added 2x and 8x multisample modes to the experimental Deko3D backend.
+- Added read-only depth/stencil attachment support to the experimental Deko3D backend.
+- Added render-pass `StoreOp::Discard` support to the experimental Deko3D backend.
+- Added bounded storage-texture binding arrays to the experimental Deko3D backend.
+- Added `Depth32Float` D2, D2Array, cube, and cube-array comparison sampling to the experimental Deko3D backend.
+- Added clamp-to-border sampler addressing, including `SamplerBorderColor::Zero`, to the experimental Deko3D backend.
+- Added standalone sampled texture bindings for WGSL `textureLoad`, including non-multisampled depth D2 and D2Array fetches, on the experimental Deko3D backend.
+- Added mixed sampled-texture and buffer bind groups to the experimental Deko3D backend.
+- Added `Features::IMMEDIATES` through a reserved uniform-buffer binding on the experimental Deko3D backend.
+- Added sampled and copy support for native one-dimensional textures on the experimental Deko3D backend.
+- Added `R8Unorm` and `Rg8Unorm` storage-texture support on the experimental Deko3D backend.
+- Added mixed sampled-texture/sampler binding arrays and storage textures on the experimental Deko3D backend.
+- Added reflected DKSH shader artifacts and runtime physical binding remapping across Deko3D bind groups.
+
+### Bug Fixes
+
+#### Hal
+
+- Fixed sRGB/linear texture-to-texture copies on the experimental Deko3D backend.
+- Fixed render passes using an occlusion query set on the experimental Deko3D backend.
+- Fixed depth/stencil-only render passes on the experimental Deko3D backend.
+- Fixed Deko3D texture views to apply their resolved native image format.
+- Added sparse color-attachment layouts to the experimental Deko3D backend.
+- Fixed Deko3D buffer clears and copies to preserve GPU-written data.
+- Fixed Deko3D queue idle waits and surface-state synchronization.
+- Fixed Deko3D texture descriptor slots to be reclaimed when bind groups are dropped.
+- Fixed stencil state support for `Depth32FloatStencil8` on the experimental Deko3D backend.
+- Stopped advertising indirect-count draws on Deko3D until GPU-written count buffers are supported correctly.
+- Stopped advertising pipeline-statistics queries on Deko3D until compute invocation counters are available.
+- Stopped advertising pipeline caches on Deko3D until cache data can be persisted and reused.
+- Fixed GLSL depth texture loads through binding arrays and helper-function arguments.
+
 ## v30.0.0 (2026-07-01)
 
 ### Major changes

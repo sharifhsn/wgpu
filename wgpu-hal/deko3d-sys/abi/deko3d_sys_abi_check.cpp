@@ -110,6 +110,11 @@ CHECK("DkFence align", alignof(DkFence) == 8);
 CHECK("DkFence size", sizeof(DkFence) == 64);
 CHECK("DkCounter size", sizeof(DkCounter) == 4);
 CHECK("DkCounter_Timestamp value", DkCounter_Timestamp == 1);
+CHECK("DkCounter_SamplesPassed value", DkCounter_SamplesPassed == 2);
+CHECK("DkCounter_VertexShaderInvocations value", DkCounter_VertexShaderInvocations == 6);
+CHECK("DkCounter_FragmentShaderInvocations value", DkCounter_FragmentShaderInvocations == 10);
+CHECK("DkCounter_ClipperInputPrimitives value", DkCounter_ClipperInputPrimitives == 13);
+CHECK("DkCounter_ClipperOutputPrimitives value", DkCounter_ClipperOutputPrimitives == 14);
 CHECK("DK_NUM_STORAGE_BUFS", DK_NUM_STORAGE_BUFS == 16);
 CHECK("DK_SHADER_CODE_UNUSABLE_SIZE", DK_SHADER_CODE_UNUSABLE_SIZE == 0x400);
 CHECK("DK_IMAGE_DESCRIPTOR_ALIGNMENT", DK_IMAGE_DESCRIPTOR_ALIGNMENT == 0x20);
@@ -281,8 +286,12 @@ using DkDeviceCreateSig = DkDevice (*)(DkDeviceMaker const*);
 using DkCmdBufClearSig = void (*)(DkCmdBuf);
 using DkCmdBufBindRenderTargetsSig =
     void (*)(DkCmdBuf, DkImageView const* const*, uint32_t, DkImageView const*);
+using DkCmdBufPushConstantsSig =
+    void (*)(DkCmdBuf, DkGpuAddr, uint32_t, uint32_t, uint32_t, void const*);
 using DkCmdBufPushDataSig = void (*)(DkCmdBuf, DkGpuAddr, void const*, uint32_t);
 using DkCmdBufBarrierSig = void (*)(DkCmdBuf, DkBarrier, uint32_t);
+using DkCmdBufDiscardColorSig = void (*)(DkCmdBuf, uint32_t);
+using DkCmdBufDiscardDepthStencilSig = void (*)(DkCmdBuf);
 using DkCmdBufBindTexturesSig =
     void (*)(DkCmdBuf, DkStage, uint32_t, DkResHandle const*, uint32_t);
 using DkCmdBufBindImagesSig =
@@ -312,6 +321,8 @@ using DkCmdBufCopyImageToBufferSig =
     void (*)(DkCmdBuf, DkImageView const*, DkImageRect const*, DkCopyBuf const*, uint32_t);
 using DkCmdBufCopyBufferSig = void (*)(DkCmdBuf, DkGpuAddr, DkGpuAddr, uint32_t);
 using DkCmdBufReportCounterSig = void (*)(DkCmdBuf, DkCounter, DkGpuAddr);
+using DkCmdBufReportValueSig = void (*)(DkCmdBuf, uint32_t, DkGpuAddr);
+using DkCmdBufResetCounterSig = void (*)(DkCmdBuf, DkCounter);
 using DkImageDescriptorInitializeSig =
     void (*)(DkImageDescriptor*, DkImageView const*, bool, bool);
 using DkSamplerDescriptorInitializeSig = void (*)(DkSamplerDescriptor*, DkSampler const*);
@@ -328,9 +339,15 @@ using DkDeviceCreateMatches = std::is_same<decltype(&dkDeviceCreate), DkDeviceCr
 using DkCmdBufClearMatches = std::is_same<decltype(&dkCmdBufClear), DkCmdBufClearSig>;
 using DkCmdBufBindRenderTargetsMatches =
     std::is_same<decltype(&dkCmdBufBindRenderTargets), DkCmdBufBindRenderTargetsSig>;
+using DkCmdBufPushConstantsMatches =
+    std::is_same<decltype(&dkCmdBufPushConstants), DkCmdBufPushConstantsSig>;
 using DkCmdBufPushDataMatches =
     std::is_same<decltype(&dkCmdBufPushData), DkCmdBufPushDataSig>;
 using DkCmdBufBarrierMatches = std::is_same<decltype(&dkCmdBufBarrier), DkCmdBufBarrierSig>;
+using DkCmdBufDiscardColorMatches =
+    std::is_same<decltype(&dkCmdBufDiscardColor), DkCmdBufDiscardColorSig>;
+using DkCmdBufDiscardDepthStencilMatches =
+    std::is_same<decltype(&dkCmdBufDiscardDepthStencil), DkCmdBufDiscardDepthStencilSig>;
 using DkCmdBufBindTexturesMatches =
     std::is_same<decltype(&dkCmdBufBindTextures), DkCmdBufBindTexturesSig>;
 using DkCmdBufBindImagesMatches =
@@ -367,6 +384,10 @@ using DkCmdBufCopyBufferMatches =
     std::is_same<decltype(&dkCmdBufCopyBuffer), DkCmdBufCopyBufferSig>;
 using DkCmdBufReportCounterMatches =
     std::is_same<decltype(&dkCmdBufReportCounter), DkCmdBufReportCounterSig>;
+using DkCmdBufReportValueMatches =
+    std::is_same<decltype(&dkCmdBufReportValue), DkCmdBufReportValueSig>;
+using DkCmdBufResetCounterMatches =
+    std::is_same<decltype(&dkCmdBufResetCounter), DkCmdBufResetCounterSig>;
 using DkImageDescriptorInitializeMatches =
     std::is_same<decltype(&dkImageDescriptorInitialize), DkImageDescriptorInitializeSig>;
 using DkSamplerDescriptorInitializeMatches =
@@ -388,8 +409,11 @@ using PadConfigureInputMatches = std::is_same<decltype(&padConfigureInput), PadC
 CHECK("dkDeviceCreate signature", DkDeviceCreateMatches::value);
 CHECK("dkCmdBufClear signature", DkCmdBufClearMatches::value);
 CHECK("dkCmdBufBindRenderTargets signature", DkCmdBufBindRenderTargetsMatches::value);
+CHECK("dkCmdBufPushConstants signature", DkCmdBufPushConstantsMatches::value);
 CHECK("dkCmdBufPushData signature", DkCmdBufPushDataMatches::value);
 CHECK("dkCmdBufBarrier signature", DkCmdBufBarrierMatches::value);
+CHECK("dkCmdBufDiscardColor signature", DkCmdBufDiscardColorMatches::value);
+CHECK("dkCmdBufDiscardDepthStencil signature", DkCmdBufDiscardDepthStencilMatches::value);
 CHECK("dkCmdBufBindTextures signature", DkCmdBufBindTexturesMatches::value);
 CHECK("dkCmdBufBindImages signature", DkCmdBufBindImagesMatches::value);
 CHECK("dkCmdBufBindImageDescriptorSet signature", DkCmdBufBindImageDescriptorSetMatches::value);
@@ -408,6 +432,8 @@ CHECK("dkCmdBufCopyBufferToImage signature", DkCmdBufCopyBufferToImageMatches::v
 CHECK("dkCmdBufCopyImageToBuffer signature", DkCmdBufCopyImageToBufferMatches::value);
 CHECK("dkCmdBufCopyBuffer signature", DkCmdBufCopyBufferMatches::value);
 CHECK("dkCmdBufReportCounter signature", DkCmdBufReportCounterMatches::value);
+CHECK("dkCmdBufReportValue signature", DkCmdBufReportValueMatches::value);
+CHECK("dkCmdBufResetCounter signature", DkCmdBufResetCounterMatches::value);
 CHECK("dkImageDescriptorInitialize signature", DkImageDescriptorInitializeMatches::value);
 CHECK("dkSamplerDescriptorInitialize signature", DkSamplerDescriptorInitializeMatches::value);
 CHECK("DkCmdBufMaker cbAddMem signature", DkCmdBufAddMemFuncMatches::value);

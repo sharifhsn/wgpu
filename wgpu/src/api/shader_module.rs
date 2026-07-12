@@ -275,3 +275,31 @@ impl<'a> Deko3dDkshShaderModuleDescriptor<'a> {
         }
     }
 }
+
+/// Descriptor for a verified, reflected Deko3D DKSH shader artifact.
+#[derive(Clone, Debug)]
+pub struct Deko3dReflectedDkshShaderModuleDescriptor<'a> {
+    /// Debug label of the shader module.
+    pub label: Label<'a>,
+    /// Entry point and compute workgroup size used by public pipeline validation.
+    pub entry_point: PassthroughShaderEntryPoint<'a>,
+    /// Exactly one stage represented by this artifact.
+    pub stage: ShaderStages,
+    /// Reflected logical-to-physical resource assignments.
+    pub bindings: Cow<'a, [wgt::Deko3dShaderBinding]>,
+    /// Binary Deko3D DKSH data produced by the offline compiler.
+    pub dksh: Cow<'a, [u8]>,
+}
+static_assertions::assert_impl_all!(Deko3dReflectedDkshShaderModuleDescriptor<'_>: Send, Sync);
+
+/// Trusted resolver for offline-compiled artifacts corresponding to ordinary WGSL source.
+///
+/// A provider is normally generated at application build time and embedded into the final
+/// executable. Each returned artifact represents one entry point from the source module.
+pub trait Deko3dShaderArtifactProvider: core::fmt::Debug + Send + Sync {
+    /// Resolve all Deko3D artifacts compiled from `wgsl`.
+    fn resolve_wgsl(
+        &self,
+        wgsl: &str,
+    ) -> Result<Option<Vec<wgt::Deko3dShaderArtifact<'static>>>, String>;
+}

@@ -187,6 +187,11 @@ pub const DkQueueFlags_DisableZcull: u32 = 1 << 4;
 pub enum DkCounter {
     DkCounter_TimestampPipelineTop = 0,
     DkCounter_Timestamp = 1,
+    DkCounter_SamplesPassed = 2,
+    DkCounter_VertexShaderInvocations = 6,
+    DkCounter_FragmentShaderInvocations = 10,
+    DkCounter_ClipperInputPrimitives = 13,
+    DkCounter_ClipperOutputPrimitives = 14,
 }
 
 #[repr(C)]
@@ -412,6 +417,10 @@ impl DkMultisampleState {
     pub fn set_rasterizer_mode(&mut self, mode: DkMsMode) {
         self.bits = (self.bits & !(0b111 << 3)) | (((mode as u32) & 0b111) << 3);
     }
+
+    pub fn set_alpha_to_coverage_enable(&mut self, enable: bool) {
+        self.bits = (self.bits & !(1 << 6)) | (u32::from(enable) << 6);
+    }
 }
 
 #[repr(C)]
@@ -553,6 +562,10 @@ impl DkRasterizerState {
 
     pub fn set_front_face(&mut self, front_face: u32) {
         self.bits = (self.bits & !(0b1 << 9)) | ((front_face & 0b1) << 9);
+    }
+
+    pub fn set_depth_bias_enable(&mut self, enable: bool) {
+        self.bits = (self.bits & !(0b111 << 14)) | (u32::from(enable) * 0b100 << 14);
     }
 }
 
@@ -1145,6 +1158,8 @@ unsafe extern "C" {
     pub fn dkCmdBufBindMultisampleState(obj: DkCmdBuf, state: *const DkMultisampleState);
     pub fn dkCmdBufSetBlendConst(obj: DkCmdBuf, red: f32, green: f32, blue: f32, alpha: f32);
     pub fn dkCmdBufSetSampleMask(obj: DkCmdBuf, mask: u32);
+    pub fn dkCmdBufSetDepthBias(obj: DkCmdBuf, constantFactor: f32, clamp: f32, slopeFactor: f32);
+    pub fn dkCmdBufSetPrimitiveRestart(obj: DkCmdBuf, enable: bool, index: u32);
     pub fn dkCmdBufSetStencil(obj: DkCmdBuf, face: u32, mask: u8, funcRef: u8, funcMask: u8);
     pub fn dkCmdBufClearDepthStencil(
         obj: DkCmdBuf,
@@ -1153,10 +1168,20 @@ unsafe extern "C" {
         stencilMask: u8,
         stencilValue: u8,
     );
+    pub fn dkCmdBufDiscardColor(obj: DkCmdBuf, targetId: u32);
+    pub fn dkCmdBufDiscardDepthStencil(obj: DkCmdBuf);
     pub fn dkCmdBufResolveImage(
         obj: DkCmdBuf,
         srcView: *const DkImageView,
         dstView: *const DkImageView,
+    );
+    pub fn dkCmdBufPushConstants(
+        obj: DkCmdBuf,
+        uboAddr: DkGpuAddr,
+        uboSize: u32,
+        offset: u32,
+        size: u32,
+        data: *const c_void,
     );
     pub fn dkCmdBufPushData(obj: DkCmdBuf, addr: DkGpuAddr, data: *const c_void, size: u32);
     pub fn dkCmdBufBindTextures(
@@ -1256,6 +1281,8 @@ unsafe extern "C" {
     );
     pub fn dkCmdBufCopyBuffer(obj: DkCmdBuf, srcAddr: DkGpuAddr, dstAddr: DkGpuAddr, size: u32);
     pub fn dkCmdBufReportCounter(obj: DkCmdBuf, type_: DkCounter, addr: DkGpuAddr);
+    pub fn dkCmdBufReportValue(obj: DkCmdBuf, value: u32, addr: DkGpuAddr);
+    pub fn dkCmdBufResetCounter(obj: DkCmdBuf, type_: DkCounter);
 
     pub fn dkQueueCreate(maker: *const DkQueueMaker) -> DkQueue;
     pub fn dkQueueDestroy(obj: DkQueue);
@@ -1471,6 +1498,8 @@ pub fn milestone_1_compile_smoke() {
     let _ = dkDeviceCreate as unsafe extern "C" fn(*const DkDeviceMaker) -> DkDevice;
     let _ = dkCmdBufDispatchCompute as unsafe extern "C" fn(DkCmdBuf, u32, u32, u32);
     let _ = dkCmdBufDispatchComputeIndirect as unsafe extern "C" fn(DkCmdBuf, DkGpuAddr);
+    let _ = dkCmdBufSetDepthBias as unsafe extern "C" fn(DkCmdBuf, f32, f32, f32);
+    let _ = dkCmdBufSetPrimitiveRestart as unsafe extern "C" fn(DkCmdBuf, bool, u32);
     let _ = nwindowGetDefault as unsafe extern "C" fn() -> *mut NWindow;
 }
 
@@ -1496,5 +1525,23 @@ mod tests {
     fn bgra8_image_format_values_match_deko3d() {
         assert_eq!(DkImageFormat::DkImageFormat_BGRA8_Unorm as u32, 117);
         assert_eq!(DkImageFormat::DkImageFormat_BGRA8_Unorm_sRGB as u32, 119);
+    }
+
+    #[test]
+    fn depth_bias_enable_uses_the_fill_polygon_bit() {
+        let mut state = DkRasterizerState::defaults();
+        state.set_depth_bias_enable(true);
+        assert_eq!((state.bits >> 14) & 0b111, 0b100);
+        state.set_depth_bias_enable(false);
+        assert_eq!((state.bits >> 14) & 0b111, 0);
+    }
+
+    #[test]
+    fn alpha_to_coverage_uses_the_native_multisample_bit() {
+        let mut state = DkMultisampleState::defaults();
+        state.set_alpha_to_coverage_enable(true);
+        assert_eq!((state.bits >> 6) & 1, 1);
+        state.set_alpha_to_coverage_enable(false);
+        assert_eq!((state.bits >> 6) & 1, 0);
     }
 }

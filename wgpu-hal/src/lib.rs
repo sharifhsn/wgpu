@@ -2539,7 +2539,11 @@ pub enum ShaderInput<'a> {
         num_workgroups: hashbrown::HashMap<String, (u32, u32, u32)>,
     },
     SpirV(&'a [u32]),
-    Deko3dDksh(&'a [u8]),
+    Deko3dDksh {
+        bytes: &'a [u8],
+        metadata: Option<&'a wgt::Deko3dShaderMetadata<'a>>,
+    },
+    Deko3dArtifacts(&'a [wgt::Deko3dShaderArtifact<'a>]),
     Dxil {
         shader: &'a [u8],
     },
@@ -2560,7 +2564,8 @@ impl fmt::Debug for ShaderInput<'_> {
             Self::MetalLib { .. } => f.debug_tuple("MetalLib").finish_non_exhaustive(),
             Self::Msl { .. } => f.debug_tuple("Msl").finish_non_exhaustive(),
             Self::SpirV { .. } => f.debug_tuple("SpirV").finish_non_exhaustive(),
-            Self::Deko3dDksh(_) => f.debug_tuple("Deko3dDksh").finish_non_exhaustive(),
+            Self::Deko3dDksh { .. } => f.debug_tuple("Deko3dDksh").finish_non_exhaustive(),
+            Self::Deko3dArtifacts(..) => f.debug_tuple("Deko3dArtifacts").finish_non_exhaustive(),
             Self::Dxil { .. } => f.debug_tuple("Dxil").finish_non_exhaustive(),
             Self::Hlsl { .. } => f.debug_tuple("Hlsl").finish_non_exhaustive(),
             Self::Glsl { .. } => f.debug_tuple("Glsl").finish_non_exhaustive(),

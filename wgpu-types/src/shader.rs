@@ -113,6 +113,62 @@ pub struct PassthroughShaderEntryPoint<'a> {
     pub workgroup_size: (u32, u32, u32),
 }
 
+/// Deko3D resource class used by an offline-compiled shader binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Deko3dShaderBindingKind {
+    /// Uniform-buffer slot namespace.
+    UniformBuffer,
+    /// Storage-buffer slot namespace.
+    StorageBuffer,
+    /// Sampled-image descriptor namespace.
+    SampledTexture,
+    /// Sampler descriptor namespace.
+    Sampler,
+    /// Storage-image slot namespace.
+    StorageTexture,
+}
+
+/// Reflected logical-to-physical binding assignment for a Deko3D shader artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Deko3dShaderBinding {
+    /// Logical bind group from the source shader.
+    pub group: u32,
+    /// Logical binding number within `group`.
+    pub binding: u32,
+    /// Resource namespace occupied by this binding.
+    pub kind: Deko3dShaderBindingKind,
+    /// Number of consecutive resources in the binding.
+    pub count: u32,
+    /// First physical Deko3D slot selected by the offline compiler.
+    pub physical_binding: u32,
+}
+
+/// Identity and binding reflection attached to offline-compiled DKSH bytes.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Deko3dShaderMetadata<'a> {
+    /// Exactly one shader stage represented by the DKSH payload.
+    pub stage: crate::ShaderStages,
+    /// Entry point compiled into the payload.
+    pub entry_point: Cow<'a, str>,
+    /// Reflected resource bindings used by the payload.
+    pub bindings: Cow<'a, [Deko3dShaderBinding]>,
+}
+
+/// One entry-point-specific DKSH payload in an offline-compiled shader module bundle.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Deko3dShaderArtifact<'a> {
+    /// Binary Deko3D DKSH data produced by the offline compiler.
+    pub dksh: Cow<'a, [u8]>,
+    /// Verified identity and binding reflection for this payload.
+    pub metadata: Deko3dShaderMetadata<'a>,
+    /// Compute workgroup size, or `(0, 0, 0)` for non-compute stages.
+    pub workgroup_size: (u32, u32, u32),
+}
+
 /// Descriptor for a shader module given by any of several sources.
 /// These shaders are passed through directly to the underlying api.
 /// At least one shader type that may be used by the backend must be `Some` or a panic is raised.
@@ -131,6 +187,10 @@ pub struct CreateShaderModuleDescriptorPassthrough<'a, L> {
     pub spirv: Option<Cow<'a, [u32]>>,
     /// Binary Deko3D DKSH data, as produced by the offline deko3d shader compiler.
     pub deko3d_dksh: Option<Cow<'a, [u8]>>,
+    /// Verified identity and binding reflection for `deko3d_dksh`.
+    pub deko3d_metadata: Option<Deko3dShaderMetadata<'a>>,
+    /// Entry-point-specific Deko3D artifacts compiled from one source module.
+    pub deko3d_artifacts: Cow<'a, [Deko3dShaderArtifact<'a>]>,
     /// Shader DXIL source.
     pub dxil: Option<Cow<'a, [u8]>>,
     /// Shader HLSL source.
@@ -154,6 +214,8 @@ impl<'a, L: Default> Default for CreateShaderModuleDescriptorPassthrough<'a, L> 
             entry_points: Cow::Borrowed(&[]),
             spirv: None,
             deko3d_dksh: None,
+            deko3d_metadata: None,
+            deko3d_artifacts: Cow::Borrowed(&[]),
             dxil: None,
             metallib: None,
             msl: None,
@@ -175,6 +237,8 @@ impl<'a, L> CreateShaderModuleDescriptorPassthrough<'a, L> {
             entry_points: self.entry_points.clone(),
             spirv: self.spirv.clone(),
             deko3d_dksh: self.deko3d_dksh.clone(),
+            deko3d_metadata: self.deko3d_metadata.clone(),
+            deko3d_artifacts: self.deko3d_artifacts.clone(),
             metallib: self.metallib.clone(),
             dxil: self.dxil.clone(),
             msl: self.msl.clone(),
@@ -191,6 +255,8 @@ impl<'a, L> CreateShaderModuleDescriptorPassthrough<'a, L> {
             bytemuck::cast_slice(spirv)
         } else if let Some(deko3d_dksh) = &self.deko3d_dksh {
             deko3d_dksh
+        } else if let Some(artifact) = self.deko3d_artifacts.first() {
+            &artifact.dksh
         } else if let Some(metallib) = &self.metallib {
             metallib
         } else if let Some(msl) = &self.msl {
@@ -213,6 +279,8 @@ impl<'a, L> CreateShaderModuleDescriptorPassthrough<'a, L> {
     pub fn trace_binary_ext(&self) -> &'static str {
         if self.spirv.is_some() {
             "spv"
+        } else if self.deko3d_dksh.is_some() || !self.deko3d_artifacts.is_empty() {
+            "dksh"
         } else if self.metallib.is_some() {
             "metallib"
         } else if self.msl.is_some() {

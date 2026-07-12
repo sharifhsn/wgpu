@@ -1372,6 +1372,7 @@ impl crate::Device for super::Device {
                 version: self.shared.shading_language_version,
                 writer_flags,
                 binding_map,
+                immediates_binding: None,
                 zero_initialize_workgroup_memory: true,
             },
         })
@@ -1488,7 +1489,8 @@ impl crate::Device for super::Device {
                     source: shader.to_owned(),
                 },
                 crate::ShaderInput::SpirV(_)
-                | crate::ShaderInput::Deko3dDksh(_)
+                | crate::ShaderInput::Deko3dDksh { .. }
+                | crate::ShaderInput::Deko3dArtifacts(..)
                 | crate::ShaderInput::MetalLib { .. }
                 | crate::ShaderInput::Msl { .. }
                 | crate::ShaderInput::Dxil { .. }

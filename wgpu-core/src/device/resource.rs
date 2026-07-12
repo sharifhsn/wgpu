@@ -2558,12 +2558,16 @@ impl Device {
             wgt::Backend::Noop => {
                 return Err(pipeline::CreateShaderModuleError::NotCompiledForBackend)
             }
-            wgt::Backend::Deko3d => hal::ShaderInput::Deko3dDksh(
-                descriptor
+            wgt::Backend::Deko3d if !descriptor.deko3d_artifacts.is_empty() => {
+                hal::ShaderInput::Deko3dArtifacts(&descriptor.deko3d_artifacts)
+            }
+            wgt::Backend::Deko3d => hal::ShaderInput::Deko3dDksh {
+                bytes: descriptor
                     .deko3d_dksh
                     .as_ref()
                     .ok_or(pipeline::CreateShaderModuleError::NotCompiledForBackend)?,
-            ),
+                metadata: descriptor.deko3d_metadata.as_ref(),
+            },
             wgt::Backend::BrowserWebGpu => unreachable!(),
         };
 

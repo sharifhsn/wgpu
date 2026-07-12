@@ -188,6 +188,11 @@ pub struct Options {
         serde(deserialize_with = "deserialize_binding_map")
     )]
     pub binding_map: BindingMap,
+    /// Binding used to emulate immediate data with a uniform block.
+    ///
+    /// When this is `None`, immediate data is emitted as a regular GLSL
+    /// uniform, preserving the existing backend behavior.
+    pub immediates_binding: Option<u8>,
     /// Should workgroup variables be zero initialized (by polyfilling)?
     pub zero_initialize_workgroup_memory: bool,
 }
@@ -198,6 +203,7 @@ impl Default for Options {
             version: Version::new_gles(310),
             writer_flags: WriterFlags::ADJUST_COORDINATE_SPACE,
             binding_map: BindingMap::default(),
+            immediates_binding: None,
             zero_initialize_workgroup_memory: true,
         }
     }
@@ -502,4 +508,5 @@ pub fn supported_capabilities() -> valid::Capabilities {
         | Caps::MEMORY_DECORATION_COHERENT
         | Caps::MEMORY_DECORATION_VOLATILE
         | Caps::STORAGE_TEXTURE_16BIT_NORM_FORMATS
+        | Caps::STORAGE_BUFFER_BINDING_ARRAY
 }

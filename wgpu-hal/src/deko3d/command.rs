@@ -12,10 +12,11 @@ use core::ptr;
 use deko3d_sys as dk;
 
 #[cfg(target_os = "horizon")]
-use super::DEKO_TIMESTAMP_QUERY_RESULT_SIZE;
+use super::{map_texture_image_format, DEKO_QUERY_RESULT_SIZE};
 use super::{
     Api, BindGroupInner, Buffer, ComputePipelineInner, DeviceResult, QuerySetInner, Queue,
     RawImage, RawQueueHandle, RenderPipelineInner, Resource, TextureInner,
+    DEKO_COLOR_ATTACHMENT_COUNT,
 };
 
 const DEKO_INVALIDATE_IMAGE: u32 = 1 << 0;
@@ -66,11 +67,33 @@ enum Command {
         offset: wgt::BufferAddress,
         stride: wgt::BufferSize,
     },
+    ResetQueries {
+        query_set: alloc::sync::Arc<QuerySetInner>,
+        range: Range<u32>,
+    },
+    BeginOcclusionQuery {
+        query_set: alloc::sync::Arc<QuerySetInner>,
+        index: u32,
+    },
+    EndOcclusionQuery {
+        query_set: alloc::sync::Arc<QuerySetInner>,
+        index: u32,
+    },
+    BeginPipelineStatisticsQuery {
+        query_set: alloc::sync::Arc<QuerySetInner>,
+        index: u32,
+    },
+    EndPipelineStatisticsQuery {
+        query_set: alloc::sync::Arc<QuerySetInner>,
+        index: u32,
+    },
+    WriteTimestamp(TimestampWrite),
     ResourceBarrier {
         invalidate_flags: u32,
     },
     BeginRenderPass {
-        colors: Vec<ColorAttachmentState>,
+        extent: wgt::Extent3d,
+        colors: Vec<Option<ColorAttachmentState>>,
         depth_stencil: DepthStencilAttachmentState,
         beginning_timestamp: Option<TimestampWrite>,
         end_timestamp: Option<TimestampWrite>,
@@ -103,6 +126,11 @@ enum Command {
         index: u32,
         group: alloc::sync::Arc<BindGroupInner>,
         dynamic_offsets: Vec<wgt::DynamicOffset>,
+    },
+    SetImmediates {
+        layout: alloc::sync::Arc<super::PipelineLayoutInner>,
+        offset_bytes: u32,
+        data: Vec<u32>,
     },
     SetViewport {
         rect: crate::Rect<f32>,
@@ -179,14 +207,17 @@ struct ColorAttachmentState {
     sample_count: u32,
     clear_value: Option<wgt::Color>,
     resolve_view: Option<AttachmentViewState>,
+    discard: bool,
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default)]
 struct DepthStencilAttachmentState {
     view: Option<AttachmentViewState>,
+    extent: Option<wgt::Extent3d>,
     depth_clear_value: Option<f32>,
     stencil_clear_value: Option<u8>,
+    discard: bool,
 }
 
 impl DepthStencilAttachmentState {
@@ -200,6 +231,8 @@ impl DepthStencilAttachmentState {
 #[derive(Clone, Copy, Debug)]
 struct AttachmentViewState {
     image: RawImage,
+    format: wgt::TextureFormat,
+    aspect: wgt::TextureAspect,
     base_mip_level: u8,
     base_array_layer: u16,
 }
@@ -208,6 +241,8 @@ impl AttachmentViewState {
     fn from_single_subresource(view: &Resource) -> DeviceResult<(Self, wgt::Extent3d, u32)> {
         let Resource::TextureView {
             image,
+            format,
+            aspect,
             extent,
             sample_count,
             base_mip_level,
@@ -227,6 +262,8 @@ impl AttachmentViewState {
         Ok((
             Self {
                 image: *image,
+                format: *format,
+                aspect: *aspect,
                 base_mip_level: *base_mip_level,
                 base_array_layer: *base_array_layer,
             },
@@ -238,6 +275,13 @@ impl AttachmentViewState {
     #[cfg(target_os = "horizon")]
     fn deko_view(self) -> dk::DkImageView {
         let mut view = dk::DkImageView::defaults(self.image.0);
+        view.format = map_texture_image_format(self.format)
+            .expect("texture view format was validated at creation");
+        if self.aspect == wgt::TextureAspect::StencilOnly
+            || self.format == wgt::TextureFormat::Stencil8
+        {
+            view.dsSource = dk::DkDsSource::DkDsSource_Stencil;
+        }
         view.mipLevelOffset = self.base_mip_level;
         view.mipLevelCount = 1;
         view.layerOffset = self.base_array_layer;
@@ -268,13 +312,16 @@ struct ExecutionState {
 struct RenderTarget {
     extent: wgt::Extent3d,
     colors: Vec<RenderTargetColor>,
+    depth_stencil_discard: bool,
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 struct RenderTargetColor {
+    target_id: u32,
     view: AttachmentViewState,
     resolve_view: Option<AttachmentViewState>,
+    discard: bool,
 }
 
 #[allow(dead_code)]
@@ -476,14 +523,77 @@ impl crate::CommandEncoder for CommandBuffer {
         });
     }
 
-    unsafe fn begin_query(&mut self, _set: &Resource, _index: u32) {
-        self.record_unsupported();
+    unsafe fn begin_query(&mut self, set: &Resource, index: u32) {
+        let Resource::QuerySet(query_set) = set else {
+            self.record_unsupported();
+            return;
+        };
+        let Some(end) = index.checked_add(1) else {
+            self.record_unsupported();
+            return;
+        };
+        if query_set.validate_range(index..end).is_err() {
+            self.record_unsupported();
+            return;
+        }
+        if query_set.is_occlusion() {
+            self.commands.push(Command::BeginOcclusionQuery {
+                query_set: query_set.clone(),
+                index,
+            });
+        } else if query_set.is_pipeline_statistics() {
+            self.commands.push(Command::BeginPipelineStatisticsQuery {
+                query_set: query_set.clone(),
+                index,
+            });
+        } else {
+            self.record_unsupported();
+        }
     }
-    unsafe fn end_query(&mut self, _set: &Resource, _index: u32) {
-        self.record_unsupported();
+    unsafe fn end_query(&mut self, set: &Resource, index: u32) {
+        let Resource::QuerySet(query_set) = set else {
+            self.record_unsupported();
+            return;
+        };
+        let Some(end) = index.checked_add(1) else {
+            self.record_unsupported();
+            return;
+        };
+        if query_set.validate_range(index..end).is_err() {
+            self.record_unsupported();
+            return;
+        }
+        if query_set.is_occlusion() {
+            self.commands.push(Command::EndOcclusionQuery {
+                query_set: query_set.clone(),
+                index,
+            });
+        } else if query_set.is_pipeline_statistics() {
+            self.commands.push(Command::EndPipelineStatisticsQuery {
+                query_set: query_set.clone(),
+                index,
+            });
+        } else {
+            self.record_unsupported();
+        }
     }
-    unsafe fn write_timestamp(&mut self, _set: &Resource, _index: u32) {
-        self.record_unsupported();
+    unsafe fn write_timestamp(&mut self, set: &Resource, index: u32) {
+        let Resource::QuerySet(query_set) = set else {
+            self.record_unsupported();
+            return;
+        };
+        let Some(end) = index.checked_add(1) else {
+            self.record_unsupported();
+            return;
+        };
+        if !query_set.is_timestamp() || query_set.validate_range(index..end).is_err() {
+            self.record_unsupported();
+            return;
+        }
+        self.commands.push(Command::WriteTimestamp(TimestampWrite {
+            query_set: query_set.clone(),
+            index,
+        }));
     }
     unsafe fn read_acceleration_structure_compact_size(
         &mut self,
@@ -492,14 +602,19 @@ impl crate::CommandEncoder for CommandBuffer {
     ) {
         self.record_unsupported();
     }
-    unsafe fn reset_queries(&mut self, _set: &Resource, _range: Range<u32>) {
-        let Resource::QuerySet(query_set) = _set else {
+    unsafe fn reset_queries(&mut self, set: &Resource, range: Range<u32>) {
+        let Resource::QuerySet(query_set) = set else {
             self.record_unsupported();
             return;
         };
-        if query_set.validate_range(_range).is_err() {
+        if query_set.validate_range(range.clone()).is_err() {
             self.record_unsupported();
+            return;
         }
+        self.commands.push(Command::ResetQueries {
+            query_set: query_set.clone(),
+            range,
+        });
     }
     unsafe fn copy_query_results(
         &mut self,
@@ -533,19 +648,23 @@ impl crate::CommandEncoder for CommandBuffer {
         desc: &crate::RenderPassDescriptor<Resource, Resource>,
     ) -> DeviceResult<()> {
         if desc.multiview_mask.is_some()
-            || desc.occlusion_query_set.is_some()
+            || !supports_render_pass_occlusion_query_set(desc.occlusion_query_set)
             || !supports_sample_count(desc.sample_count)
         {
             return Err(crate::DeviceError::Lost);
         }
 
         let colors = color_attachments(desc.color_attachments, desc.sample_count)?;
-        let extent = colors[0].extent;
-        let depth_stencil =
-            depth_stencil_attachment(desc.depth_stencil_attachment.as_ref(), extent)?;
+        let depth_stencil = depth_stencil_attachment(
+            desc.depth_stencil_attachment.as_ref(),
+            colors.iter().flatten().next().map(|color| color.extent),
+            desc.sample_count,
+        )?;
+        let extent = render_pass_extent(&colors, depth_stencil)?;
         let (beginning_timestamp, end_timestamp) =
             timestamp_writes(desc.timestamp_writes.as_ref())?;
         self.commands.push(Command::BeginRenderPass {
+            extent,
             colors,
             depth_stencil,
             beginning_timestamp,
@@ -572,7 +691,21 @@ impl crate::CommandEncoder for CommandBuffer {
             });
         }
     }
-    unsafe fn set_immediates(&mut self, layout: &Resource, offset_bytes: u32, data: &[u32]) {}
+    unsafe fn set_immediates(&mut self, layout: &Resource, offset_bytes: u32, data: &[u32]) {
+        let Resource::PipelineLayout(layout) = layout else {
+            self.record_unsupported();
+            return;
+        };
+        if !layout.contains_immediate_range(offset_bytes, data) {
+            self.record_unsupported();
+            return;
+        }
+        self.commands.push(Command::SetImmediates {
+            layout: layout.clone(),
+            offset_bytes,
+            data: data.to_vec(),
+        });
+    }
 
     unsafe fn insert_debug_marker(&mut self, label: &str) {}
     unsafe fn begin_debug_marker(&mut self, group_label: &str) {}
@@ -841,31 +974,47 @@ impl Command {
     ) -> DeviceResult<()> {
         match self {
             Command::ClearBuffer { ref buffer, range } => {
-                // SAFETY:
-                // Caller is responsible for ensuring this does not alias.
-                let buffer_slice: &mut [u8] = unsafe { &mut *buffer.get_slice_ptr(range.clone()) };
-                buffer_slice.fill(0);
-                upload_after_host_write(buffer)?;
-                Ok(())
-            }
-
-            Command::CopyBufferToBuffer { src, dst, regions } => {
-                for &crate::BufferCopy {
-                    src_offset,
-                    dst_offset,
-                    size,
-                } in regions
+                #[cfg(target_os = "horizon")]
+                {
+                    unsafe { submit_clear_buffer(queue, surface_queue, buffer, range.clone()) }
+                }
+                #[cfg(not(target_os = "horizon"))]
                 {
                     // SAFETY:
                     // Caller is responsible for ensuring this does not alias.
-                    let src_region: &[u8] =
-                        unsafe { &*src.get_slice_ptr(src_offset..src_offset + size.get()) };
-                    let dst_region: &mut [u8] =
-                        unsafe { &mut *dst.get_slice_ptr(dst_offset..dst_offset + size.get()) };
-                    dst_region.copy_from_slice(src_region);
+                    let buffer_slice: &mut [u8] =
+                        unsafe { &mut *buffer.get_slice_ptr(range.clone()) };
+                    buffer_slice.fill(0);
+                    upload_after_host_write(buffer)?;
+                    Ok(())
                 }
-                upload_after_host_write(dst)?;
-                Ok(())
+            }
+
+            Command::CopyBufferToBuffer { src, dst, regions } => {
+                #[cfg(target_os = "horizon")]
+                {
+                    unsafe { submit_copy_buffer_to_buffer(queue, surface_queue, src, dst, regions) }
+                }
+
+                #[cfg(not(target_os = "horizon"))]
+                {
+                    for &crate::BufferCopy {
+                        src_offset,
+                        dst_offset,
+                        size,
+                    } in regions
+                    {
+                        // SAFETY:
+                        // Caller is responsible for ensuring this does not alias.
+                        let src_region: &[u8] =
+                            unsafe { &*src.get_slice_ptr(src_offset..src_offset + size.get()) };
+                        let dst_region: &mut [u8] =
+                            unsafe { &mut *dst.get_slice_ptr(dst_offset..dst_offset + size.get()) };
+                        dst_region.copy_from_slice(src_region);
+                    }
+                    upload_after_host_write(dst)?;
+                    Ok(())
+                }
             }
             Command::CopyBufferToTexture { src, dst, regions } => {
                 let dst = dst.as_ref().ok_or(crate::DeviceError::Lost)?;
@@ -880,6 +1029,24 @@ impl Command {
                 let src = src.as_ref().ok_or(crate::DeviceError::Lost)?;
                 unsafe { submit_copy_texture_to_buffer(queue, surface_queue, src, dst, regions) }
             }
+            Command::ResetQueries { query_set, range } => unsafe {
+                submit_reset_query_results(queue, surface_queue, query_set, range.clone())
+            },
+            Command::BeginOcclusionQuery { query_set, index } => unsafe {
+                submit_begin_occlusion_query(queue, surface_queue, query_set, *index)
+            },
+            Command::EndOcclusionQuery { query_set, index } => unsafe {
+                submit_end_occlusion_query(queue, surface_queue, query_set, *index)
+            },
+            Command::BeginPipelineStatisticsQuery { query_set, index } => unsafe {
+                submit_begin_pipeline_statistics_query(queue, surface_queue, query_set, *index)
+            },
+            Command::EndPipelineStatisticsQuery { query_set, index } => unsafe {
+                submit_end_pipeline_statistics_query(queue, surface_queue, query_set, *index)
+            },
+            Command::WriteTimestamp(timestamp) => unsafe {
+                submit_timestamp_write(queue, surface_queue, timestamp)
+            },
             Command::CopyQueryResults {
                 query_set,
                 range,
@@ -887,7 +1054,7 @@ impl Command {
                 offset,
                 stride,
             } => unsafe {
-                submit_copy_timestamp_query_results(
+                submit_copy_query_results(
                     queue,
                     surface_queue,
                     query_set,
@@ -901,27 +1068,35 @@ impl Command {
                 submit_resource_barrier(queue, surface_queue, *invalidate_flags)
             },
             Command::BeginRenderPass {
+                extent,
                 colors,
                 depth_stencil,
                 beginning_timestamp,
                 end_timestamp,
             } => {
-                let extent = colors.first().ok_or(crate::DeviceError::Lost)?.extent;
                 state.target = Some(RenderTarget {
-                    extent,
+                    extent: *extent,
                     colors: colors
                         .iter()
-                        .map(|color| RenderTargetColor {
-                            view: color.view,
-                            resolve_view: color.resolve_view,
+                        .enumerate()
+                        .filter_map(|(index, color)| {
+                            color.as_ref().map(|color| RenderTargetColor {
+                                target_id: index as u32,
+                                view: color.view,
+                                resolve_view: color.resolve_view,
+                                discard: color.discard,
+                            })
                         })
                         .collect(),
+                    depth_stencil_discard: depth_stencil.discard,
                 });
                 state.viewport = None;
                 state.scissor = None;
                 state.stencil_reference = 0;
                 state.blend_constants = [0.0; 4];
-                unsafe { submit_begin_render_pass(queue, surface_queue, colors, *depth_stencil) }?;
+                unsafe {
+                    submit_begin_render_pass(queue, surface_queue, *extent, colors, *depth_stencil)
+                }?;
                 state.render_pass_end_timestamp = end_timestamp.clone();
                 if let Some(timestamp) = beginning_timestamp {
                     unsafe { submit_timestamp_write(queue, surface_queue, timestamp) }?;
@@ -1014,6 +1189,13 @@ impl Command {
                 });
                 Ok(())
             }
+            Command::SetImmediates {
+                layout,
+                offset_bytes,
+                data,
+            } => unsafe {
+                submit_set_immediates(queue, surface_queue, layout, *offset_bytes, data)
+            },
             Command::SetViewport { rect, depth_range } => {
                 state.viewport = Some(ViewportState {
                     rect: rect.clone(),
@@ -1135,37 +1317,40 @@ impl Command {
     }
 }
 
+#[cfg(not(target_os = "horizon"))]
 fn upload_after_host_write(buffer: &Buffer) -> DeviceResult<()> {
-    #[cfg(target_os = "horizon")]
-    unsafe {
-        buffer.upload_to_gpu()?;
-    }
-    #[cfg(not(target_os = "horizon"))]
-    {
-        let _ = buffer;
-    }
+    let _ = buffer;
     Ok(())
+}
+
+fn supports_render_pass_occlusion_query_set(query_set: Option<&Resource>) -> bool {
+    match query_set {
+        None => true,
+        Some(Resource::QuerySet(query_set)) => query_set.is_occlusion(),
+        Some(_) => false,
+    }
 }
 
 fn color_attachments(
     color_attachments: &[Option<crate::ColorAttachment<'_, Resource>>],
     sample_count: u32,
-) -> DeviceResult<Vec<ColorAttachmentState>> {
-    if color_attachments.is_empty() || color_attachments.len() > 2 {
+) -> DeviceResult<Vec<Option<ColorAttachmentState>>> {
+    if color_attachments.len() > DEKO_COLOR_ATTACHMENT_COUNT as usize {
         return Err(crate::DeviceError::Lost);
     }
-    let mut colors: Vec<ColorAttachmentState> = Vec::with_capacity(color_attachments.len());
+    let mut colors: Vec<Option<ColorAttachmentState>> = Vec::with_capacity(color_attachments.len());
     for attachment in color_attachments {
         let Some(attachment) = attachment else {
-            return Err(crate::DeviceError::Lost);
+            colors.push(None);
+            continue;
         };
         let color = color_attachment(attachment, sample_count)?;
-        if let Some(first) = colors.first() {
+        if let Some(first) = colors.iter().flatten().next() {
             if color.extent != first.extent {
                 return Err(crate::DeviceError::Lost);
             }
         }
-        colors.push(color);
+        colors.push(Some(color));
     }
     Ok(colors)
 }
@@ -1186,12 +1371,14 @@ fn color_attachment(
     if sample_count == 1 && resolve_view.is_some() {
         return Err(crate::DeviceError::Lost);
     }
+    validate_attachment_store(attachment.ops)?;
     Ok(ColorAttachmentState {
         view,
         extent,
         sample_count,
         clear_value: attachment_clear_value(attachment.ops, attachment.clear_value)?,
         resolve_view,
+        discard: attachment_should_discard(attachment.ops),
     })
 }
 
@@ -1215,23 +1402,27 @@ fn resolve_attachment(
 
 fn depth_stencil_attachment(
     attachment: Option<&crate::DepthStencilAttachment<'_, Resource>>,
-    expected_extent: wgt::Extent3d,
+    expected_extent: Option<wgt::Extent3d>,
+    expected_sample_count: u32,
 ) -> DeviceResult<DepthStencilAttachmentState> {
     let Some(attachment) = attachment else {
         return Ok(DepthStencilAttachmentState::default());
     };
-    if attachment.depth_ops.is_empty() && attachment.stencil_ops.is_empty() {
-        return Err(crate::DeviceError::Lost);
-    }
     if !attachment
         .target
         .usage
-        .contains(wgt::TextureUses::DEPTH_STENCIL_WRITE)
+        .contains(depth_stencil_attachment_usage(
+            attachment.depth_ops,
+            attachment.stencil_ops,
+        ))
     {
         return Err(crate::DeviceError::Lost);
     }
-    let (view, extent, _) = AttachmentViewState::from_single_subresource(attachment.target.view)?;
-    if extent != expected_extent {
+    let (view, extent, sample_count) =
+        AttachmentViewState::from_single_subresource(attachment.target.view)?;
+    if expected_extent.is_some_and(|expected| extent != expected)
+        || sample_count != expected_sample_count
+    {
         return Err(crate::DeviceError::Lost);
     }
 
@@ -1249,9 +1440,36 @@ fn depth_stencil_attachment(
     };
     Ok(DepthStencilAttachmentState {
         view: Some(view),
+        extent: Some(extent),
         depth_clear_value,
         stencil_clear_value,
+        discard: attachment_should_discard(attachment.depth_ops)
+            || attachment_should_discard(attachment.stencil_ops),
     })
+}
+
+fn depth_stencil_attachment_usage(
+    depth_ops: crate::AttachmentOps,
+    stencil_ops: crate::AttachmentOps,
+) -> wgt::TextureUses {
+    if depth_ops.is_empty() && stencil_ops.is_empty() {
+        wgt::TextureUses::DEPTH_STENCIL_READ
+    } else {
+        wgt::TextureUses::DEPTH_STENCIL_WRITE
+    }
+}
+
+fn render_pass_extent(
+    colors: &[Option<ColorAttachmentState>],
+    depth_stencil: DepthStencilAttachmentState,
+) -> DeviceResult<wgt::Extent3d> {
+    colors
+        .first()
+        .and_then(|color| color.as_ref())
+        .map(|color| color.extent)
+        .or_else(|| colors.iter().flatten().next().map(|color| color.extent))
+        .or(depth_stencil.extent)
+        .ok_or(crate::DeviceError::Lost)
 }
 
 fn attachment_clear_value<T: Copy>(ops: crate::AttachmentOps, value: T) -> DeviceResult<Option<T>> {
@@ -1263,12 +1481,14 @@ fn attachment_clear_value<T: Copy>(ops: crate::AttachmentOps, value: T) -> Devic
 }
 
 fn validate_attachment_store(ops: crate::AttachmentOps) -> DeviceResult<()> {
-    if ops.contains(crate::AttachmentOps::STORE_DISCARD)
-        || !ops.contains(crate::AttachmentOps::STORE)
-    {
+    if !ops.intersects(crate::AttachmentOps::STORE | crate::AttachmentOps::STORE_DISCARD) {
         return Err(crate::DeviceError::Lost);
     }
     Ok(())
+}
+
+fn attachment_should_discard(ops: crate::AttachmentOps) -> bool {
+    ops.contains(crate::AttachmentOps::STORE_DISCARD)
 }
 
 fn validate_attachment_load(ops: crate::AttachmentOps) -> DeviceResult<()> {
@@ -1281,7 +1501,7 @@ fn validate_attachment_load(ops: crate::AttachmentOps) -> DeviceResult<()> {
 }
 
 fn supports_sample_count(sample_count: u32) -> bool {
-    matches!(sample_count, 1 | 4)
+    matches!(sample_count, 1 | 2 | 4 | 8)
 }
 
 fn timestamp_writes(
@@ -1332,7 +1552,7 @@ unsafe fn submit_timestamp_write(
     surface_queue: Option<RawQueueHandle>,
     timestamp: &TimestampWrite,
 ) -> DeviceResult<()> {
-    let address = timestamp.query_set.report_address(timestamp.index)?;
+    let address = timestamp.query_set.report_address(timestamp.index, 0)?;
     unsafe {
         submit_deko_commands(queue, surface_queue, |cmdbuf| {
             dk::dkCmdBufReportCounter(cmdbuf, dk::DkCounter::DkCounter_Timestamp, address);
@@ -1351,7 +1571,252 @@ unsafe fn submit_timestamp_write(
 }
 
 #[cfg(target_os = "horizon")]
-unsafe fn submit_copy_timestamp_query_results(
+unsafe fn submit_reset_query_results(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    query_set: &QuerySetInner,
+    range: Range<u32>,
+) -> DeviceResult<()> {
+    query_set.validate_range(range.clone())?;
+    unsafe {
+        submit_deko_commands(queue, surface_queue, |cmdbuf| {
+            for index in range {
+                for component in 0..query_set.result_count() {
+                    dk::dkCmdBufReportValue(cmdbuf, 0, query_set.report_address(index, component)?);
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_reset_query_results(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _query_set: &QuerySetInner,
+    _range: Range<u32>,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_begin_occlusion_query(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    query_set: &QuerySetInner,
+    index: u32,
+) -> DeviceResult<()> {
+    if !query_set.is_occlusion() {
+        return Err(crate::DeviceError::Lost);
+    }
+    query_set.validate_range(index..index.checked_add(1).ok_or(crate::DeviceError::Lost)?)?;
+    unsafe {
+        submit_deko_commands(queue, surface_queue, |cmdbuf| {
+            dk::dkCmdBufResetCounter(cmdbuf, dk::DkCounter::DkCounter_SamplesPassed);
+            Ok(())
+        })
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_begin_occlusion_query(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _query_set: &QuerySetInner,
+    _index: u32,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_end_occlusion_query(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    query_set: &QuerySetInner,
+    index: u32,
+) -> DeviceResult<()> {
+    if !query_set.is_occlusion() {
+        return Err(crate::DeviceError::Lost);
+    }
+    let address = query_set.report_address(index, 0)?;
+    unsafe {
+        submit_deko_commands(queue, surface_queue, |cmdbuf| {
+            dk::dkCmdBufReportCounter(cmdbuf, dk::DkCounter::DkCounter_SamplesPassed, address);
+            Ok(())
+        })
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_end_occlusion_query(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _query_set: &QuerySetInner,
+    _index: u32,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_begin_pipeline_statistics_query(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    query_set: &QuerySetInner,
+    index: u32,
+) -> DeviceResult<()> {
+    let statistics = query_set
+        .pipeline_statistics()
+        .filter(|statistics| QuerySetInner::supports_pipeline_statistics(*statistics))
+        .ok_or(crate::DeviceError::Lost)?;
+    query_set.validate_range(index..index.checked_add(1).ok_or(crate::DeviceError::Lost)?)?;
+    unsafe {
+        submit_deko_commands(queue, surface_queue, |cmdbuf| {
+            for (statistic, counter) in pipeline_statistics_counters() {
+                if statistics.contains(statistic) {
+                    dk::dkCmdBufResetCounter(cmdbuf, counter);
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_begin_pipeline_statistics_query(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _query_set: &QuerySetInner,
+    _index: u32,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_end_pipeline_statistics_query(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    query_set: &QuerySetInner,
+    index: u32,
+) -> DeviceResult<()> {
+    let statistics = query_set
+        .pipeline_statistics()
+        .filter(|statistics| QuerySetInner::supports_pipeline_statistics(*statistics))
+        .ok_or(crate::DeviceError::Lost)?;
+    query_set.validate_range(index..index.checked_add(1).ok_or(crate::DeviceError::Lost)?)?;
+    unsafe {
+        submit_deko_commands(queue, surface_queue, |cmdbuf| {
+            let mut component = 0;
+            for (statistic, counter) in pipeline_statistics_counters() {
+                if statistics.contains(statistic) {
+                    let address = query_set.report_address(index, component)?;
+                    dk::dkCmdBufReportCounter(cmdbuf, counter, address);
+                    component += 1;
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_end_pipeline_statistics_query(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _query_set: &QuerySetInner,
+    _index: u32,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(target_os = "horizon")]
+fn pipeline_statistics_counters() -> [(wgt::PipelineStatisticsTypes, dk::DkCounter); 4] {
+    [
+        (
+            wgt::PipelineStatisticsTypes::VERTEX_SHADER_INVOCATIONS,
+            dk::DkCounter::DkCounter_VertexShaderInvocations,
+        ),
+        (
+            wgt::PipelineStatisticsTypes::CLIPPER_INVOCATIONS,
+            dk::DkCounter::DkCounter_ClipperInputPrimitives,
+        ),
+        (
+            wgt::PipelineStatisticsTypes::CLIPPER_PRIMITIVES_OUT,
+            dk::DkCounter::DkCounter_ClipperOutputPrimitives,
+        ),
+        (
+            wgt::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS,
+            dk::DkCounter::DkCounter_FragmentShaderInvocations,
+        ),
+    ]
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_clear_buffer(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    dst: &Buffer,
+    range: Range<wgt::BufferAddress>,
+) -> DeviceResult<()> {
+    let mut dst_offset = range.start;
+    let mut remaining = range
+        .end
+        .checked_sub(range.start)
+        .ok_or(crate::DeviceError::Lost)?;
+    unsafe {
+        submit_deko_commands(queue, surface_queue, |cmdbuf| {
+            while remaining != 0 {
+                let chunk = remaining.min(super::DEKO_CLEAR_BUFFER_SIZE);
+                let chunk_size = wgt::BufferSize::new(chunk).ok_or(crate::DeviceError::Lost)?;
+                let (src_addr, _) = queue.device.clear_buffer.gpu_binding(0, Some(chunk_size))?;
+                let (dst_addr, _) = dst.gpu_binding(dst_offset, Some(chunk_size))?;
+                dk::dkCmdBufCopyBuffer(cmdbuf, src_addr, dst_addr, chunk as u32);
+                dst_offset = dst_offset
+                    .checked_add(chunk)
+                    .ok_or(crate::DeviceError::Lost)?;
+                remaining -= chunk;
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_copy_buffer_to_buffer(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    src: &Buffer,
+    dst: &Buffer,
+    regions: &[crate::BufferCopy],
+) -> DeviceResult<()> {
+    unsafe {
+        submit_deko_commands(queue, surface_queue, |cmdbuf| {
+            for region in regions {
+                let mut src_offset = region.src_offset;
+                let mut dst_offset = region.dst_offset;
+                let mut remaining = region.size.get();
+                while remaining != 0 {
+                    let chunk = remaining.min(u64::from(u32::MAX));
+                    let chunk_size = wgt::BufferSize::new(chunk).ok_or(crate::DeviceError::Lost)?;
+                    let (src_addr, _) = src.gpu_binding(src_offset, Some(chunk_size))?;
+                    let (dst_addr, _) = dst.gpu_binding(dst_offset, Some(chunk_size))?;
+                    dk::dkCmdBufCopyBuffer(cmdbuf, src_addr, dst_addr, chunk as u32);
+                    src_offset = src_offset
+                        .checked_add(chunk)
+                        .ok_or(crate::DeviceError::Lost)?;
+                    dst_offset = dst_offset
+                        .checked_add(chunk)
+                        .ok_or(crate::DeviceError::Lost)?;
+                    remaining -= chunk;
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_copy_query_results(
     queue: &Queue,
     surface_queue: Option<RawQueueHandle>,
     query_set: &QuerySetInner,
@@ -1361,11 +1826,15 @@ unsafe fn submit_copy_timestamp_query_results(
     stride: wgt::BufferSize,
 ) -> DeviceResult<()> {
     query_set.validate_range(range.clone())?;
-    if stride.get() < DEKO_TIMESTAMP_QUERY_RESULT_SIZE {
+    let result_count = u64::from(query_set.result_count());
+    let query_result_size = result_count
+        .checked_mul(DEKO_QUERY_RESULT_SIZE)
+        .ok_or(crate::DeviceError::Lost)?;
+    if stride.get() < query_result_size {
         return Err(crate::DeviceError::Lost);
     }
     let result_size =
-        wgt::BufferSize::new(DEKO_TIMESTAMP_QUERY_RESULT_SIZE).ok_or(crate::DeviceError::Lost)?;
+        wgt::BufferSize::new(DEKO_QUERY_RESULT_SIZE).ok_or(crate::DeviceError::Lost)?;
     unsafe {
         submit_deko_commands(queue, surface_queue, |cmdbuf| {
             for (destination_index, query_index) in range.enumerate() {
@@ -1378,14 +1847,23 @@ unsafe fn submit_copy_timestamp_query_results(
                             .ok_or(crate::DeviceError::Lost)?,
                     )
                     .ok_or(crate::DeviceError::Lost)?;
-                let source = query_set.report_address(query_index)?;
-                let (destination, _) = buffer.gpu_binding(destination_offset, Some(result_size))?;
-                dk::dkCmdBufCopyBuffer(
-                    cmdbuf,
-                    source,
-                    destination,
-                    DEKO_TIMESTAMP_QUERY_RESULT_SIZE as u32,
-                );
+                for component in 0..query_set.result_count() {
+                    let component_offset = u64::from(component)
+                        .checked_mul(DEKO_QUERY_RESULT_SIZE)
+                        .ok_or(crate::DeviceError::Lost)?;
+                    let destination_offset = destination_offset
+                        .checked_add(component_offset)
+                        .ok_or(crate::DeviceError::Lost)?;
+                    let source = query_set.report_address(query_index, component)?;
+                    let (destination, _) =
+                        buffer.gpu_binding(destination_offset, Some(result_size))?;
+                    dk::dkCmdBufCopyBuffer(
+                        cmdbuf,
+                        source,
+                        destination,
+                        DEKO_QUERY_RESULT_SIZE as u32,
+                    );
+                }
             }
             Ok(())
         })
@@ -1393,7 +1871,7 @@ unsafe fn submit_copy_timestamp_query_results(
 }
 
 #[cfg(not(target_os = "horizon"))]
-unsafe fn submit_copy_timestamp_query_results(
+unsafe fn submit_copy_query_results(
     _queue: &Queue,
     _surface_queue: Option<RawQueueHandle>,
     _query_set: &QuerySetInner,
@@ -1482,6 +1960,7 @@ fn texture_copy_view_type(
     extent: wgt::Extent3d,
 ) -> Option<dk::DkImageType> {
     match texture.dimension() {
+        wgt::TextureDimension::D1 => Some(dk::DkImageType::DkImageType_1D),
         wgt::TextureDimension::D2 if extent.depth_or_array_layers > 1 => {
             Some(dk::DkImageType::DkImageType_2DArray)
         }
@@ -1490,14 +1969,51 @@ fn texture_copy_view_type(
     }
 }
 
-#[cfg(target_os = "horizon")]
+#[cfg(any(target_os = "horizon", test))]
 fn copy_format_aspect(format: wgt::TextureFormat) -> DeviceResult<crate::FormatAspects> {
     match format {
         wgt::TextureFormat::Rgba8Unorm
         | wgt::TextureFormat::Rgba8UnormSrgb
+        | wgt::TextureFormat::Rgba8Uint
+        | wgt::TextureFormat::Rgba8Sint
+        | wgt::TextureFormat::R8Unorm
+        | wgt::TextureFormat::Rg8Unorm
+        | wgt::TextureFormat::R8Uint
+        | wgt::TextureFormat::R8Sint
+        | wgt::TextureFormat::Rg8Uint
+        | wgt::TextureFormat::Rg8Sint
+        | wgt::TextureFormat::R8Snorm
+        | wgt::TextureFormat::Rg8Snorm
+        | wgt::TextureFormat::Rgba8Snorm
         | wgt::TextureFormat::Bgra8Unorm
-        | wgt::TextureFormat::Bgra8UnormSrgb => Ok(crate::FormatAspects::COLOR),
-        wgt::TextureFormat::Depth32Float => Ok(crate::FormatAspects::DEPTH),
+        | wgt::TextureFormat::Bgra8UnormSrgb
+        | wgt::TextureFormat::R16Float
+        | wgt::TextureFormat::Rg16Float
+        | wgt::TextureFormat::R16Unorm
+        | wgt::TextureFormat::R16Snorm
+        | wgt::TextureFormat::Rg16Unorm
+        | wgt::TextureFormat::Rg16Snorm
+        | wgt::TextureFormat::R16Uint
+        | wgt::TextureFormat::R16Sint
+        | wgt::TextureFormat::Rg16Uint
+        | wgt::TextureFormat::Rg16Sint
+        | wgt::TextureFormat::Rgba16Unorm
+        | wgt::TextureFormat::Rgba16Snorm
+        | wgt::TextureFormat::Rgba16Uint
+        | wgt::TextureFormat::Rgba16Sint
+        | wgt::TextureFormat::R32Float
+        | wgt::TextureFormat::R32Uint
+        | wgt::TextureFormat::R32Sint
+        | wgt::TextureFormat::Rg32Float
+        | wgt::TextureFormat::Rg32Uint
+        | wgt::TextureFormat::Rg32Sint
+        | wgt::TextureFormat::Rgba32Float
+        | wgt::TextureFormat::Rgba32Uint
+        | wgt::TextureFormat::Rgba32Sint
+        | wgt::TextureFormat::Rgba16Float => Ok(crate::FormatAspects::COLOR),
+        wgt::TextureFormat::Depth16Unorm | wgt::TextureFormat::Depth32Float => {
+            Ok(crate::FormatAspects::DEPTH)
+        }
         wgt::TextureFormat::Stencil8 => Ok(crate::FormatAspects::STENCIL),
         _ => Err(crate::DeviceError::Lost),
     }
@@ -1534,14 +2050,56 @@ fn copy_texel_size(format: wgt::TextureFormat) -> DeviceResult<u32> {
     match format {
         wgt::TextureFormat::Rgba8Unorm
         | wgt::TextureFormat::Rgba8UnormSrgb
+        | wgt::TextureFormat::Rgba8Uint
+        | wgt::TextureFormat::Rgba8Sint
+        | wgt::TextureFormat::Rgba8Snorm
         | wgt::TextureFormat::Bgra8Unorm
         | wgt::TextureFormat::Bgra8UnormSrgb => Ok(4),
-        wgt::TextureFormat::Rg8Unorm => Ok(2),
-        wgt::TextureFormat::R8Unorm => Ok(1),
+        wgt::TextureFormat::Rg16Float
+        | wgt::TextureFormat::Rg16Unorm
+        | wgt::TextureFormat::Rg16Snorm
+        | wgt::TextureFormat::Rg16Uint
+        | wgt::TextureFormat::Rg16Sint => Ok(4),
+        wgt::TextureFormat::Rgba16Float
+        | wgt::TextureFormat::Rgba16Unorm
+        | wgt::TextureFormat::Rgba16Snorm
+        | wgt::TextureFormat::Rgba16Uint
+        | wgt::TextureFormat::Rgba16Sint => Ok(8),
+        wgt::TextureFormat::Rg32Float
+        | wgt::TextureFormat::Rg32Uint
+        | wgt::TextureFormat::Rg32Sint => Ok(8),
+        wgt::TextureFormat::Rgba32Float
+        | wgt::TextureFormat::Rgba32Uint
+        | wgt::TextureFormat::Rgba32Sint => Ok(16),
+        wgt::TextureFormat::Rg8Unorm
+        | wgt::TextureFormat::Rg8Uint
+        | wgt::TextureFormat::Rg8Sint
+        | wgt::TextureFormat::Rg8Snorm
+        | wgt::TextureFormat::R16Float
+        | wgt::TextureFormat::R16Unorm
+        | wgt::TextureFormat::R16Snorm
+        | wgt::TextureFormat::R16Uint
+        | wgt::TextureFormat::R16Sint => Ok(2),
+        wgt::TextureFormat::R32Float
+        | wgt::TextureFormat::R32Uint
+        | wgt::TextureFormat::R32Sint => Ok(4),
+        wgt::TextureFormat::R8Unorm
+        | wgt::TextureFormat::R8Uint
+        | wgt::TextureFormat::R8Sint
+        | wgt::TextureFormat::R8Snorm => Ok(1),
+        wgt::TextureFormat::Depth16Unorm => Ok(2),
         wgt::TextureFormat::Depth32Float => Ok(4),
         wgt::TextureFormat::Stencil8 => Ok(1),
         _ => Err(crate::DeviceError::Lost),
     }
+}
+
+#[cfg(any(target_os = "horizon", test))]
+fn copy_formats_are_compatible(
+    src_format: wgt::TextureFormat,
+    dst_format: wgt::TextureFormat,
+) -> bool {
+    src_format.remove_srgb_suffix() == dst_format.remove_srgb_suffix()
 }
 
 #[cfg(target_os = "horizon")]
@@ -1642,7 +2200,10 @@ unsafe fn submit_copy_texture_to_texture(
     dst: &TextureInner,
     regions: &[crate::TextureCopy],
 ) -> DeviceResult<()> {
-    if src.format() != dst.format() || src.sample_count() != 1 || dst.sample_count() != 1 {
+    if !copy_formats_are_compatible(src.format(), dst.format())
+        || src.sample_count() != 1
+        || dst.sample_count() != 1
+    {
         return Err(crate::DeviceError::Lost);
     }
     unsafe {
@@ -1710,47 +2271,53 @@ unsafe fn submit_copy_texture_to_buffer(
 unsafe fn submit_begin_render_pass(
     queue: &Queue,
     surface_queue: Option<RawQueueHandle>,
-    colors: &[ColorAttachmentState],
+    extent: wgt::Extent3d,
+    colors: &[Option<ColorAttachmentState>],
     depth_stencil: DepthStencilAttachmentState,
 ) -> DeviceResult<()> {
-    let Some(first_color) = colors.first() else {
-        return Err(crate::DeviceError::Lost);
-    };
     unsafe {
         submit_deko_commands(queue, surface_queue, |cmdbuf| {
             let image_views = colors
                 .iter()
-                .map(|color| color.view.deko_view())
+                .map(|color| color.as_ref().map(|color| color.view.deko_view()))
                 .collect::<Vec<_>>();
-            let image_view_ptrs = image_views.iter().map(ptr::from_ref).collect::<Vec<_>>();
+            let image_view_ptrs = image_views
+                .iter()
+                .map(|view| view.as_ref().map_or(ptr::null(), ptr::from_ref))
+                .collect::<Vec<_>>();
+            let image_view_ptr = if image_view_ptrs.is_empty() {
+                ptr::null()
+            } else {
+                image_view_ptrs.as_ptr()
+            };
             let depth_stencil_image_view = depth_stencil.view.map(AttachmentViewState::deko_view);
             let depth_stencil_image_view_ptr = depth_stencil_image_view
                 .as_ref()
                 .map_or(ptr::null(), |view| ptr::from_ref(view));
             dk::dkCmdBufBindRenderTargets(
                 cmdbuf,
-                image_view_ptrs.as_ptr(),
+                image_view_ptr,
                 image_view_ptrs.len() as u32,
                 depth_stencil_image_view_ptr,
             );
             let viewport = dk::DkViewport {
                 x: 0.0,
                 y: 0.0,
-                width: first_color.extent.width as f32,
-                height: first_color.extent.height as f32,
+                width: extent.width as f32,
+                height: extent.height as f32,
                 near: 0.0,
                 far: 1.0,
             };
             let scissor = dk::DkScissor {
                 x: 0,
                 y: 0,
-                width: first_color.extent.width,
-                height: first_color.extent.height,
+                width: extent.width,
+                height: extent.height,
             };
             dk::dkCmdBufSetViewports(cmdbuf, 0, &viewport, 1);
             dk::dkCmdBufSetScissors(cmdbuf, 0, &scissor, 1);
             for (index, color) in colors.iter().enumerate() {
-                if let Some(clear_value) = color.clear_value {
+                if let Some(clear_value) = color.as_ref().and_then(|color| color.clear_value) {
                     dk::dkCmdBufClearColorFloat(
                         cmdbuf,
                         index as u32,
@@ -1784,7 +2351,8 @@ unsafe fn submit_begin_render_pass(
 unsafe fn submit_begin_render_pass(
     _queue: &Queue,
     _surface_queue: Option<RawQueueHandle>,
-    _colors: &[ColorAttachmentState],
+    _extent: wgt::Extent3d,
+    _colors: &[Option<ColorAttachmentState>],
     _depth_stencil: DepthStencilAttachmentState,
 ) -> DeviceResult<()> {
     Err(crate::DeviceError::Lost)
@@ -1802,7 +2370,8 @@ unsafe fn submit_end_render_pass(
     if !target
         .colors
         .iter()
-        .any(|color| color.resolve_view.is_some())
+        .any(|color| color.resolve_view.is_some() || color.discard)
+        && !target.depth_stencil_discard
     {
         return Ok(());
     }
@@ -1814,6 +2383,12 @@ unsafe fn submit_end_render_pass(
                     let dst_view = resolve_view.deko_view();
                     dk::dkCmdBufResolveImage(cmdbuf, &src_view, &dst_view);
                 }
+                if color.discard {
+                    dk::dkCmdBufDiscardColor(cmdbuf, color.target_id);
+                }
+            }
+            if target.depth_stencil_discard {
+                dk::dkCmdBufDiscardDepthStencil(cmdbuf);
             }
             Ok(())
         })
@@ -1855,6 +2430,7 @@ unsafe fn submit_draw(
 }
 
 #[cfg(target_os = "horizon")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn submit_draw_indexed(
     queue: &Queue,
     surface_queue: Option<RawQueueHandle>,
@@ -1948,6 +2524,7 @@ unsafe fn submit_draw_indexed_indirect(
 }
 
 #[cfg(target_os = "horizon")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn submit_draw_indirect_count(
     queue: &Queue,
     surface_queue: Option<RawQueueHandle>,
@@ -1963,6 +2540,7 @@ unsafe fn submit_draw_indirect_count(
 }
 
 #[cfg(target_os = "horizon")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn submit_draw_indexed_indirect_count(
     queue: &Queue,
     surface_queue: Option<RawQueueHandle>,
@@ -2001,11 +2579,18 @@ unsafe fn submit_dispatch_workgroups(
                 shader.as_ptr(),
                 shader.len() as u32,
             );
-            for group in state.bind_groups.iter().flatten() {
-                group
-                    .group
-                    .bind_descriptor_sets(cmdbuf, &group.dynamic_offsets)?;
+            for (group_index, group) in state.bind_groups.iter().enumerate() {
+                let Some(group) = group else { continue };
+                group.group.bind_descriptor_sets(
+                    cmdbuf,
+                    group_index as u32,
+                    &group.dynamic_offsets,
+                    &pipeline.binding_map,
+                )?;
             }
+            pipeline
+                .layout
+                .bind_immediates(cmdbuf, wgt::ShaderStages::COMPUTE)?;
             dk::dkCmdBufDispatchCompute(cmdbuf, count[0], count[1], count[2]);
             Ok(())
         })
@@ -2040,11 +2625,18 @@ unsafe fn submit_dispatch_workgroups_indirect(
                 shader.as_ptr(),
                 shader.len() as u32,
             );
-            for group in state.bind_groups.iter().flatten() {
-                group
-                    .group
-                    .bind_descriptor_sets(cmdbuf, &group.dynamic_offsets)?;
+            for (group_index, group) in state.bind_groups.iter().enumerate() {
+                let Some(group) = group else { continue };
+                group.group.bind_descriptor_sets(
+                    cmdbuf,
+                    group_index as u32,
+                    &group.dynamic_offsets,
+                    &pipeline.binding_map,
+                )?;
             }
+            pipeline
+                .layout
+                .bind_immediates(cmdbuf, wgt::ShaderStages::COMPUTE)?;
             dk::dkCmdBufDispatchComputeIndirect(cmdbuf, dispatch_addr);
             Ok(())
         })
@@ -2146,22 +2738,53 @@ unsafe fn submit_deko_draw(
             );
             let shaders = [
                 pipeline.vertex_shader.raw_shader(),
-                pipeline.fragment_shader.raw_shader(),
+                pipeline
+                    .fragment_shader
+                    .as_ref()
+                    .map_or(ptr::null(), |shader| shader.raw_shader()),
             ];
+            let shader_count = if pipeline.fragment_shader.is_some() {
+                2
+            } else {
+                1
+            };
             dk::dkCmdBufSetViewports(cmdbuf, 0, &viewport, 1);
             dk::dkCmdBufSetScissors(cmdbuf, 0, &scissor, 1);
             dk::dkCmdBufBindShaders(
                 cmdbuf,
                 dk::DkStageFlag_GraphicsMask,
                 shaders.as_ptr(),
-                shaders.len() as u32,
+                shader_count,
             );
-            for group in state.bind_groups.iter().flatten() {
-                group
-                    .group
-                    .bind_descriptor_sets(cmdbuf, &group.dynamic_offsets)?;
+            for (group_index, group) in state.bind_groups.iter().enumerate() {
+                let Some(group) = group else { continue };
+                group.group.bind_descriptor_sets(
+                    cmdbuf,
+                    group_index as u32,
+                    &group.dynamic_offsets,
+                    &pipeline.binding_map,
+                )?;
             }
+            pipeline
+                .layout
+                .bind_immediates(cmdbuf, pipeline.active_stages)?;
             dk::dkCmdBufBindRasterizerState(cmdbuf, &pipeline.rasterizer_state);
+            dk::dkCmdBufSetDepthBias(
+                cmdbuf,
+                pipeline.depth_bias.constant as f32,
+                pipeline.depth_bias.clamp,
+                pipeline.depth_bias.slope_scale,
+            );
+            let primitive_restart_index = match pipeline.strip_index_format {
+                Some(wgt::IndexFormat::Uint16) => Some(u16::MAX as u32),
+                Some(wgt::IndexFormat::Uint32) => Some(u32::MAX),
+                None => None,
+            };
+            dk::dkCmdBufSetPrimitiveRestart(
+                cmdbuf,
+                primitive_restart_index.is_some(),
+                primitive_restart_index.unwrap_or(0),
+            );
             dk::dkCmdBufBindColorState(cmdbuf, &pipeline.color_state);
             dk::dkCmdBufBindColorWriteState(cmdbuf, &pipeline.color_write_state);
             dk::dkCmdBufBindBlendStates(
@@ -2216,6 +2839,21 @@ unsafe fn submit_deko_draw(
 }
 
 #[cfg(target_os = "horizon")]
+unsafe fn submit_set_immediates(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    layout: &super::PipelineLayoutInner,
+    offset_bytes: u32,
+    data: &[u32],
+) -> DeviceResult<()> {
+    unsafe {
+        submit_deko_commands(queue, surface_queue, |cmdbuf| {
+            layout.push_immediates(cmdbuf, offset_bytes, data)
+        })
+    }
+}
+
+#[cfg(target_os = "horizon")]
 fn map_index_format(format: wgt::IndexFormat) -> dk::DkIdxFormat {
     match format {
         wgt::IndexFormat::Uint16 => dk::DkIdxFormat::DkIdxFormat_Uint16,
@@ -2237,6 +2875,18 @@ unsafe fn submit_draw(
 }
 
 #[cfg(not(target_os = "horizon"))]
+unsafe fn submit_set_immediates(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _layout: &super::PipelineLayoutInner,
+    _offset_bytes: u32,
+    _data: &[u32],
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(not(target_os = "horizon"))]
+#[allow(clippy::too_many_arguments)]
 unsafe fn submit_draw_indexed(
     _queue: &Queue,
     _surface_queue: Option<RawQueueHandle>,
@@ -2275,6 +2925,7 @@ unsafe fn submit_draw_indexed_indirect(
 }
 
 #[cfg(not(target_os = "horizon"))]
+#[allow(clippy::too_many_arguments)]
 unsafe fn submit_draw_indirect_count(
     _queue: &Queue,
     _surface_queue: Option<RawQueueHandle>,
@@ -2289,6 +2940,7 @@ unsafe fn submit_draw_indirect_count(
 }
 
 #[cfg(not(target_os = "horizon"))]
+#[allow(clippy::too_many_arguments)]
 unsafe fn submit_draw_indexed_indirect_count(
     _queue: &Queue,
     _surface_queue: Option<RawQueueHandle>,
@@ -2384,6 +3036,65 @@ mod tests {
     }
 
     #[test]
+    fn accepts_srgb_copy_compatible_formats() {
+        for (src, dst) in [
+            (
+                wgt::TextureFormat::Rgba8Unorm,
+                wgt::TextureFormat::Rgba8UnormSrgb,
+            ),
+            (
+                wgt::TextureFormat::Rgba8UnormSrgb,
+                wgt::TextureFormat::Rgba8Unorm,
+            ),
+            (
+                wgt::TextureFormat::Bgra8Unorm,
+                wgt::TextureFormat::Bgra8UnormSrgb,
+            ),
+            (
+                wgt::TextureFormat::Bgra8UnormSrgb,
+                wgt::TextureFormat::Bgra8Unorm,
+            ),
+        ] {
+            assert!(copy_formats_are_compatible(src, dst));
+        }
+        assert!(!copy_formats_are_compatible(
+            wgt::TextureFormat::Rgba8Unorm,
+            wgt::TextureFormat::Bgra8Unorm,
+        ));
+    }
+
+    #[test]
+    fn color_copy_aspects_include_r_and_rg_unorm_and_normalized_16bit_formats() {
+        for format in [
+            wgt::TextureFormat::R8Unorm,
+            wgt::TextureFormat::Rg8Unorm,
+            wgt::TextureFormat::R16Unorm,
+            wgt::TextureFormat::R16Snorm,
+            wgt::TextureFormat::Rg16Unorm,
+            wgt::TextureFormat::Rg16Snorm,
+            wgt::TextureFormat::Rgba16Unorm,
+            wgt::TextureFormat::Rgba16Snorm,
+            wgt::TextureFormat::R16Uint,
+            wgt::TextureFormat::R16Sint,
+            wgt::TextureFormat::Rg16Uint,
+            wgt::TextureFormat::Rg16Sint,
+            wgt::TextureFormat::Rgba16Uint,
+            wgt::TextureFormat::Rgba16Sint,
+            wgt::TextureFormat::R32Float,
+            wgt::TextureFormat::R32Uint,
+            wgt::TextureFormat::R32Sint,
+            wgt::TextureFormat::Rg32Float,
+            wgt::TextureFormat::Rg32Uint,
+            wgt::TextureFormat::Rg32Sint,
+            wgt::TextureFormat::Rgba32Float,
+            wgt::TextureFormat::Rgba32Uint,
+            wgt::TextureFormat::Rgba32Sint,
+        ] {
+            assert_eq!(copy_format_aspect(format), Ok(crate::FormatAspects::COLOR));
+        }
+    }
+
+    #[test]
     fn query_commands_record_deferred_errors() {
         let resource = Resource::Placeholder;
         let buffer = test_buffer();
@@ -2404,6 +3115,134 @@ mod tests {
         }
 
         assert_unsupported_commands(&encoder, 5);
+    }
+
+    #[test]
+    fn occlusion_query_commands_are_recorded() {
+        let resource = Resource::QuerySet(Arc::new(QuerySetInner {
+            query_type: wgt::QueryType::Occlusion,
+            count: 2,
+        }));
+        let buffer = test_buffer();
+        let mut encoder = CommandBuffer::new();
+
+        unsafe {
+            encoder.reset_queries(&resource, 0..2);
+            encoder.begin_query(&resource, 1);
+            encoder.end_query(&resource, 1);
+            encoder.copy_query_results(
+                &resource,
+                0..2,
+                &buffer,
+                0,
+                wgt::BufferSize::new(8).unwrap(),
+            );
+        }
+
+        assert_eq!(encoder.commands.len(), 4);
+        assert!(matches!(encoder.commands[0], Command::ResetQueries { .. }));
+        assert!(matches!(
+            encoder.commands[1],
+            Command::BeginOcclusionQuery { index: 1, .. }
+        ));
+        assert!(matches!(
+            encoder.commands[2],
+            Command::EndOcclusionQuery { index: 1, .. }
+        ));
+        assert!(matches!(
+            encoder.commands[3],
+            Command::CopyQueryResults { .. }
+        ));
+        assert!(supports_render_pass_occlusion_query_set(Some(&resource)));
+
+        let texture = test_texture();
+        assert!(!supports_render_pass_occlusion_query_set(Some(&texture)));
+    }
+
+    #[test]
+    fn depth_only_render_passes_use_the_depth_extent() {
+        let extent = wgt::Extent3d {
+            width: 4,
+            height: 2,
+            depth_or_array_layers: 1,
+        };
+        assert!(color_attachments(&[], 1).unwrap().is_empty());
+        let sparse_colors = color_attachments(&[None], 1).unwrap();
+        assert_eq!(sparse_colors.len(), 1);
+        assert!(sparse_colors[0].is_none());
+        assert_eq!(
+            render_pass_extent(
+                &sparse_colors,
+                DepthStencilAttachmentState {
+                    extent: Some(extent),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+            extent
+        );
+        assert!(render_pass_extent(&[], DepthStencilAttachmentState::default()).is_err());
+    }
+
+    #[test]
+    fn pipeline_statistics_query_commands_are_recorded() {
+        let statistics = wgt::PipelineStatisticsTypes::VERTEX_SHADER_INVOCATIONS
+            | wgt::PipelineStatisticsTypes::CLIPPER_INVOCATIONS
+            | wgt::PipelineStatisticsTypes::CLIPPER_PRIMITIVES_OUT
+            | wgt::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS;
+        let resource = Resource::QuerySet(Arc::new(QuerySetInner {
+            query_type: wgt::QueryType::PipelineStatistics(statistics),
+            count: 2,
+        }));
+        let buffer = test_buffer();
+        let mut encoder = CommandBuffer::new();
+
+        unsafe {
+            encoder.reset_queries(&resource, 0..2);
+            encoder.begin_query(&resource, 1);
+            encoder.end_query(&resource, 1);
+            encoder.copy_query_results(
+                &resource,
+                0..2,
+                &buffer,
+                0,
+                wgt::BufferSize::new(32).unwrap(),
+            );
+        }
+
+        assert_eq!(encoder.commands.len(), 4);
+        assert!(matches!(encoder.commands[0], Command::ResetQueries { .. }));
+        assert!(matches!(
+            encoder.commands[1],
+            Command::BeginPipelineStatisticsQuery { index: 1, .. }
+        ));
+        assert!(matches!(
+            encoder.commands[2],
+            Command::EndPipelineStatisticsQuery { index: 1, .. }
+        ));
+        assert!(matches!(
+            encoder.commands[3],
+            Command::CopyQueryResults { .. }
+        ));
+    }
+
+    #[test]
+    fn timestamp_write_commands_are_recorded() {
+        let resource = Resource::QuerySet(Arc::new(QuerySetInner {
+            query_type: wgt::QueryType::Timestamp,
+            count: 2,
+        }));
+        let mut encoder = CommandBuffer::new();
+
+        unsafe {
+            encoder.write_timestamp(&resource, 1);
+        }
+
+        assert_eq!(encoder.commands.len(), 1);
+        assert!(matches!(
+            encoder.commands[0],
+            Command::WriteTimestamp(TimestampWrite { index: 1, .. })
+        ));
     }
 
     #[test]
@@ -2546,5 +3385,43 @@ mod tests {
         }
 
         assert!(encoder.commands.is_empty());
+    }
+
+    #[test]
+    fn supports_all_native_multisample_counts() {
+        for sample_count in [1, 2, 4, 8] {
+            assert!(supports_sample_count(sample_count));
+        }
+        for sample_count in [0, 3, 16] {
+            assert!(!supports_sample_count(sample_count));
+        }
+    }
+
+    #[test]
+    fn read_only_depth_stencil_attachment_requires_read_usage() {
+        assert_eq!(
+            depth_stencil_attachment_usage(
+                crate::AttachmentOps::empty(),
+                crate::AttachmentOps::empty(),
+            ),
+            wgt::TextureUses::DEPTH_STENCIL_READ
+        );
+        assert_eq!(
+            depth_stencil_attachment_usage(
+                crate::AttachmentOps::LOAD | crate::AttachmentOps::STORE,
+                crate::AttachmentOps::empty(),
+            ),
+            wgt::TextureUses::DEPTH_STENCIL_WRITE
+        );
+    }
+
+    #[test]
+    fn discard_store_operations_are_admitted() {
+        let discard_ops = crate::AttachmentOps::LOAD | crate::AttachmentOps::STORE_DISCARD;
+        assert!(validate_attachment_store(discard_ops).is_ok());
+        assert!(attachment_should_discard(discard_ops));
+        assert!(!attachment_should_discard(
+            crate::AttachmentOps::LOAD | crate::AttachmentOps::STORE
+        ));
     }
 }

@@ -1894,7 +1894,8 @@ impl crate::Device for super::Device {
                 runtime_checks: desc.runtime_checks,
             }),
             crate::ShaderInput::SpirV(_)
-            | crate::ShaderInput::Deko3dDksh(_)
+            | crate::ShaderInput::Deko3dDksh { .. }
+            | crate::ShaderInput::Deko3dArtifacts(..)
             | crate::ShaderInput::MetalLib { .. }
             | crate::ShaderInput::Msl { .. }
             | crate::ShaderInput::Glsl { .. } => {

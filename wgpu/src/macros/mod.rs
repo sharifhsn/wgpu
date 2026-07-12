@@ -143,6 +143,8 @@ macro_rules! include_spirv_raw {
                 label: $crate::__macro_helpers::Some($($token)*),
                 spirv: Some($crate::__macro_helpers::Cow::Borrowed($crate::include_spirv_source!($($token)*))),
                 deko3d_dksh: None,
+                deko3d_metadata: None,
+                deko3d_artifacts: $crate::__macro_helpers::Cow::Borrowed(&[]),
                 entry_points: $crate::__macro_helpers::Cow::Borrowed(&[$crate::PassthroughShaderEntryPoint {
                     name: $crate::__macro_helpers::Cow::Borrowed("main"),
                     // This is unused for SPIR-V

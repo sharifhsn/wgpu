@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, string::String, sync::Arc, vec};
+use alloc::{borrow::Cow, boxed::Box, string::String, sync::Arc, vec};
 #[cfg(wgpu_core)]
 use core::ops::Deref;
 use core::{error, fmt, future::Future, marker::PhantomData};
@@ -19,6 +19,8 @@ use crate::*;
 #[derive(Debug, Clone)]
 pub struct Device {
     pub(crate) inner: dispatch::DispatchDevice,
+    pub(crate) deko3d_shader_artifact_provider:
+        Arc<Mutex<Option<Arc<dyn Deko3dShaderArtifactProvider>>>>,
 }
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(Device: Send, Sync);
@@ -46,6 +48,7 @@ impl Device {
     pub fn from_custom<T: custom::DeviceInterface>(device: T) -> Self {
         Self {
             inner: dispatch::DispatchDevice::custom(device),
+            deko3d_shader_artifact_provider: Default::default(),
         }
     }
 
@@ -137,10 +140,60 @@ impl Device {
     /// </div>
     #[must_use]
     pub fn create_shader_module(&self, desc: ShaderModuleDescriptor<'_>) -> ShaderModule {
+        #[cfg(feature = "wgsl")]
+        if self.adapter_info().backend == Backend::Deko3d {
+            if let ShaderSource::Wgsl(wgsl) = &desc.source {
+                if let Some(provider) = self.deko3d_shader_artifact_provider.lock().as_ref() {
+                    match provider.resolve_wgsl(wgsl) {
+                        Ok(Some(artifacts)) => {
+                            let entry_points = artifacts
+                                .iter()
+                                .map(|artifact| PassthroughShaderEntryPoint {
+                                    name: artifact.metadata.entry_point.clone(),
+                                    workgroup_size: artifact.workgroup_size,
+                                })
+                                .collect();
+                            let module = unsafe {
+                                self.inner.create_shader_module_passthrough(
+                                    &ShaderModuleDescriptorPassthrough {
+                                        label: desc.label,
+                                        entry_points: Cow::Owned(entry_points),
+                                        deko3d_artifacts: Cow::Owned(artifacts),
+                                        ..Default::default()
+                                    },
+                                )
+                            };
+                            return ShaderModule { inner: module };
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            log::error!("Deko3D shader artifact resolution failed: {error}");
+                        }
+                    }
+                }
+            }
+        }
         let module = self
             .inner
             .create_shader_module(desc, wgt::ShaderRuntimeChecks::checked());
         ShaderModule { inner: module }
+    }
+
+    /// Installs the trusted build-time artifact provider used by ordinary WGSL shader creation
+    /// on Deko3D devices.
+    ///
+    /// Once installed, [`create_shader_module`][Self::create_shader_module] resolves matching WGSL
+    /// modules to embedded, reflected DKSH entry-point bundles. Other backends are unaffected.
+    ///
+    /// # Safety
+    ///
+    /// Every artifact returned by `provider` must have been compiled from the exact WGSL source
+    /// passed to it and its reflection must describe the accompanying DKSH bytes.
+    pub unsafe fn set_deko3d_shader_artifact_provider(
+        &self,
+        provider: Arc<dyn Deko3dShaderArtifactProvider>,
+    ) {
+        *self.deko3d_shader_artifact_provider.lock() = Some(provider);
     }
 
     /// Deprecated: Use [`create_shader_module_trusted`][csmt] instead.
@@ -224,6 +277,43 @@ impl Device {
                 entry_points: desc.entry_points,
                 spirv: None,
                 deko3d_dksh: Some(desc.dksh),
+                deko3d_metadata: None,
+                deko3d_artifacts: Cow::Borrowed(&[]),
+                dxil: None,
+                hlsl: None,
+                metallib: None,
+                msl: None,
+                glsl: None,
+                wgsl: None,
+            })
+        }
+    }
+
+    /// Creates a Deko3D shader module from a verified artifact and its binding reflection.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the DKSH bytes and metadata were produced together by a trusted
+    /// compiler pipeline. The backend validates their use against subsequent pipeline descriptors,
+    /// but cannot reconstruct shader semantics from the binary payload.
+    #[must_use]
+    pub unsafe fn create_shader_module_deko3d_reflected_dksh(
+        &self,
+        desc: Deko3dReflectedDkshShaderModuleDescriptor<'_>,
+    ) -> ShaderModule {
+        let entry_name = desc.entry_point.name.clone();
+        unsafe {
+            self.create_shader_module_passthrough(ShaderModuleDescriptorPassthrough {
+                label: desc.label,
+                entry_points: Cow::Owned(alloc::vec![desc.entry_point]),
+                spirv: None,
+                deko3d_dksh: Some(desc.dksh),
+                deko3d_metadata: Some(wgt::Deko3dShaderMetadata {
+                    stage: desc.stage,
+                    entry_point: entry_name,
+                    bindings: desc.bindings,
+                }),
+                deko3d_artifacts: Cow::Borrowed(&[]),
                 dxil: None,
                 hlsl: None,
                 metallib: None,
