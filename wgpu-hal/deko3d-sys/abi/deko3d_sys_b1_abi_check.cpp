@@ -21,10 +21,12 @@ CHECK_FN(dkCmdBufBindRenderTargets, void (*)(DkCmdBuf, DkImageView const* const*
 CHECK_FN(dkCmdBufSetViewports, void (*)(DkCmdBuf, uint32_t, DkViewport const*, uint32_t));
 CHECK_FN(dkCmdBufSetScissors, void (*)(DkCmdBuf, uint32_t, DkScissor const*, uint32_t));
 CHECK_FN(dkCmdBufClearColor, void (*)(DkCmdBuf, uint32_t, uint32_t, void const*));
+CHECK_FN(dkCmdBufClearDepthStencil, void (*)(DkCmdBuf, bool, float, uint8_t, uint8_t));
 CHECK_FN(dkCmdBufBindShaders, void (*)(DkCmdBuf, uint32_t, DkShader const* const*, uint32_t));
 CHECK_FN(dkCmdBufBindRasterizerState, void (*)(DkCmdBuf, DkRasterizerState const*));
 CHECK_FN(dkCmdBufBindColorState, void (*)(DkCmdBuf, DkColorState const*));
 CHECK_FN(dkCmdBufBindColorWriteState, void (*)(DkCmdBuf, DkColorWriteState const*));
+CHECK_FN(dkCmdBufBindDepthStencilState, void (*)(DkCmdBuf, DkDepthStencilState const*));
 CHECK_FN(dkCmdBufPushData, void (*)(DkCmdBuf, DkGpuAddr, void const*, uint32_t));
 CHECK_FN(dkCmdBufBindTextures, void (*)(DkCmdBuf, DkStage, uint32_t, DkResHandle const*, uint32_t));
 CHECK_FN(dkCmdBufBindImages, void (*)(DkCmdBuf, DkStage, uint32_t, DkResHandle const*, uint32_t));

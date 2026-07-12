@@ -1122,6 +1122,13 @@ unsafe extern "C" {
         clearMask: u32,
         clearData: *const c_void,
     );
+    pub fn dkCmdBufClearDepthStencil(
+        obj: DkCmdBuf,
+        clearDepth: bool,
+        depthValue: f32,
+        stencilMask: u8,
+        stencilValue: u8,
+    );
     pub fn dkCmdBufBindShaders(
         obj: DkCmdBuf,
         stageMask: u32,
@@ -1131,6 +1138,7 @@ unsafe extern "C" {
     pub fn dkCmdBufBindRasterizerState(obj: DkCmdBuf, state: *const DkRasterizerState);
     pub fn dkCmdBufBindColorState(obj: DkCmdBuf, state: *const DkColorState);
     pub fn dkCmdBufBindColorWriteState(obj: DkCmdBuf, state: *const DkColorWriteState);
+    pub fn dkCmdBufBindDepthStencilState(obj: DkCmdBuf, state: *const DkDepthStencilState);
     pub fn dkCmdBufPushData(obj: DkCmdBuf, addr: DkGpuAddr, data: *const c_void, size: u32);
     pub fn dkCmdBufBindTextures(
         obj: DkCmdBuf,

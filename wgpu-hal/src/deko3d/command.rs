@@ -40,6 +40,8 @@ enum Command {
         image: RawImage,
         extent: wgt::Extent3d,
         clear_value: Option<wgt::Color>,
+        depth: Option<RawImage>,
+        depth_clear_value: Option<f32>,
     },
     SetRenderPipeline {
         pipeline: alloc::sync::Arc<RenderPipelineInner>,
@@ -59,6 +61,13 @@ enum Command {
     SetBindGroup {
         index: u32,
         group: alloc::sync::Arc<BindGroupInner>,
+    },
+    SetViewport {
+        rect: crate::Rect<f32>,
+        depth_range: Range<f32>,
+    },
+    SetScissor {
+        rect: crate::Rect<u32>,
     },
     Draw {
         first_vertex: u32,
@@ -82,6 +91,8 @@ struct ExecutionState {
     vertex_buffers: Vec<Option<VertexBinding>>,
     index_buffer: Option<IndexBinding>,
     bind_groups: Vec<Option<alloc::sync::Arc<BindGroupInner>>>,
+    viewport: Option<(crate::Rect<f32>, Range<f32>)>,
+    scissor: Option<crate::Rect<u32>>,
 }
 
 #[allow(dead_code)]
@@ -89,6 +100,7 @@ struct ExecutionState {
 struct RenderTarget {
     image: RawImage,
     extent: wgt::Extent3d,
+    depth: Option<RawImage>,
 }
 
 #[allow(dead_code)]
@@ -278,8 +290,7 @@ impl crate::CommandEncoder for CommandBuffer {
         &mut self,
         desc: &crate::RenderPassDescriptor<Resource, Resource>,
     ) -> DeviceResult<()> {
-        if desc.depth_stencil_attachment.is_some()
-            || desc.multiview_mask.is_some()
+        if desc.multiview_mask.is_some()
             || desc.timestamp_writes.is_some()
             || desc.occlusion_query_set.is_some()
             || desc.sample_count != 1
@@ -298,9 +309,19 @@ impl crate::CommandEncoder for CommandBuffer {
             if attachment.resolve_target.is_some() || attachment.depth_slice.is_some() {
                 return Err(crate::DeviceError::Lost);
             }
-            let Resource::TextureView { image, extent, .. } = attachment.target.view else {
+            let Resource::TextureView {
+                image,
+                extent,
+                format,
+                aspect,
+                ..
+            } = attachment.target.view
+            else {
                 return Err(crate::DeviceError::Lost);
             };
+            if *format != wgt::TextureFormat::Rgba8Unorm || *aspect != wgt::TextureAspect::All {
+                return Err(crate::DeviceError::Lost);
+            }
             let clear_value = if attachment.ops.contains(crate::AttachmentOps::LOAD_CLEAR) {
                 Some(attachment.clear_value)
             } else if attachment.ops.contains(crate::AttachmentOps::LOAD)
@@ -312,10 +333,51 @@ impl crate::CommandEncoder for CommandBuffer {
             } else {
                 return Err(crate::DeviceError::Lost);
             };
+            let (depth, depth_clear_value) = match desc.depth_stencil_attachment.as_ref() {
+                None => (None, None),
+                Some(depth) => {
+                    if depth.target.usage != wgt::TextureUses::DEPTH_STENCIL_WRITE {
+                        return Err(crate::DeviceError::Lost);
+                    }
+                    let Resource::TextureView {
+                        image,
+                        extent: depth_extent,
+                        format,
+                        aspect,
+                        ..
+                    } = depth.target.view
+                    else {
+                        return Err(crate::DeviceError::Lost);
+                    };
+                    if *depth_extent != *extent
+                        || *format != wgt::TextureFormat::Depth32Float
+                        || !matches!(
+                            *aspect,
+                            wgt::TextureAspect::All | wgt::TextureAspect::DepthOnly
+                        )
+                    {
+                        return Err(crate::DeviceError::Lost);
+                    }
+                    let clear = if depth.depth_ops.contains(crate::AttachmentOps::LOAD_CLEAR) {
+                        Some(depth.clear_value.0)
+                    } else if depth.depth_ops.contains(crate::AttachmentOps::LOAD)
+                        || depth
+                            .depth_ops
+                            .contains(crate::AttachmentOps::LOAD_DONT_CARE)
+                    {
+                        None
+                    } else {
+                        return Err(crate::DeviceError::Lost);
+                    };
+                    (Some(*image), clear)
+                }
+            };
             self.commands.push(Command::BeginRenderPass {
                 image: *image,
                 extent: *extent,
                 clear_value,
+                depth,
+                depth_clear_value,
             });
         }
         Ok(())
@@ -381,10 +443,29 @@ impl crate::CommandEncoder for CommandBuffer {
         });
     }
     unsafe fn set_viewport(&mut self, rect: &crate::Rect<f32>, depth_range: Range<f32>) {
-        self.record_unsupported();
+        if !rect.x.is_finite()
+            || !rect.y.is_finite()
+            || !rect.w.is_finite()
+            || !rect.h.is_finite()
+            || rect.w < 0.0
+            || rect.h < 0.0
+            || !depth_range.start.is_finite()
+            || !depth_range.end.is_finite()
+            || depth_range.start < 0.0
+            || depth_range.end > 1.0
+            || depth_range.start > depth_range.end
+        {
+            self.record_unsupported();
+            return;
+        }
+        self.commands.push(Command::SetViewport {
+            rect: rect.clone(),
+            depth_range,
+        });
     }
     unsafe fn set_scissor_rect(&mut self, rect: &crate::Rect<u32>) {
-        self.record_unsupported();
+        self.commands
+            .push(Command::SetScissor { rect: rect.clone() });
     }
     unsafe fn set_stencil_reference(&mut self, value: u32) {
         self.record_unsupported();
@@ -585,13 +666,26 @@ impl Command {
                 image,
                 extent,
                 clear_value,
+                depth,
+                depth_clear_value,
             } => {
                 state.target = Some(RenderTarget {
                     image: *image,
                     extent: *extent,
+                    depth: *depth,
                 });
+                state.viewport = None;
+                state.scissor = None;
                 unsafe {
-                    submit_begin_render_pass(queue, surface_queue, *image, *extent, *clear_value)
+                    submit_begin_render_pass(
+                        queue,
+                        surface_queue,
+                        *image,
+                        *extent,
+                        *clear_value,
+                        *depth,
+                        *depth_clear_value,
+                    )
                 }
             }
             Command::SetRenderPipeline { pipeline } => {
@@ -635,6 +729,14 @@ impl Command {
                     state.bind_groups.resize(index + 1, None);
                 }
                 state.bind_groups[index] = Some(group.clone());
+                Ok(())
+            }
+            Command::SetViewport { rect, depth_range } => {
+                state.viewport = Some((rect.clone(), depth_range.clone()));
+                Ok(())
+            }
+            Command::SetScissor { rect } => {
+                state.scissor = Some(rect.clone());
                 Ok(())
             }
             Command::Draw {
@@ -702,17 +804,6 @@ mod tests {
     #[test]
     fn unsupported_void_commands_fail_encoding_on_forced_host() {
         assert_end_fails(|encoder| unsafe {
-            encoder.set_viewport(
-                &crate::Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    w: 1.0,
-                    h: 1.0,
-                },
-                0.0..1.0,
-            );
-        });
-        assert_end_fails(|encoder| unsafe {
             encoder.copy_texture_to_texture(
                 &Resource::Placeholder,
                 wgt::TextureUses::COPY_SRC,
@@ -726,6 +817,29 @@ mod tests {
         assert_end_fails(|encoder| unsafe {
             encoder.dispatch([1, 1, 1]);
         });
+    }
+
+    #[test]
+    fn viewport_and_scissor_encode_on_forced_host() {
+        let mut encoder = CommandBuffer::new();
+        unsafe {
+            encoder.set_viewport(
+                &crate::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 1.0,
+                    h: 1.0,
+                },
+                0.0..1.0,
+            );
+            encoder.set_scissor_rect(&crate::Rect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            });
+        }
+        assert!(unsafe { encoder.end_encoding() }.is_ok());
     }
 
     #[test]
@@ -852,11 +966,18 @@ unsafe fn submit_begin_render_pass(
     image: RawImage,
     extent: wgt::Extent3d,
     clear_value: Option<wgt::Color>,
+    depth: Option<RawImage>,
+    depth_clear_value: Option<f32>,
 ) -> DeviceResult<()> {
     unsafe {
         submit_deko_commands(queue, surface_queue, |cmdbuf| {
             let image_view = dk::DkImageView::defaults(image.0);
-            dk::dkCmdBufBindRenderTarget(cmdbuf, &image_view, ptr::null());
+            let depth_view = depth.map(|depth| dk::DkImageView::defaults(depth.0));
+            dk::dkCmdBufBindRenderTarget(
+                cmdbuf,
+                &image_view,
+                depth_view.as_ref().map_or(ptr::null(), |view| view),
+            );
             let viewport = dk::DkViewport {
                 x: 0.0,
                 y: 0.0,
@@ -884,6 +1005,9 @@ unsafe fn submit_begin_render_pass(
                     clear_value.a as f32,
                 );
             }
+            if let Some(depth_clear_value) = depth_clear_value {
+                dk::dkCmdBufClearDepthStencil(cmdbuf, true, depth_clear_value, 0, 0);
+            }
             Ok(())
         })
     }
@@ -896,6 +1020,8 @@ unsafe fn submit_begin_render_pass(
     _image: RawImage,
     _extent: wgt::Extent3d,
     _clear_value: Option<wgt::Color>,
+    _depth: Option<RawImage>,
+    _depth_clear_value: Option<f32>,
 ) -> DeviceResult<()> {
     Err(crate::DeviceError::Lost)
 }
@@ -972,19 +1098,34 @@ unsafe fn submit_deko_draw(
     let pipeline = pipeline.raw();
     unsafe {
         submit_deko_commands(queue, surface_queue, |cmdbuf| {
+            let (viewport_rect, depth_range) = state.viewport.as_ref().cloned().unwrap_or((
+                crate::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: target.extent.width as f32,
+                    h: target.extent.height as f32,
+                },
+                0.0..1.0,
+            ));
             let viewport = dk::DkViewport {
-                x: 0.0,
-                y: 0.0,
-                width: target.extent.width as f32,
-                height: target.extent.height as f32,
-                near: 0.0,
-                far: 1.0,
+                x: viewport_rect.x,
+                y: viewport_rect.y,
+                width: viewport_rect.w,
+                height: viewport_rect.h,
+                near: depth_range.start,
+                far: depth_range.end,
             };
-            let scissor = dk::DkScissor {
+            let scissor_rect = state.scissor.as_ref().cloned().unwrap_or(crate::Rect {
                 x: 0,
                 y: 0,
-                width: target.extent.width,
-                height: target.extent.height,
+                w: target.extent.width,
+                h: target.extent.height,
+            });
+            let scissor = dk::DkScissor {
+                x: scissor_rect.x,
+                y: scissor_rect.y,
+                width: scissor_rect.w,
+                height: scissor_rect.h,
             };
             let shaders = [
                 pipeline.vertex_shader.raw_shader(),
@@ -998,12 +1139,16 @@ unsafe fn submit_deko_draw(
                 shaders.as_ptr(),
                 shaders.len() as u32,
             );
-            if let Some(Some(group)) = state.bind_groups.first() {
+            for group in state.bind_groups.iter().flatten() {
                 group.bind_descriptor_sets(cmdbuf)?;
             }
             dk::dkCmdBufBindRasterizerState(cmdbuf, &pipeline.rasterizer_state);
             dk::dkCmdBufBindColorState(cmdbuf, &pipeline.color_state);
             dk::dkCmdBufBindColorWriteState(cmdbuf, &pipeline.color_write_state);
+            if pipeline.uses_depth_stencil && target.depth.is_none() {
+                return Err(crate::DeviceError::Lost);
+            }
+            dk::dkCmdBufBindDepthStencilState(cmdbuf, &pipeline.depth_stencil_state);
             for (index, binding) in state.vertex_buffers.iter().enumerate() {
                 let Some(binding) = binding else {
                     continue;

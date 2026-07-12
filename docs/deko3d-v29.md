@@ -20,7 +20,13 @@ the release `deko3d` feature. This keeps ordinary builds and default backend sel
 1. B1a complete: `wgpu-hal/deko3d-sys` owns the raw ABI declarations and header-layout probe. It has no HAL runtime claim.
 2. B1b complete: a native v29 `wgpu-hal::deko3d::Api` owns its HAL types and satisfies the full trait surface. It remains HAL-only, and `Instance::create_surface` fails closed until the explicit Switch policy is ready.
 3. B1c complete: validate the buffer, DKSH shader, pipeline, command, and explicit default-Switch surface paths needed for a public triangle, then wire the functional API into `wgpu-core::Instance` and `wgpu::Instance::enabled_backend_features`.
-4. Validate the triangle on Horizon before extending toward Bevy workloads.
+4. B2 partial: the opaque path accepts one mip-level, single-sample `Rgba8Unorm` or
+   `Rgba8UnormSrgb` sampled texture, a filtering sampler, one static texture/sampler bind
+   group with an optional uniform (or a separate uniform bind group), `Float32x2`/`x3`/`x4`
+   and `Uint32` vertex attributes,
+   cull/front-face state, and no-blend color output. `Depth32Float` supports clear/load,
+   depth compare, and writes. Dynamic viewport and scissor state are recorded. Every other
+   texture format, blend mode, depth/stencil mode, topology, and binding form remains rejected.
 
 ## DKSH validation fixture
 
@@ -57,3 +63,7 @@ triangle-list pipeline, then submits and presents one frame. The fixtures are
 The remaining gate is an external Horizon build and run with the devkitPro/libnx/Deko3D target
 toolchain and real hardware. Host checks compile the selection plumbing and test fail-closed
 behavior, but do not claim that target build or presentation validation.
+
+The explicit triangle was built on 2026-07-12 against the public devkitPro prefix at
+`/tmp/devkitpro-switch1/opt/devkitpro`; its NRO SHA-256 was
+`ed6785ee6c6c549108f96a8897bdedd296d192cc1e4c84b9aa3ff1c0f5c984c8`.
