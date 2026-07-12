@@ -7,6 +7,125 @@ use crate::api::blas::{Blas, BlasGeometrySizeDescriptors, CreateBlasDescriptor};
 use crate::api::tlas::{CreateTlasDescriptor, Tlas};
 use crate::util::Mutex;
 use crate::*;
+use sha2::{Digest, Sha256};
+
+struct Deko3dWgslArtifactProviderState {
+    provider: Mutex<Option<Arc<dyn Deko3dWgslArtifactProvider>>>,
+}
+
+fn validate_deko3d_dksh(bytes: &[u8]) -> Result<(), Deko3dWgslArtifactError> {
+    const HEADER_SIZE: usize = 24;
+    const PROGRAM_SIZE: usize = 64;
+    const SECTION_ALIGNMENT: u32 = 256;
+    if bytes.len() < HEADER_SIZE {
+        return Err(Deko3dWgslArtifactError::InvalidDksh("truncated header"));
+    }
+    let word = |offset| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+    let magic = word(0);
+    let header_size = word(4);
+    let control_size = word(8);
+    let code_size = word(12);
+    let programs_offset = word(16);
+    let num_programs = word(20);
+    if magic != u32::from_le_bytes(*b"DKSH")
+        || header_size != HEADER_SIZE as u32
+        || control_size < header_size
+        || code_size == 0
+        || num_programs != 1
+        || programs_offset < header_size
+        || control_size % SECTION_ALIGNMENT != 0
+        || code_size % SECTION_ALIGNMENT != 0
+    {
+        return Err(Deko3dWgslArtifactError::InvalidDksh("invalid header"));
+    }
+    let control_size = usize::try_from(control_size)
+        .map_err(|_| Deko3dWgslArtifactError::InvalidDksh("control section overflow"))?;
+    let code_size = usize::try_from(code_size)
+        .map_err(|_| Deko3dWgslArtifactError::InvalidDksh("code section overflow"))?;
+    let total_size = control_size
+        .checked_add(code_size)
+        .ok_or(Deko3dWgslArtifactError::InvalidDksh("section overflow"))?;
+    let programs_offset = usize::try_from(programs_offset)
+        .map_err(|_| Deko3dWgslArtifactError::InvalidDksh("program table overflow"))?;
+    let programs_end =
+        programs_offset
+            .checked_add(PROGRAM_SIZE)
+            .ok_or(Deko3dWgslArtifactError::InvalidDksh(
+                "program table overflow",
+            ))?;
+    if total_size > bytes.len() || programs_offset % 4 != 0 || programs_end > control_size {
+        return Err(Deko3dWgslArtifactError::InvalidDksh(
+            "truncated or invalid program table",
+        ));
+    }
+    let program_type = word(programs_offset);
+    let entrypoint = word(programs_offset + 4);
+    let constbuf_offset = word(programs_offset + 12);
+    let constbuf_size = word(programs_offset + 16);
+    if program_type > 5
+        || entrypoint >= code_size as u32
+        || constbuf_offset > code_size as u32
+        || constbuf_size > code_size as u32 - constbuf_offset
+    {
+        return Err(Deko3dWgslArtifactError::InvalidDksh(
+            "invalid program entry",
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_deko3d_wgsl_artifact(
+    state: &Deko3dWgslArtifactProviderState,
+    request: Deko3dWgslArtifactRequest<'_>,
+) -> Result<Arc<[u8]>, Deko3dWgslArtifactError> {
+    let provider = state.provider()?;
+    let dksh = provider
+        .resolve(request)
+        .map_err(Deko3dWgslArtifactError::Provider)?;
+    validate_deko3d_dksh(&dksh)?;
+    Ok(dksh)
+}
+
+#[cfg(feature = "wgsl")]
+fn deko3d_wgsl_source(desc: &ShaderModuleDescriptor<'_>) -> Option<Arc<[u8]>> {
+    match &desc.source {
+        ShaderSource::Wgsl(wgsl) => Some(Arc::from(wgsl.as_bytes())),
+        _ => None,
+    }
+}
+
+#[cfg(not(feature = "wgsl"))]
+fn deko3d_wgsl_source(_desc: &ShaderModuleDescriptor<'_>) -> Option<Arc<[u8]>> {
+    None
+}
+
+impl core::fmt::Debug for Deko3dWgslArtifactProviderState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Deko3dWgslArtifactProviderState")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Deko3dWgslArtifactProviderState {
+    fn install(
+        &self,
+        provider: Arc<dyn Deko3dWgslArtifactProvider>,
+    ) -> Result<(), Deko3dWgslArtifactError> {
+        let mut slot = self.provider.lock();
+        if slot.is_some() {
+            return Err(Deko3dWgslArtifactError::AlreadyInstalled);
+        }
+        *slot = Some(provider);
+        Ok(())
+    }
+
+    fn provider(&self) -> Result<Arc<dyn Deko3dWgslArtifactProvider>, Deko3dWgslArtifactError> {
+        self.provider
+            .lock()
+            .clone()
+            .ok_or(Deko3dWgslArtifactError::NotInstalled)
+    }
+}
 
 /// Open connection to a graphics and/or compute device.
 ///
@@ -19,6 +138,7 @@ use crate::*;
 #[derive(Debug, Clone)]
 pub struct Device {
     pub(crate) inner: dispatch::DispatchDevice,
+    deko3d_artifacts: Arc<Deko3dWgslArtifactProviderState>,
 }
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(Device: Send, Sync);
@@ -35,6 +155,59 @@ pub type DeviceDescriptor<'a> = wgt::DeviceDescriptor<Label<'a>>;
 static_assertions::assert_impl_all!(DeviceDescriptor<'_>: Send, Sync);
 
 impl Device {
+    pub(crate) fn new(inner: dispatch::DispatchDevice) -> Self {
+        Self {
+            inner,
+            deko3d_artifacts: Arc::new(Deko3dWgslArtifactProviderState {
+                provider: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// Installs the trusted, process-local Deko3D WGSL artifact provider for this device.
+    ///
+    /// The provider is shared by [`Device`] clones and can only be installed once. Its callback
+    /// is invoked without holding wgpu's provider lock.
+    pub fn install_deko3d_wgsl_artifact_provider(
+        &self,
+        provider: Arc<dyn Deko3dWgslArtifactProvider>,
+    ) -> Result<(), Deko3dWgslArtifactError> {
+        self.deko3d_artifacts.install(provider)
+    }
+
+    fn resolve_deko3d_wgsl_artifact(
+        &self,
+        shader: &ShaderModule,
+        stage: Deko3dWgslArtifactStage,
+        entry_point: Option<&str>,
+    ) -> Result<Option<ShaderModule>, Deko3dWgslArtifactError> {
+        if self.adapter_info().backend != Backend::Deko3d {
+            return Ok(None);
+        }
+        let Some(wgsl) = shader.deko3d_wgsl.as_deref() else {
+            return Ok(None);
+        };
+        let entry_point = entry_point.unwrap_or("main");
+        let digest = Sha256::digest(wgsl);
+        let mut wgsl_sha256 = [0; 32];
+        wgsl_sha256.copy_from_slice(&digest);
+        let dksh = resolve_deko3d_wgsl_artifact(
+            &self.deko3d_artifacts,
+            Deko3dWgslArtifactRequest {
+                wgsl,
+                wgsl_sha256,
+                stage,
+                entry_point,
+            },
+        )?;
+        Ok(Some(unsafe {
+            self.create_shader_module_deko3d_dksh(Deko3dDkshShaderModuleDescriptor {
+                label: None,
+                num_workgroups: (0, 0, 0),
+                dksh: alloc::borrow::Cow::Borrowed(&dksh),
+            })
+        }))
+    }
     #[cfg(custom)]
     /// Returns custom implementation of Device (if custom backend and is internally T)
     pub fn as_custom<T: custom::DeviceInterface>(&self) -> Option<&T> {
@@ -44,9 +217,7 @@ impl Device {
     #[cfg(custom)]
     /// Creates Device from custom implementation
     pub fn from_custom<T: custom::DeviceInterface>(device: T) -> Self {
-        Self {
-            inner: dispatch::DispatchDevice::custom(device),
-        }
+        Self::new(dispatch::DispatchDevice::custom(device))
     }
 
     /// Constructs a stub device for testing using [`Backend::Noop`].
@@ -137,10 +308,14 @@ impl Device {
     /// </div>
     #[must_use]
     pub fn create_shader_module(&self, desc: ShaderModuleDescriptor<'_>) -> ShaderModule {
+        let deko3d_wgsl = deko3d_wgsl_source(&desc);
         let module = self
             .inner
             .create_shader_module(desc, wgt::ShaderRuntimeChecks::checked());
-        ShaderModule { inner: module }
+        ShaderModule {
+            inner: module,
+            deko3d_wgsl,
+        }
     }
 
     /// Deprecated: Use [`create_shader_module_trusted`][csmt] instead.
@@ -183,8 +358,12 @@ impl Device {
         desc: ShaderModuleDescriptor<'_>,
         runtime_checks: crate::ShaderRuntimeChecks,
     ) -> ShaderModule {
+        let deko3d_wgsl = deko3d_wgsl_source(&desc);
         let module = self.inner.create_shader_module(desc, runtime_checks);
-        ShaderModule { inner: module }
+        ShaderModule {
+            inner: module,
+            deko3d_wgsl,
+        }
     }
 
     /// Creates a shader module which will bypass wgpu's shader tooling and validation and be used directly by the backend.
@@ -199,7 +378,10 @@ impl Device {
         desc: ShaderModuleDescriptorPassthrough<'_>,
     ) -> ShaderModule {
         let module = unsafe { self.inner.create_shader_module_passthrough(&desc) };
-        ShaderModule { inner: module }
+        ShaderModule {
+            inner: module,
+            deko3d_wgsl: None,
+        }
     }
 
     /// Creates a Deko3D shader module from offline-compiled DKSH bytes.
@@ -281,7 +463,56 @@ impl Device {
     /// Creates a [`RenderPipeline`].
     #[must_use]
     pub fn create_render_pipeline(&self, desc: &RenderPipelineDescriptor<'_>) -> RenderPipeline {
-        let pipeline = self.inner.create_render_pipeline(desc);
+        let vertex = self
+            .resolve_deko3d_wgsl_artifact(
+                desc.vertex.module,
+                Deko3dWgslArtifactStage::Vertex,
+                desc.vertex.entry_point,
+            )
+            .unwrap_or_else(|error| panic!("Deko3D WGSL artifact resolution failed: {error}"));
+        let fragment_artifact = desc
+            .fragment
+            .as_ref()
+            .map(|fragment| {
+                self.resolve_deko3d_wgsl_artifact(
+                    fragment.module,
+                    Deko3dWgslArtifactStage::Fragment,
+                    fragment.entry_point,
+                )
+            })
+            .transpose()
+            .map(Option::flatten)
+            .unwrap_or_else(|error| panic!("Deko3D WGSL artifact resolution failed: {error}"));
+        let vertex_state = VertexState {
+            module: vertex.as_ref().unwrap_or(desc.vertex.module),
+            entry_point: vertex.as_ref().map_or(desc.vertex.entry_point, |_| {
+                Some(desc.vertex.entry_point.unwrap_or("main"))
+            }),
+            compilation_options: desc.vertex.compilation_options.clone(),
+            buffers: desc.vertex.buffers,
+        };
+        let fragment_state = desc.fragment.as_ref().map(|fragment| FragmentState {
+            module: fragment_artifact.as_ref().unwrap_or(fragment.module),
+            entry_point: fragment_artifact
+                .as_ref()
+                .map_or(fragment.entry_point, |_| {
+                    Some(fragment.entry_point.unwrap_or("main"))
+                }),
+            compilation_options: fragment.compilation_options.clone(),
+            targets: fragment.targets,
+        });
+        let descriptor = RenderPipelineDescriptor {
+            label: desc.label,
+            layout: desc.layout,
+            vertex: vertex_state,
+            primitive: desc.primitive,
+            depth_stencil: desc.depth_stencil.clone(),
+            multisample: desc.multisample,
+            fragment: fragment_state,
+            multiview_mask: desc.multiview_mask,
+            cache: desc.cache,
+        };
+        let pipeline = self.inner.create_render_pipeline(&descriptor);
         RenderPipeline { inner: pipeline }
     }
 
@@ -295,7 +526,24 @@ impl Device {
     /// Creates a [`ComputePipeline`].
     #[must_use]
     pub fn create_compute_pipeline(&self, desc: &ComputePipelineDescriptor<'_>) -> ComputePipeline {
-        let pipeline = self.inner.create_compute_pipeline(desc);
+        let module = self
+            .resolve_deko3d_wgsl_artifact(
+                desc.module,
+                Deko3dWgslArtifactStage::Compute,
+                desc.entry_point,
+            )
+            .unwrap_or_else(|error| panic!("Deko3D WGSL artifact resolution failed: {error}"));
+        let descriptor = ComputePipelineDescriptor {
+            label: desc.label,
+            layout: desc.layout,
+            module: module.as_ref().unwrap_or(desc.module),
+            entry_point: module.as_ref().map_or(desc.entry_point, |_| {
+                Some(desc.entry_point.unwrap_or("main"))
+            }),
+            compilation_options: desc.compilation_options.clone(),
+            cache: desc.cache,
+        };
+        let pipeline = self.inner.create_compute_pipeline(&descriptor);
         ComputePipeline { inner: pipeline }
     }
 
@@ -900,5 +1148,202 @@ impl Drop for ErrorScopeGuard {
         if !self.popped {
             drop(self.device.pop_error_scope(self.index));
         }
+    }
+}
+
+#[cfg(test)]
+mod deko3d_artifact_tests {
+    use super::*;
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    fn dksh() -> Arc<[u8]> {
+        let mut bytes = vec![0; 512];
+        let put = |bytes: &mut [u8], offset, value| {
+            bytes[offset..offset + 4].copy_from_slice(&u32::to_le_bytes(value));
+        };
+        put(&mut bytes, 0, u32::from_le_bytes(*b"DKSH"));
+        put(&mut bytes, 4, 24);
+        put(&mut bytes, 8, 256);
+        put(&mut bytes, 12, 256);
+        put(&mut bytes, 16, 24);
+        put(&mut bytes, 20, 1);
+        Arc::from(bytes)
+    }
+
+    struct Provider {
+        expected: [u8; 32],
+        seen: std::sync::Mutex<Vec<(Deko3dWgslArtifactStage, String)>>,
+        artifact: Arc<[u8]>,
+    }
+
+    impl Deko3dWgslArtifactProvider for Provider {
+        fn resolve(&self, request: Deko3dWgslArtifactRequest<'_>) -> Result<Arc<[u8]>, String> {
+            if request.wgsl_sha256 != self.expected {
+                return Err("WGSL SHA-256 does not match the manifest".into());
+            }
+            self.seen
+                .lock()
+                .unwrap()
+                .push((request.stage, request.entry_point.into()));
+            Ok(self.artifact.clone())
+        }
+    }
+
+    fn request<'a>(
+        wgsl: &'a [u8],
+        stage: Deko3dWgslArtifactStage,
+        entry_point: &'a str,
+    ) -> Deko3dWgslArtifactRequest<'a> {
+        let digest = Sha256::digest(wgsl);
+        let mut wgsl_sha256 = [0; 32];
+        wgsl_sha256.copy_from_slice(&digest);
+        Deko3dWgslArtifactRequest {
+            wgsl,
+            wgsl_sha256,
+            stage,
+            entry_point,
+        }
+    }
+
+    #[test]
+    fn provider_is_set_once_and_distinguishes_stage_and_entry_point() {
+        let state = Deko3dWgslArtifactProviderState {
+            provider: Mutex::new(None),
+        };
+        let wgsl = b"@vertex fn vertex_main() {}";
+        let provider = Arc::new(Provider {
+            expected: request(wgsl, Deko3dWgslArtifactStage::Vertex, "vertex_main").wgsl_sha256,
+            seen: std::sync::Mutex::new(Vec::new()),
+            artifact: dksh(),
+        });
+        state.install(provider.clone()).unwrap();
+        assert_eq!(
+            state.install(provider.clone()),
+            Err(Deko3dWgslArtifactError::AlreadyInstalled)
+        );
+        resolve_deko3d_wgsl_artifact(
+            &state,
+            request(wgsl, Deko3dWgslArtifactStage::Vertex, "vertex_main"),
+        )
+        .unwrap();
+        resolve_deko3d_wgsl_artifact(
+            &state,
+            request(wgsl, Deko3dWgslArtifactStage::Fragment, "fragment_main"),
+        )
+        .unwrap();
+        assert_eq!(
+            *provider.seen.lock().unwrap(),
+            vec![
+                (Deko3dWgslArtifactStage::Vertex, String::from("vertex_main")),
+                (
+                    Deko3dWgslArtifactStage::Fragment,
+                    String::from("fragment_main")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_rejects_a_one_byte_wgsl_miss_and_bad_dksh() {
+        let state = Deko3dWgslArtifactProviderState {
+            provider: Mutex::new(None),
+        };
+        let wgsl = b"@compute fn main() {}";
+        let provider = Arc::new(Provider {
+            expected: request(wgsl, Deko3dWgslArtifactStage::Compute, "main").wgsl_sha256,
+            seen: std::sync::Mutex::new(Vec::new()),
+            artifact: Arc::from([0u8; 8]),
+        });
+        state.install(provider).unwrap();
+        let mut changed = wgsl.to_vec();
+        changed[0] ^= 1;
+        assert!(matches!(
+            resolve_deko3d_wgsl_artifact(
+                &state,
+                request(&changed, Deko3dWgslArtifactStage::Compute, "main")
+            ),
+            Err(Deko3dWgslArtifactError::Provider(_))
+        ));
+        assert!(matches!(
+            resolve_deko3d_wgsl_artifact(
+                &state,
+                request(wgsl, Deko3dWgslArtifactStage::Compute, "main")
+            ),
+            Err(Deko3dWgslArtifactError::InvalidDksh(_))
+        ));
+
+        let corrupt_state = Deko3dWgslArtifactProviderState {
+            provider: Mutex::new(None),
+        };
+        let mut corrupt = dksh().to_vec();
+        corrupt[0] ^= 1;
+        corrupt_state
+            .install(Arc::new(Provider {
+                expected: request(wgsl, Deko3dWgslArtifactStage::Compute, "main").wgsl_sha256,
+                seen: std::sync::Mutex::new(Vec::new()),
+                artifact: Arc::from(corrupt),
+            }))
+            .unwrap();
+        assert!(matches!(
+            resolve_deko3d_wgsl_artifact(
+                &corrupt_state,
+                request(wgsl, Deko3dWgslArtifactStage::Compute, "main")
+            ),
+            Err(Deko3dWgslArtifactError::InvalidDksh(_))
+        ));
+    }
+
+    #[test]
+    fn provider_callback_is_reentrant_and_concurrent() {
+        struct ReentrantProvider {
+            state: Arc<Deko3dWgslArtifactProviderState>,
+            calls: AtomicUsize,
+        }
+        impl Deko3dWgslArtifactProvider for ReentrantProvider {
+            fn resolve(
+                &self,
+                _request: Deko3dWgslArtifactRequest<'_>,
+            ) -> Result<Arc<[u8]>, String> {
+                assert_eq!(
+                    self.state.install(Arc::new(Provider {
+                        expected: [0; 32],
+                        seen: std::sync::Mutex::new(Vec::new()),
+                        artifact: dksh(),
+                    })),
+                    Err(Deko3dWgslArtifactError::AlreadyInstalled)
+                );
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(dksh())
+            }
+        }
+
+        let state = Arc::new(Deko3dWgslArtifactProviderState {
+            provider: Mutex::new(None),
+        });
+        let provider = Arc::new(ReentrantProvider {
+            state: state.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        state.install(provider.clone()).unwrap();
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let state = state.clone();
+            workers.push(std::thread::spawn(move || {
+                resolve_deko3d_wgsl_artifact(
+                    &state,
+                    request(
+                        b"@compute fn main() {}",
+                        Deko3dWgslArtifactStage::Compute,
+                        "main",
+                    ),
+                )
+                .unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 4);
     }
 }

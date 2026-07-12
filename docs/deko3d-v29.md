@@ -28,6 +28,13 @@ the release `deko3d` feature. This keeps ordinary builds and default backend sel
    depth compare, and writes. Dynamic viewport and scissor state are recorded. Every other
    texture format, blend mode, depth/stencil mode, topology, and binding form remains rejected.
 
+For captured WGSL, install one [`Deko3dWgslArtifactProvider`] on the `Device` before pipeline
+creation. The provider receives the exact WGSL bytes and SHA-256 digest plus the requested
+vertex, fragment, or compute entry point, and returns a single-program DKSH artifact. It is
+set-once, shared by `Device` clones, and invoked outside wgpu's provider lock. WGSL is only a
+manifest key on Deko3D: the stage-specific DKSH is selected when a pipeline is created.
+This does not add a general runtime WGSL compiler or broaden the single-program DKSH contract.
+
 ## DKSH validation fixture
 
 Forced-host unit tests validate the single-program DKSH container without a Switch toolchain. The
@@ -66,4 +73,4 @@ behavior, but do not claim that target build or presentation validation.
 
 The explicit triangle was built on 2026-07-12 against the public devkitPro prefix at
 `/tmp/devkitpro-switch1/opt/devkitpro`; its NRO SHA-256 was
-`ed6785ee6c6c549108f96a8897bdedd296d192cc1e4c84b9aa3ff1c0f5c984c8`.
+`87e5d05b107b2e012a0b0f91dd281337703a1b64f06cd39d857f79f3090887a0`.

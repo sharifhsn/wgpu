@@ -2593,8 +2593,9 @@ impl crate::Device for Device {
                         ShaderModuleInner::new_dksh(self.inner.raw_device(), bytes)?
                     })))
                 }
+                crate::ShaderInput::Naga(_) => Ok(Resource::Placeholder),
                 _ => Err(crate::ShaderError::Compilation(String::from(
-                    "deko3d only accepts explicit offline DKSH shader input",
+                    "deko3d accepts WGSL only through a trusted stage-specific DKSH artifact provider",
                 ))),
             }
         }

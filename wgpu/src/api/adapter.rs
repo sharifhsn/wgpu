@@ -63,7 +63,7 @@ impl Adapter {
         async move {
             device
                 .await
-                .map(|(device, queue)| (Device { inner: device }, Queue { inner: queue }))
+                .map(|(device, queue)| (Device::new(device), Queue { inner: queue }))
         }
     }
 
@@ -87,9 +87,7 @@ impl Adapter {
         }?;
 
         Ok((
-            Device {
-                inner: device.into(),
-            },
+            Device::new(device.into()),
             Queue {
                 inner: queue.into(),
             },

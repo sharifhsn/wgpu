@@ -1,4 +1,4 @@
-use alloc::{string::String, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{future::Future, marker::PhantomData};
 
 use crate::*;
@@ -15,7 +15,72 @@ use crate::*;
 #[derive(Debug, Clone)]
 pub struct ShaderModule {
     pub(crate) inner: dispatch::DispatchShaderModule,
+    pub(crate) deko3d_wgsl: Option<Arc<[u8]>>,
 }
+
+/// Stage for which a Deko3D offline artifact is requested.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum Deko3dWgslArtifactStage {
+    /// Vertex stage.
+    Vertex,
+    /// Fragment stage.
+    Fragment,
+    /// Compute stage.
+    Compute,
+}
+
+/// Exact WGSL and pipeline-stage metadata used to resolve a Deko3D DKSH artifact.
+#[derive(Clone, Copy, Debug)]
+pub struct Deko3dWgslArtifactRequest<'a> {
+    /// The exact final WGSL bytes passed to `create_shader_module`.
+    pub wgsl: &'a [u8],
+    /// SHA-256 digest of [`Self::wgsl`].
+    pub wgsl_sha256: [u8; 32],
+    /// Pipeline stage requiring the artifact.
+    pub stage: Deko3dWgslArtifactStage,
+    /// Requested pipeline entry point, with `main` substituted for an omitted entry point.
+    pub entry_point: &'a str,
+}
+
+/// A trusted source of offline-compiled Deko3D DKSH artifacts.
+pub trait Deko3dWgslArtifactProvider: Send + Sync {
+    /// Resolves an exact WGSL/stage/entry-point request to validated DKSH bytes.
+    fn resolve(&self, request: Deko3dWgslArtifactRequest<'_>) -> Result<Arc<[u8]>, String>;
+}
+
+/// Failure to install or resolve a Deko3D WGSL artifact provider.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Deko3dWgslArtifactError {
+    /// A provider was already installed for this device.
+    AlreadyInstalled,
+    /// A Deko3D WGSL module required a provider but none is installed.
+    NotInstalled,
+    /// The trusted provider rejected an artifact request.
+    Provider(String),
+    /// The trusted provider returned malformed DKSH bytes.
+    InvalidDksh(&'static str),
+}
+
+impl core::fmt::Display for Deko3dWgslArtifactError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::AlreadyInstalled => {
+                f.write_str("a Deko3D WGSL artifact provider is already installed")
+            }
+            Self::NotInstalled => f.write_str("no Deko3D WGSL artifact provider is installed"),
+            Self::Provider(message) => write!(
+                f,
+                "Deko3D WGSL artifact provider rejected the request: {message}"
+            ),
+            Self::InvalidDksh(message) => write!(
+                f,
+                "Deko3D WGSL artifact provider returned invalid DKSH: {message}"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for Deko3dWgslArtifactError {}
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(ShaderModule: Send, Sync);
 

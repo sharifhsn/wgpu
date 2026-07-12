@@ -94,7 +94,7 @@ webgl = ["web", "wgpu-core/webgl", "dep:wgpu-hal", "dep:smallvec"]
 noop = ["wgpu-core/noop", "dep:wgpu-hal", "dep:smallvec"]
 
 ## Reserves the Deko3D backend path for original Nintendo Switch homebrew.
-deko3d = ["wgpu-core?/deko3d"]
+deko3d = ["wgsl", "wgpu-core?/deko3d"]
 
 #! **Note:** In the documentation, if you see that an item depends on a backend,
 #! it means that the item is only available when that backend is enabled _and_ the backend
@@ -213,6 +213,7 @@ hashbrown.workspace = true
 parking_lot = { workspace = true, optional = true }
 profiling.workspace = true
 raw-window-handle = { workspace = true, features = ["alloc"] }
+sha2 = { version = "0.10", default-features = false }
 static_assertions.workspace = true
 
 ########################################

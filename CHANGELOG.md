@@ -49,6 +49,8 @@ Bottom level categories:
 - The experimental Deko3D HAL now supports the conservative opaque textured path, including
   sampled RGBA8 textures, depth32float, common mesh vertex attributes, culling, and dynamic
   viewport/scissor state.
+- Deko3D can resolve captured WGSL through a trusted, set-once, stage-specific DKSH artifact
+  provider at pipeline creation.
 
 ## v29.0.4 (2026-07-01)
 
