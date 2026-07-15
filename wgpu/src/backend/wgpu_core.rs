@@ -871,6 +871,9 @@ impl dispatch::InstanceInterface for ContextWgpuCore {
         &self,
         options: &crate::api::RequestAdapterOptions<'_, '_>,
     ) -> Pin<Box<dyn dispatch::RequestAdapterFuture>> {
+        let backends = wgt::Backends::all();
+        #[cfg(deko3d)]
+        let backends = backends | wgt::Backends::DEKO3D;
         let id = self.0.request_adapter(
             &wgc::instance::RequestAdapterOptions {
                 power_preference: options.power_preference,
@@ -879,7 +882,7 @@ impl dispatch::InstanceInterface for ContextWgpuCore {
                     .compatible_surface
                     .map(|surface| surface.inner.as_core().id),
             },
-            wgt::Backends::all(),
+            backends,
             None,
         );
         let adapter = id.map(|id| {
@@ -1624,6 +1627,11 @@ impl dispatch::DeviceInterface for CoreDevice {
             None,
         );
         if let Some(cause) = error {
+            #[cfg(deko3d)]
+            std::eprintln!(
+                "[wgpu-core] create_buffer label={:?} error={cause:?}",
+                desc.label
+            );
             self.context
                 .handle_error(&self.error_sink, cause, desc.label, "Device::create_buffer");
         }
@@ -1643,6 +1651,11 @@ impl dispatch::DeviceInterface for CoreDevice {
             .0
             .device_create_texture(self.id, &wgt_desc, None);
         if let Some(cause) = error {
+            #[cfg(deko3d)]
+            std::eprintln!(
+                "[wgpu-core] create_texture label={:?} error={cause:?}",
+                desc.label
+            );
             self.context.handle_error(
                 &self.error_sink,
                 cause,
@@ -1962,6 +1975,8 @@ impl dispatch::QueueInterface for CoreQueue {
         {
             Ok(()) => (),
             Err(err) => {
+                #[cfg(deko3d)]
+                std::eprintln!("[wgpu-core] queue_write_buffer error={err:?}");
                 self.context
                     .handle_error_nolabel(&self.error_sink, err, "Queue::write_buffer")
             }

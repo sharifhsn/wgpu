@@ -90,6 +90,22 @@ fn resolve_deko3d_wgsl_artifact(
 fn deko3d_wgsl_source(desc: &ShaderModuleDescriptor<'_>) -> Option<Arc<[u8]>> {
     match &desc.source {
         ShaderSource::Wgsl(wgsl) => Some(Arc::from(wgsl.as_bytes())),
+        #[cfg(feature = "naga-ir")]
+        ShaderSource::Naga(module) => {
+            let info = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(module)
+            .ok()?;
+            naga::back::wgsl::write_string(
+                module,
+                &info,
+                naga::back::wgsl::WriterFlags::EXPLICIT_TYPES,
+            )
+            .ok()
+            .map(|wgsl| Arc::from(wgsl.into_bytes()))
+        }
         _ => None,
     }
 }
@@ -485,9 +501,9 @@ impl Device {
             .unwrap_or_else(|error| panic!("Deko3D WGSL artifact resolution failed: {error}"));
         let vertex_state = VertexState {
             module: vertex.as_ref().unwrap_or(desc.vertex.module),
-            entry_point: vertex.as_ref().map_or(desc.vertex.entry_point, |_| {
-                Some(desc.vertex.entry_point.unwrap_or("main"))
-            }),
+            entry_point: vertex
+                .as_ref()
+                .map_or(desc.vertex.entry_point, |_| Some("main")),
             compilation_options: desc.vertex.compilation_options.clone(),
             buffers: desc.vertex.buffers,
         };
@@ -495,9 +511,7 @@ impl Device {
             module: fragment_artifact.as_ref().unwrap_or(fragment.module),
             entry_point: fragment_artifact
                 .as_ref()
-                .map_or(fragment.entry_point, |_| {
-                    Some(fragment.entry_point.unwrap_or("main"))
-                }),
+                .map_or(fragment.entry_point, |_| Some("main")),
             compilation_options: fragment.compilation_options.clone(),
             targets: fragment.targets,
         });

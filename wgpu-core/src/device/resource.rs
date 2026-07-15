@@ -699,7 +699,13 @@ impl Device {
             .map_err(|e| self.handle_hal_error(e));
     }
 
+    #[track_caller]
     pub fn handle_hal_error(&self, error: hal::DeviceError) -> DeviceError {
+        #[cfg(deko3d)]
+        std::eprintln!(
+            "[wgpu-core] hal_error={error:?} caller={}",
+            core::panic::Location::caller()
+        );
         match error {
             hal::DeviceError::OutOfMemory
             | hal::DeviceError::Lost
@@ -710,7 +716,13 @@ impl Device {
         DeviceError::from_hal(error)
     }
 
+    #[track_caller]
     pub fn handle_hal_error_with_nonfatal_oom(&self, error: hal::DeviceError) -> DeviceError {
+        #[cfg(deko3d)]
+        std::eprintln!(
+            "[wgpu-core] hal_error_nonfatal_oom={error:?} caller={}",
+            core::panic::Location::caller()
+        );
         match error {
             hal::DeviceError::OutOfMemory => DeviceError::from_hal(error),
             error => self.handle_hal_error(error),

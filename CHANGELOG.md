@@ -55,6 +55,18 @@ Bottom level categories:
   normalized, integer, and half-float vertex formats used by UI and sprites.
 - Deko3D static bind groups support up to four sampled texture/sampler pairs and multiple static
   uniform buffers with explicit physical slot mapping.
+- The experimental Deko3D HAL supports sampled 3D textures and staged buffer uploads to native
+  Deko3D 3D images.
+- The experimental Deko3D HAL supports color texture-to-buffer copies for deterministic GPU data
+  verification and keeps bounded resource/upload traces that dump only on failures or an explicit
+  diagnostic trigger.
+
+### Bug Fixes
+
+#### Hal
+
+- Deko3D buffer-to-texture copies now pass byte strides to `DkCopyBuf`, fixing padded rows and
+  multi-image uploads.
 
 ## v29.0.4 (2026-07-01)
 

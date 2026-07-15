@@ -259,6 +259,9 @@ CHECK(
 CHECK(
     "dkCmdBufDispatchComputeIndirect signature",
     (std::is_same<decltype(&dkCmdBufDispatchComputeIndirect), void (*)(DkCmdBuf, DkGpuAddr)>::value));
+CHECK(
+    "dkCmdBufCopyImageToBuffer signature",
+    (std::is_same<decltype(&dkCmdBufCopyImageToBuffer), void (*)(DkCmdBuf, DkImageView const*, DkImageRect const*, DkCopyBuf const*, uint32_t)>::value));
 
 CHECK("DkImageRect size", sizeof(DkImageRect) == 24);
 CHECK("DkImageRect width offset", offsetof(DkImageRect, width) == 12);

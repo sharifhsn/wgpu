@@ -1,5 +1,7 @@
 use alloc::vec::Vec;
 use core::{cell::UnsafeCell, ops::Range, ptr};
+#[cfg(target_os = "horizon")]
+use std::sync::Mutex;
 
 #[cfg(target_os = "horizon")]
 use deko3d_sys as dk;
@@ -14,6 +16,10 @@ cfg_if::cfg_if! {
 
 #[derive(Clone, Debug)]
 pub struct Buffer {
+    #[cfg(target_os = "horizon")]
+    id: u64,
+    #[cfg(target_os = "horizon")]
+    label: Option<alloc::string::String>,
     /// This data is potentially accessed mutably in arbitrary non-overlapping slices,
     /// so we must store it in `UnsafeCell` to avoid making any too-strong no-aliasing claims.
     storage: Arc<UnsafeCell<[u8]>>,
@@ -25,14 +31,92 @@ pub struct Buffer {
     size: usize,
 
     #[cfg(target_os = "horizon")]
-    gpu: Arc<GpuBuffer>,
+    gpu: Option<Arc<GpuBuffer>>,
 }
 
 #[cfg(target_os = "horizon")]
 #[derive(Debug)]
 struct GpuBuffer {
-    mem_block: dk::DkMemBlock,
+    pool: Arc<GpuBufferPool>,
+    offset: u32,
+    size: u32,
     gpu_addr: dk::DkGpuAddr,
+}
+
+#[cfg(target_os = "horizon")]
+#[derive(Debug)]
+pub(super) struct GpuBufferPool {
+    mem_block: dk::DkMemBlock,
+    size: u32,
+    free: Mutex<Vec<Range<u32>>>,
+}
+
+#[cfg(target_os = "horizon")]
+const GPU_BUFFER_POOL_SIZE: u32 = 32 * 1024 * 1024;
+
+#[cfg(target_os = "horizon")]
+impl GpuBufferPool {
+    pub(super) fn new(raw_device: dk::DkDevice) -> Result<Arc<Self>, crate::DeviceError> {
+        let mut maker = dk::DkMemBlockMaker::defaults(raw_device, GPU_BUFFER_POOL_SIZE);
+        maker.flags = dk::DkMemBlockFlags_CpuUncached
+            | dk::DkMemBlockFlags_GpuCached
+            | dk::DkMemBlockFlags_ZeroFillInit;
+        let mem_block = unsafe { dk::dkMemBlockCreate(&maker) };
+        if mem_block.is_null() {
+            return Err(crate::DeviceError::OutOfMemory);
+        }
+        Ok(Arc::new(Self {
+            mem_block,
+            size: GPU_BUFFER_POOL_SIZE,
+            free: Mutex::new(vec![0..GPU_BUFFER_POOL_SIZE]),
+        }))
+    }
+
+    fn allocate(&self, size: u32) -> Result<u32, crate::DeviceError> {
+        let size = align_up(size.max(1), 256);
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for index in 0..free.len() {
+            let range = free[index].clone();
+            if range.end - range.start >= size {
+                let offset = range.start;
+                free[index].start += size;
+                if free[index].is_empty() {
+                    free.remove(index);
+                }
+                return Ok(offset);
+            }
+        }
+        let available = free.iter().map(Range::len).sum::<usize>();
+        super::trace::record(format_args!(
+            "failure kind=buffer_pool_exhausted size={size} available={available}"
+        ));
+        super::trace::dump("buffer_pool_exhausted");
+        Err(crate::DeviceError::OutOfMemory)
+    }
+
+    fn release(&self, offset: u32, size: u32) {
+        debug_assert!(offset + size <= self.size);
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut index = free.partition_point(|range| range.start < offset);
+        free.insert(index, offset..offset + size);
+        if index > 0 && free[index - 1].end == free[index].start {
+            let end = free[index].end;
+            free[index - 1].end = end;
+            free.remove(index);
+            index -= 1;
+        }
+        if index + 1 < free.len() && free[index].end == free[index + 1].start {
+            let end = free[index + 1].end;
+            free[index].end = end;
+            free.remove(index + 1);
+        }
+    }
 }
 
 /// SAFETY:
@@ -46,30 +130,27 @@ impl Buffer {
     #[cfg(target_os = "horizon")]
     pub(super) fn new(
         desc: &crate::BufferDescriptor,
-        raw_device: dk::DkDevice,
+        pool: Arc<GpuBufferPool>,
     ) -> Result<Self, crate::DeviceError> {
         let mut buffer = Self::new_host(desc)?;
-        let allocation_size = align_up(
-            u32::try_from(buffer.size.max(1)).map_err(|_| crate::DeviceError::OutOfMemory)?,
-            dk::DK_MEMBLOCK_ALIGNMENT,
-        );
-        let mut mem_block_maker = dk::DkMemBlockMaker::defaults(raw_device, allocation_size);
-        mem_block_maker.flags = dk::DkMemBlockFlags_CpuUncached
-            | dk::DkMemBlockFlags_GpuCached
-            | dk::DkMemBlockFlags_ZeroFillInit;
-        let mem_block = unsafe { dk::dkMemBlockCreate(&mem_block_maker) };
-        if mem_block.is_null() {
-            return Err(crate::DeviceError::OutOfMemory);
-        }
-        let gpu_addr = unsafe { dk::dkMemBlockGetGpuAddr(mem_block) };
+        let allocation_size =
+            u32::try_from(buffer.size.max(1)).map_err(|_| crate::DeviceError::OutOfMemory)?;
+        let offset = pool.allocate(allocation_size)?;
+        let base_gpu_addr = unsafe { dk::dkMemBlockGetGpuAddr(pool.mem_block) };
+        let gpu_addr = base_gpu_addr + u64::from(offset);
         if gpu_addr == u64::MAX {
-            unsafe { dk::dkMemBlockDestroy(mem_block) };
             return Err(crate::DeviceError::Lost);
         }
-        buffer.gpu = Arc::new(GpuBuffer {
-            mem_block,
+        buffer.gpu = Some(Arc::new(GpuBuffer {
+            pool,
+            offset,
+            size: align_up(allocation_size.max(1), 256),
             gpu_addr,
-        });
+        }));
+        super::trace::record_resource(format_args!(
+            "resource kind=buffer id={} label={:?} size={} usage={:?}",
+            buffer.id, buffer.label, desc.size, desc.usage
+        ));
         Ok(buffer)
     }
 
@@ -103,13 +184,14 @@ impl Buffer {
             unsafe { Arc::from_raw(Arc::into_raw(storage) as *mut UnsafeCell<[u8]>) };
 
         Ok(Buffer {
+            #[cfg(target_os = "horizon")]
+            id: super::trace::resource_id(),
+            #[cfg(target_os = "horizon")]
+            label: desc.label.map(alloc::string::String::from),
             storage,
             size,
             #[cfg(target_os = "horizon")]
-            gpu: Arc::new(GpuBuffer {
-                mem_block: ptr::null_mut(),
-                gpu_addr: u64::MAX,
-            }),
+            gpu: None,
         })
     }
 
@@ -132,16 +214,53 @@ impl Buffer {
     }
 
     #[cfg(target_os = "horizon")]
+    pub(super) fn id(&self) -> u64 {
+        self.id
+    }
+
+    #[cfg(target_os = "horizon")]
+    pub(super) fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    #[cfg(target_os = "horizon")]
     pub(super) unsafe fn upload_to_gpu(&self) -> Result<(), crate::DeviceError> {
-        if self.gpu.mem_block.is_null() {
-            return Err(crate::DeviceError::Lost);
-        }
-        let dst = unsafe { dk::dkMemBlockGetCpuAddr(self.gpu.mem_block) };
+        let gpu = self.gpu.as_ref().ok_or(crate::DeviceError::Lost)?;
+        let dst = unsafe { dk::dkMemBlockGetCpuAddr(gpu.pool.mem_block) };
         if dst.is_null() {
             return Err(crate::DeviceError::Lost);
         }
         unsafe {
-            ptr::copy_nonoverlapping(self.storage.get().cast::<u8>(), dst.cast::<u8>(), self.size);
+            ptr::copy_nonoverlapping(
+                self.storage.get().cast::<u8>(),
+                dst.cast::<u8>().add(gpu.offset as usize),
+                self.size,
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "horizon")]
+    pub(super) unsafe fn download_from_gpu(
+        &self,
+        range: Range<wgt::BufferAddress>,
+    ) -> Result<(), crate::DeviceError> {
+        let start = usize::try_from(range.start).map_err(|_| crate::DeviceError::Lost)?;
+        let end = usize::try_from(range.end).map_err(|_| crate::DeviceError::Lost)?;
+        if start > end || end > self.size {
+            return Err(crate::DeviceError::Lost);
+        }
+        let gpu = self.gpu.as_ref().ok_or(crate::DeviceError::Lost)?;
+        let src = unsafe { dk::dkMemBlockGetCpuAddr(gpu.pool.mem_block) };
+        if src.is_null() {
+            return Err(crate::DeviceError::Lost);
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(
+                src.cast::<u8>().add(gpu.offset as usize + start),
+                self.storage.get().cast::<u8>().add(start),
+                end - start,
+            );
         }
         Ok(())
     }
@@ -152,10 +271,8 @@ impl Buffer {
         offset: wgt::BufferAddress,
         size: Option<wgt::BufferSize>,
     ) -> Result<(dk::DkGpuAddr, u32), crate::DeviceError> {
-        if self.gpu.mem_block.is_null() {
-            return Err(crate::DeviceError::Lost);
-        }
         let offset_usize = usize::try_from(offset).map_err(|_| crate::DeviceError::Lost)?;
+        let gpu = self.gpu.as_ref().ok_or(crate::DeviceError::Lost)?;
         if offset_usize > self.size {
             return Err(crate::DeviceError::Lost);
         }
@@ -167,12 +284,42 @@ impl Buffer {
             return Err(crate::DeviceError::Lost);
         }
         let size = u32::try_from(size).map_err(|_| crate::DeviceError::Lost)?;
-        Ok((self.gpu.gpu_addr + offset, size))
+        Ok((gpu.gpu_addr + offset, size))
+    }
+
+    #[cfg(target_os = "horizon")]
+    pub(super) unsafe fn gpu_slice(
+        &self,
+        range: Range<wgt::BufferAddress>,
+    ) -> Result<&[u8], crate::DeviceError> {
+        let start = usize::try_from(range.start).map_err(|_| crate::DeviceError::Lost)?;
+        let end = usize::try_from(range.end).map_err(|_| crate::DeviceError::Lost)?;
+        if start > end || end > self.size {
+            return Err(crate::DeviceError::Lost);
+        }
+        let gpu = self.gpu.as_ref().ok_or(crate::DeviceError::Lost)?;
+        let base = unsafe { dk::dkMemBlockGetCpuAddr(gpu.pool.mem_block) };
+        if base.is_null() {
+            return Err(crate::DeviceError::Lost);
+        }
+        Ok(unsafe {
+            core::slice::from_raw_parts(
+                base.cast::<u8>().add(gpu.offset as usize + start),
+                end - start,
+            )
+        })
     }
 }
 
 #[cfg(target_os = "horizon")]
 impl Drop for GpuBuffer {
+    fn drop(&mut self) {
+        self.pool.release(self.offset, self.size);
+    }
+}
+
+#[cfg(target_os = "horizon")]
+impl Drop for GpuBufferPool {
     fn drop(&mut self) {
         if !self.mem_block.is_null() {
             unsafe { dk::dkMemBlockDestroy(self.mem_block) };

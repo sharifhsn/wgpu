@@ -368,6 +368,7 @@ pub enum DkImageFormat {
     DkImageFormat_ZF32_X24S8,
     DkImageFormat_RGBX8_Unorm_sRGB,
     DkImageFormat_RGBA8_Unorm_sRGB,
+    DkImageFormat_E5BGR9_Float = 55,
     DkImageFormat_BGRA8_Unorm = 117,
     DkImageFormat_BGRA8_Unorm_sRGB = 119,
 }
@@ -1098,6 +1099,7 @@ unsafe extern "C" {
     pub fn dkCmdBufAddMemory(obj: DkCmdBuf, mem: DkMemBlock, offset: u32, size: u32);
     pub fn dkCmdBufFinishList(obj: DkCmdBuf) -> DkCmdList;
     pub fn dkCmdBufClear(obj: DkCmdBuf);
+    pub fn dkCmdBufBarrier(obj: DkCmdBuf, mode: DkBarrier, invalidateFlags: u32);
     pub fn dkCmdBufBindRenderTargets(
         obj: DkCmdBuf,
         colorTargets: *const *const DkImageView,
@@ -1146,6 +1148,7 @@ unsafe extern "C" {
     );
     pub fn dkCmdBufBindDepthStencilState(obj: DkCmdBuf, state: *const DkDepthStencilState);
     pub fn dkCmdBufPushData(obj: DkCmdBuf, addr: DkGpuAddr, data: *const c_void, size: u32);
+    pub fn dkCmdBufCopyBuffer(obj: DkCmdBuf, srcAddr: DkGpuAddr, dstAddr: DkGpuAddr, size: u32);
     pub fn dkCmdBufBindTextures(
         obj: DkCmdBuf,
         stage: DkStage,
@@ -1210,11 +1213,27 @@ unsafe extern "C" {
         dstRect: *const DkImageRect,
         flags: u32,
     );
+    pub fn dkCmdBufCopyImageToBuffer(
+        obj: DkCmdBuf,
+        srcView: *const DkImageView,
+        srcRect: *const DkImageRect,
+        dst: *const DkCopyBuf,
+        flags: u32,
+    );
+    pub fn dkCmdBufCopyImage(
+        obj: DkCmdBuf,
+        srcView: *const DkImageView,
+        srcRect: *const DkImageRect,
+        dstView: *const DkImageView,
+        dstRect: *const DkImageRect,
+        flags: u32,
+    );
 
     pub fn dkQueueCreate(maker: *const DkQueueMaker) -> DkQueue;
     pub fn dkQueueDestroy(obj: DkQueue);
     pub fn dkQueueSignalFence(obj: DkQueue, fence: *mut DkFence, flush: bool);
     pub fn dkQueueWaitFence(obj: DkQueue, fence: *mut DkFence);
+    pub fn dkQueueFlush(obj: DkQueue);
     pub fn dkQueueWaitIdle(obj: DkQueue);
     pub fn dkQueueAcquireImage(obj: DkQueue, swapchain: DkSwapchain) -> c_int;
     pub fn dkQueueSubmitCommands(obj: DkQueue, cmds: DkCmdList);

@@ -117,7 +117,7 @@ glsl = ["naga/glsl-in", "wgpu-core?/glsl"]
 wgsl = ["wgpu-core?/wgsl"]
 
 ## Enable accepting naga IR shaders as input.
-naga-ir = ["dep:naga"]
+naga-ir = ["dep:naga", "naga/wgsl-out"]
 
 #! ### Assertions and Serialization
 # --------------------------------------------------------------------
