@@ -373,6 +373,7 @@ pub enum DkImageFormat {
     DkImageFormat_ZF32_X24S8,
     DkImageFormat_RGBX8_Unorm_sRGB,
     DkImageFormat_RGBA8_Unorm_sRGB,
+    DkImageFormat_E5BGR9_Float = 55,
     DkImageFormat_BGRA8_Unorm = 117,
     DkImageFormat_BGRA8_Unorm_sRGB = 119,
 }

@@ -2889,10 +2889,17 @@ impl<'a, W: Write> Writer<'a, W> {
                     && level == crate::SampleLevel::Zero
                     && matches!(class, crate::ImageClass::Depth { .. })
                     && !self.features.contains(Features::TEXTURE_SHADOW_LOD);
+                let zero_as_auto = level == crate::SampleLevel::Zero
+                    && depth_ref.is_some()
+                    && self
+                        .options
+                        .writer_flags
+                        .contains(WriterFlags::DEPTH_SAMPLE_LEVEL_ZERO_AS_AUTO);
 
                 // Write the function to be used depending on the sample level
                 let fun_name = match level {
                     crate::SampleLevel::Zero if gather.is_some() => "textureGather",
+                    crate::SampleLevel::Zero if zero_as_auto => "texture",
                     crate::SampleLevel::Zero if workaround_lod_with_grad => "textureGrad",
                     crate::SampleLevel::Auto | crate::SampleLevel::Bias(_) => "texture",
                     crate::SampleLevel::Zero | crate::SampleLevel::Exact(_) => "textureLod",
@@ -2959,6 +2966,7 @@ impl<'a, W: Write> Writer<'a, W> {
                 match level {
                     // Auto needs no more arguments
                     crate::SampleLevel::Auto => (),
+                    crate::SampleLevel::Zero if zero_as_auto => (),
                     // Zero needs level set to 0
                     crate::SampleLevel::Zero => {
                         if workaround_lod_with_grad {

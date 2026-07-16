@@ -3415,6 +3415,14 @@ fn texture_format_support(format: wgt::TextureFormat) -> Option<TextureFormatSup
                     | wgt::TextureUses::STORAGE_READ_WRITE,
             ),
         }),
+        wgt::TextureFormat::Rgb9e5Ufloat => Some(TextureFormatSupport {
+            image_format: map_texture_image_format(format)?,
+            usage: TextureUsageRequirement::Contains(
+                wgt::TextureUses::RESOURCE
+                    | wgt::TextureUses::COPY_DST
+                    | wgt::TextureUses::COPY_SRC,
+            ),
+        }),
         wgt::TextureFormat::R8Uint
         | wgt::TextureFormat::R8Sint
         | wgt::TextureFormat::Rg8Uint
@@ -3608,6 +3616,11 @@ fn deko3d_texture_format_capabilities(
                 | crate::TextureFormatCapabilities::STORAGE_WRITE_ONLY
                 | crate::TextureFormatCapabilities::STORAGE_READ_WRITE
         }
+        wgt::TextureFormat::Rgb9e5Ufloat => {
+            crate::TextureFormatCapabilities::SAMPLED
+                | crate::TextureFormatCapabilities::COPY_SRC
+                | crate::TextureFormatCapabilities::COPY_DST
+        }
         wgt::TextureFormat::R8Uint
         | wgt::TextureFormat::R8Sint
         | wgt::TextureFormat::Rg8Uint
@@ -3690,6 +3703,7 @@ fn map_texture_image_format(format: wgt::TextureFormat) -> Option<dk::DkImageFor
         wgt::TextureFormat::Rg8Uint => Some(dk::DkImageFormat::DkImageFormat_RG8_Uint),
         wgt::TextureFormat::Rg8Sint => Some(dk::DkImageFormat::DkImageFormat_RG8_Sint),
         wgt::TextureFormat::Rg8Snorm => Some(dk::DkImageFormat::DkImageFormat_RG8_Snorm),
+        wgt::TextureFormat::Rgb9e5Ufloat => Some(dk::DkImageFormat::DkImageFormat_E5BGR9_Float),
         wgt::TextureFormat::R16Float => Some(dk::DkImageFormat::DkImageFormat_R16_Float),
         wgt::TextureFormat::Rg16Float => Some(dk::DkImageFormat::DkImageFormat_RG16_Float),
         wgt::TextureFormat::R16Unorm => Some(dk::DkImageFormat::DkImageFormat_R16_Unorm),
@@ -8253,6 +8267,20 @@ mod tests {
             assert!(capabilities.contains(crate::TextureFormatCapabilities::STORAGE_WRITE_ONLY));
             assert!(capabilities.contains(crate::TextureFormatCapabilities::STORAGE_READ_WRITE));
         }
+    }
+
+    #[test]
+    fn rgb9e5_is_a_sampled_copy_format() {
+        let capabilities = deko3d_texture_format_capabilities(wgt::TextureFormat::Rgb9e5Ufloat);
+        assert!(capabilities.contains(crate::TextureFormatCapabilities::SAMPLED));
+        assert!(capabilities.contains(crate::TextureFormatCapabilities::COPY_SRC));
+        assert!(capabilities.contains(crate::TextureFormatCapabilities::COPY_DST));
+        assert!(!capabilities.intersects(
+            crate::TextureFormatCapabilities::COLOR_ATTACHMENT
+                | crate::TextureFormatCapabilities::STORAGE_READ_ONLY
+                | crate::TextureFormatCapabilities::STORAGE_WRITE_ONLY
+                | crate::TextureFormatCapabilities::STORAGE_READ_WRITE,
+        ));
     }
 
     #[test]

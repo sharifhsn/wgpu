@@ -158,6 +158,8 @@ bitflags::bitflags! {
         /// Supports ARB_shader_draw_parameters on the host, which provides
         /// support for `gl_BaseInstanceARB`, `gl_BaseVertexARB`, `gl_DrawIDARB`, and `gl_DrawID`.
         const DRAW_PARAMETERS = 0x4;
+        /// Lower explicit level-zero depth-comparison samples to implicit-level samples.
+        const DEPTH_SAMPLE_LEVEL_ZERO_AS_AUTO = 0x8;
         /// Include unused global variables, constants and functions. By default the output will exclude
         /// global variables that are not used in the specified entrypoint (including indirect use),
         /// all constant declarations, and functions that use excluded global variables.

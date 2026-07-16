@@ -74,6 +74,8 @@ Bottom level categories:
 - Added `R8Unorm` and `Rg8Unorm` storage-texture support on the experimental Deko3D backend.
 - Added mixed sampled-texture/sampler binding arrays and storage textures on the experimental Deko3D backend.
 - Added reflected DKSH shader artifacts and runtime physical binding remapping across Deko3D bind groups.
+- Added sampled and copy support for `Rgb9e5Ufloat` textures to the experimental Deko3D backend.
+- Added an opt-in GLSL lowering mode for explicit level-zero depth comparisons on targets without shadow `textureLod` support.
 
 ### Bug Fixes
 

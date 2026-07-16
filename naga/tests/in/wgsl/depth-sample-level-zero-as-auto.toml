@@ -1,0 +1,5 @@
+targets = "GLSL"
+
+[glsl]
+version.Desktop = 460
+writer_flags = "DEPTH_SAMPLE_LEVEL_ZERO_AS_AUTO"

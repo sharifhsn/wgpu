@@ -1978,6 +1978,7 @@ fn copy_format_aspect(format: wgt::TextureFormat) -> DeviceResult<crate::FormatA
         | wgt::TextureFormat::Rgba8Sint
         | wgt::TextureFormat::R8Unorm
         | wgt::TextureFormat::Rg8Unorm
+        | wgt::TextureFormat::Rgb9e5Ufloat
         | wgt::TextureFormat::R8Uint
         | wgt::TextureFormat::R8Sint
         | wgt::TextureFormat::Rg8Uint
@@ -2045,7 +2046,7 @@ fn texture_copy_view(
     Ok(view)
 }
 
-#[cfg(target_os = "horizon")]
+#[cfg(any(target_os = "horizon", test))]
 fn copy_texel_size(format: wgt::TextureFormat) -> DeviceResult<u32> {
     match format {
         wgt::TextureFormat::Rgba8Unorm
@@ -2055,6 +2056,7 @@ fn copy_texel_size(format: wgt::TextureFormat) -> DeviceResult<u32> {
         | wgt::TextureFormat::Rgba8Snorm
         | wgt::TextureFormat::Bgra8Unorm
         | wgt::TextureFormat::Bgra8UnormSrgb => Ok(4),
+        wgt::TextureFormat::Rgb9e5Ufloat => Ok(4),
         wgt::TextureFormat::Rg16Float
         | wgt::TextureFormat::Rg16Unorm
         | wgt::TextureFormat::Rg16Snorm
@@ -3092,6 +3094,15 @@ mod tests {
         ] {
             assert_eq!(copy_format_aspect(format), Ok(crate::FormatAspects::COLOR));
         }
+    }
+
+    #[test]
+    fn rgb9e5_is_a_four_byte_color_copy_format() {
+        assert_eq!(
+            copy_format_aspect(wgt::TextureFormat::Rgb9e5Ufloat),
+            Ok(crate::FormatAspects::COLOR),
+        );
+        assert_eq!(copy_texel_size(wgt::TextureFormat::Rgb9e5Ufloat), Ok(4));
     }
 
     #[test]

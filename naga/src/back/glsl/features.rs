@@ -546,13 +546,20 @@ impl<W> Writer<'_, W> {
                         }
                     }
                 }
-                Expression::ImageSample { image, level, offset, .. } => {
+                Expression::ImageSample { image, level, offset, depth_ref, .. } => {
                     if let TypeInner::Image {
                         dim,
                         arrayed,
                         class: ImageClass::Depth { .. },
                     } = *info[image].ty.inner_with(&module.types) {
-                        let lod = matches!(level, SampleLevel::Zero | SampleLevel::Exact(_));
+                        let zero_as_auto = level == SampleLevel::Zero
+                            && depth_ref.is_some()
+                            && self
+                                .options
+                                .writer_flags
+                                .contains(WriterFlags::DEPTH_SAMPLE_LEVEL_ZERO_AS_AUTO);
+                        let lod = matches!(level, SampleLevel::Zero | SampleLevel::Exact(_))
+                            && !zero_as_auto;
                         let bias = matches!(level, SampleLevel::Bias(_));
                         let auto = matches!(level, SampleLevel::Auto);
                         let cube = dim == ImageDimension::Cube;

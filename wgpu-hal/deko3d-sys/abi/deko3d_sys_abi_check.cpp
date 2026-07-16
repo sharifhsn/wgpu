@@ -156,6 +156,7 @@ CHECK("DkImageFormat_RGBA8_Unorm", DkImageFormat_RGBA8_Unorm == 28);
 CHECK("DkImageFormat_S8", DkImageFormat_S8 == 40);
 CHECK("DkImageFormat_ZF32", DkImageFormat_ZF32 == 43);
 CHECK("DkImageFormat_RGBA8_Unorm_sRGB", DkImageFormat_RGBA8_Unorm_sRGB == 47);
+CHECK("DkImageFormat_E5BGR9_Float", DkImageFormat_E5BGR9_Float == 55);
 CHECK("DkImageLayoutMaker size", sizeof(DkImageLayoutMaker) == 48);
 CHECK("DkImageLayoutMaker dimensions offset", offsetof(DkImageLayoutMaker, dimensions) == 24);
 CHECK("DkImageLayoutMaker pitchStride offset", offsetof(DkImageLayoutMaker, pitchStride) == 40);
