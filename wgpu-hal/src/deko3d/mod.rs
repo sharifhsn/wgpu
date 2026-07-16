@@ -110,6 +110,7 @@ pub enum Resource {
         label: Option<String>,
         image: RawImage,
         extent: wgt::Extent3d,
+        sample_count: u32,
         format: wgt::TextureFormat,
         aspect: wgt::TextureAspect,
         view_dimension: wgt::TextureViewDimension,
@@ -129,6 +130,7 @@ impl Resource {
             label: Some(String::from("surface")),
             image,
             extent,
+            sample_count: 1,
             format: wgt::TextureFormat::Rgba8Unorm,
             aspect: wgt::TextureAspect::All,
             view_dimension: wgt::TextureViewDimension::D2,
@@ -356,6 +358,8 @@ pub(super) struct RenderPipelineInnerRaw {
     color_write_state: dk::DkColorWriteState,
     blend_states: Vec<dk::DkBlendState>,
     depth_stencil_state: dk::DkDepthStencilState,
+    multisample_state: dk::DkMultisampleState,
+    sample_mask: u32,
     uses_depth_stencil: bool,
     stencil_read_mask: u8,
     stencil_write_mask: u8,
@@ -377,6 +381,7 @@ struct TextureInnerRaw {
     mem_block: dk::DkMemBlock,
     image: dk::DkImage,
     extent: wgt::Extent3d,
+    sample_count: u32,
     dimension: wgt::TextureDimension,
     format: wgt::TextureFormat,
 }
@@ -1149,6 +1154,11 @@ impl TextureInner {
         self.inner.format
     }
 
+    #[cfg(target_os = "horizon")]
+    pub(super) fn sample_count(&self) -> u32 {
+        self.inner.sample_count
+    }
+
     #[cfg(not(target_os = "horizon"))]
     pub(super) fn extent(&self) -> wgt::Extent3d {
         wgt::Extent3d {
@@ -1161,6 +1171,11 @@ impl TextureInner {
     #[cfg(not(target_os = "horizon"))]
     pub(super) fn format(&self) -> wgt::TextureFormat {
         wgt::TextureFormat::Rgba8Unorm
+    }
+
+    #[cfg(not(target_os = "horizon"))]
+    pub(super) fn sample_count(&self) -> u32 {
+        1
     }
 }
 
@@ -1799,12 +1814,15 @@ impl RenderPipelineInner {
         desc: &crate::RenderPipelineDescriptor<Resource, Resource, Resource>,
     ) -> Result<Self, crate::PipelineError> {
         if desc.multiview_mask.is_some()
-            || desc.multisample.count != 1
             || desc.multisample.alpha_to_coverage_enabled
             || !matches!(desc.cache, None | Some(Resource::PipelineCache))
         {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         }
+        let ms_mode = map_sample_count(desc.multisample.count)
+            .map_err(|_| crate::PipelineError::Device(crate::DeviceError::Lost))?;
+        let sample_mask = u32::try_from(desc.multisample.mask)
+            .map_err(|_| crate::PipelineError::Device(crate::DeviceError::Lost))?;
         if desc.primitive.topology != wgt::PrimitiveTopology::TriangleList
             || desc.primitive.strip_index_format.is_some()
             || desc.primitive.unclipped_depth
@@ -1923,6 +1941,9 @@ impl RenderPipelineInner {
             .map(map_depth_stencil_state)
             .transpose()?
             .unwrap_or_else(depth_stencil_disabled_state);
+        let mut multisample_state = dk::DkMultisampleState::defaults();
+        multisample_state.set_mode(ms_mode);
+        multisample_state.set_rasterizer_mode(ms_mode);
 
         Ok(Self {
             inner: RenderPipelineInnerRaw {
@@ -1936,6 +1957,8 @@ impl RenderPipelineInner {
                 color_write_state,
                 blend_states,
                 depth_stencil_state,
+                multisample_state,
+                sample_mask,
                 uses_depth_stencil,
                 stencil_read_mask: desc
                     .depth_stencil
@@ -2241,10 +2264,17 @@ impl TextureInner {
                 | wgt::TextureFormat::Depth16Unorm
                 | wgt::TextureFormat::Depth32Float
         ) || desc.mip_level_count == 0
-            || desc.sample_count != 1
+            || !matches!(desc.sample_count, 1 | 4)
             || desc.size.width == 0
             || desc.size.height == 0
             || desc.size.depth_or_array_layers == 0
+        {
+            return Err(crate::DeviceError::Lost);
+        }
+        if desc.sample_count > 1
+            && (desc.mip_level_count != 1
+                || desc.size.depth_or_array_layers != 1
+                || desc.dimension != wgt::TextureDimension::D2)
         {
             return Err(crate::DeviceError::Lost);
         }
@@ -2270,6 +2300,7 @@ impl TextureInner {
         };
         image_layout_maker.format =
             map_texture_image_format(desc.format).ok_or(crate::DeviceError::Lost)?;
+        image_layout_maker.msMode = map_sample_count(desc.sample_count)?;
         if desc.dimension != wgt::TextureDimension::D3
             && desc
                 .usage
@@ -2319,6 +2350,7 @@ impl TextureInner {
             mem_block,
             image,
             extent: desc.size,
+            sample_count: desc.sample_count,
             dimension: desc.dimension,
             format: desc.format,
         };
@@ -4641,6 +4673,7 @@ impl crate::Device for Device {
                     desc.range,
                 )?,
                 extent: *extent,
+                sample_count: 1,
                 format: desc.format,
                 aspect: desc.range.aspect,
                 view_dimension: wgt::TextureViewDimension::D2,
@@ -4690,6 +4723,7 @@ impl crate::Device for Device {
                         desc.range,
                     )?,
                     extent: texture.extent(),
+                    sample_count: texture.sample_count(),
                     format: texture.format(),
                     aspect: desc.range.aspect,
                     view_dimension: desc.dimension,

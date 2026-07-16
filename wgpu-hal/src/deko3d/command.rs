@@ -87,6 +87,7 @@ enum Command {
     },
     BeginRenderPass {
         images: Vec<Option<RawImage>>,
+        resolve_images: Vec<Option<RawImage>>,
         extent: wgt::Extent3d,
         clear_values: Vec<Option<wgt::Color>>,
         depth: Option<RawImage>,
@@ -214,6 +215,7 @@ struct ExecutionState {
 #[derive(Clone, Debug)]
 struct RenderTarget {
     images: Vec<Option<RawImage>>,
+    resolve_images: Vec<Option<RawImage>>,
     extent: wgt::Extent3d,
     depth: Option<RawImage>,
 }
@@ -576,7 +578,7 @@ impl crate::CommandEncoder for CommandBuffer {
         &mut self,
         desc: &crate::RenderPassDescriptor<Resource, Resource>,
     ) -> DeviceResult<()> {
-        if desc.multiview_mask.is_some() || desc.sample_count != 1 {
+        if desc.multiview_mask.is_some() || !supports_sample_count(desc.sample_count) {
             return Err(crate::DeviceError::Lost);
         }
         if let Some(query_set) = desc.occlusion_query_set {
@@ -592,19 +594,22 @@ impl crate::CommandEncoder for CommandBuffer {
             return Err(crate::DeviceError::Lost);
         }
         let mut images = Vec::with_capacity(desc.color_attachments.len());
+        let mut resolve_images = Vec::with_capacity(desc.color_attachments.len());
         let mut clear_values = Vec::with_capacity(desc.color_attachments.len());
         for attachment in desc.color_attachments {
             let Some(attachment) = attachment else {
                 images.push(None);
+                resolve_images.push(None);
                 clear_values.push(None);
                 continue;
             };
-            if attachment.resolve_target.is_some() || attachment.depth_slice.is_some() {
+            if attachment.depth_slice.is_some() {
                 return Err(crate::DeviceError::Lost);
             }
             let Resource::TextureView {
                 image,
                 extent,
+                sample_count,
                 format,
                 aspect,
                 ..
@@ -622,6 +627,38 @@ impl crate::CommandEncoder for CommandBuffer {
             {
                 return Err(crate::DeviceError::Lost);
             }
+            if *sample_count != desc.sample_count {
+                return Err(crate::DeviceError::Lost);
+            }
+            let resolve_image = match attachment.resolve_target.as_ref() {
+                None => None,
+                Some(resolve) => {
+                    if desc.sample_count == 1
+                        || !resolve.usage.contains(wgt::TextureUses::COLOR_TARGET)
+                    {
+                        return Err(crate::DeviceError::Lost);
+                    }
+                    let Resource::TextureView {
+                        image,
+                        extent: resolve_extent,
+                        sample_count,
+                        format: resolve_format,
+                        aspect: resolve_aspect,
+                        ..
+                    } = resolve.view
+                    else {
+                        return Err(crate::DeviceError::Lost);
+                    };
+                    if *sample_count != 1
+                        || *resolve_extent != *extent
+                        || *resolve_format != *format
+                        || *resolve_aspect != wgt::TextureAspect::All
+                    {
+                        return Err(crate::DeviceError::Lost);
+                    }
+                    Some(*image)
+                }
+            };
             let clear_value = if attachment.ops.contains(crate::AttachmentOps::LOAD_CLEAR) {
                 Some(attachment.clear_value)
             } else if attachment.ops.contains(crate::AttachmentOps::LOAD)
@@ -637,6 +674,7 @@ impl crate::CommandEncoder for CommandBuffer {
                 return Err(crate::DeviceError::Lost);
             }
             images.push(Some(*image));
+            resolve_images.push(resolve_image);
             clear_values.push(clear_value);
         }
         let (depth, depth_clear_value) = match desc.depth_stencil_attachment.as_ref() {
@@ -652,6 +690,7 @@ impl crate::CommandEncoder for CommandBuffer {
                 let Resource::TextureView {
                     image,
                     extent,
+                    sample_count,
                     format,
                     aspect,
                     ..
@@ -670,6 +709,9 @@ impl crate::CommandEncoder for CommandBuffer {
                         wgt::TextureAspect::All | wgt::TextureAspect::DepthOnly
                     )
                 {
+                    return Err(crate::DeviceError::Lost);
+                }
+                if *sample_count != desc.sample_count {
                     return Err(crate::DeviceError::Lost);
                 }
                 let clear = if depth.depth_ops.contains(crate::AttachmentOps::LOAD_CLEAR) {
@@ -693,6 +735,7 @@ impl crate::CommandEncoder for CommandBuffer {
             timestamp_writes(desc.timestamp_writes.as_ref())?;
         self.commands.push(Command::BeginRenderPass {
             images,
+            resolve_images,
             extent: desc.extent,
             clear_values,
             depth,
@@ -1080,6 +1123,7 @@ impl Command {
             },
             Command::BeginRenderPass {
                 images,
+                resolve_images,
                 extent,
                 clear_values,
                 depth,
@@ -1089,6 +1133,7 @@ impl Command {
             } => {
                 state.target = Some(RenderTarget {
                     images: images.clone(),
+                    resolve_images: resolve_images.clone(),
                     extent: *extent,
                     depth: *depth,
                 });
@@ -1115,8 +1160,7 @@ impl Command {
                 if let Some(timestamp) = state.render_pass_end_timestamp.take() {
                     unsafe { submit_timestamp_write(queue, surface_queue, &timestamp)? };
                 }
-                state.target = None;
-                Ok(())
+                unsafe { submit_end_render_pass(queue, surface_queue, state) }
             }
             Command::SetRenderPipeline { pipeline } => {
                 state.pipeline = Some(pipeline.clone());
@@ -1484,6 +1528,14 @@ mod tests {
                 Command::EndOcclusionQuery { index: 0, .. },
             ] if range == &(0..2)
         ));
+    }
+
+    #[test]
+    fn render_pass_sample_counts_match_deko_modes() {
+        assert!(supports_sample_count(1));
+        assert!(supports_sample_count(4));
+        assert!(!supports_sample_count(2));
+        assert!(!supports_sample_count(8));
     }
 
     #[test]
@@ -1861,6 +1913,10 @@ fn timestamp_writes(
         timestamp(writes.beginning_of_pass_write_index)?,
         timestamp(writes.end_of_pass_write_index)?,
     ))
+}
+
+fn supports_sample_count(sample_count: u32) -> bool {
+    matches!(sample_count, 1 | 4)
 }
 
 #[cfg(target_os = "horizon")]
@@ -2347,6 +2403,35 @@ unsafe fn submit_begin_render_pass(
     _depth_clear_value: Option<f32>,
 ) -> DeviceResult<()> {
     Err(crate::DeviceError::Lost)
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_end_render_pass(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    state: &mut ExecutionState,
+) -> DeviceResult<()> {
+    let target = state.target.take().ok_or(crate::DeviceError::Lost)?;
+    unsafe {
+        submit_deko_commands(queue, surface_queue, "end_render_pass", |cmdbuf| {
+            for (source, destination) in target.images.iter().zip(&target.resolve_images) {
+                if let (Some(source), Some(destination)) = (source, destination) {
+                    dk::dkCmdBufResolveImage(cmdbuf, &source.1, &destination.1);
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_end_render_pass(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    state: &mut ExecutionState,
+) -> DeviceResult<()> {
+    state.target.take().ok_or(crate::DeviceError::Lost)?;
+    Ok(())
 }
 
 #[cfg(target_os = "horizon")]
@@ -2886,6 +2971,8 @@ unsafe fn submit_deko_draw(
                 return Err(crate::DeviceError::Lost);
             }
             dk::dkCmdBufBindDepthStencilState(cmdbuf, &pipeline.depth_stencil_state);
+            dk::dkCmdBufBindMultisampleState(cmdbuf, &pipeline.multisample_state);
+            dk::dkCmdBufSetSampleMask(cmdbuf, pipeline.sample_mask);
             dk::dkCmdBufSetStencil(
                 cmdbuf,
                 dk::DkFace_FrontAndBack,
