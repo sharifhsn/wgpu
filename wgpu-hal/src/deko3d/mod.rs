@@ -86,7 +86,8 @@ pub struct Encoder;
 pub enum Resource {
     Placeholder,
     BindGroupLayout(BindGroupLayoutKind),
-    PipelineLayout(Vec<Option<BindGroupLayoutKind>>),
+    PipelineLayout(Arc<PipelineLayoutInner>),
+    PipelineCache,
     ShaderModule(Arc<ShaderModuleInner>),
     RenderPipeline(Arc<RenderPipelineInner>),
     ComputePipeline(Arc<ComputePipelineInner>),
@@ -246,6 +247,14 @@ pub struct ComputePipelineInner {
     inner: ComputePipelineInnerRaw,
 }
 
+#[derive(Debug)]
+pub struct PipelineLayoutInner {
+    immediate_size: u32,
+    bind_group_layouts: Vec<Option<BindGroupLayoutKind>>,
+    #[cfg(target_os = "horizon")]
+    immediate_buffer: Option<Buffer>,
+}
+
 pub struct TextureInner {
     #[allow(dead_code)]
     inner: TextureInnerRaw,
@@ -327,6 +336,7 @@ pub(super) struct ShaderBinding {
 
 #[cfg(target_os = "horizon")]
 pub(super) struct RenderPipelineInnerRaw {
+    pipeline_layout: Arc<PipelineLayoutInner>,
     vertex_shader: Arc<ShaderModuleInner>,
     fragment_shader: Arc<ShaderModuleInner>,
     primitive: dk::DkPrimitive,
@@ -347,6 +357,7 @@ pub(super) struct RenderPipelineInnerRaw {
 
 #[cfg(target_os = "horizon")]
 pub(super) struct ComputePipelineInnerRaw {
+    pipeline_layout: Arc<PipelineLayoutInner>,
     compute_shader: Arc<ShaderModuleInner>,
 }
 
@@ -646,6 +657,8 @@ const DEFAULT_HEIGHT: u32 = 720;
 #[cfg(target_os = "horizon")]
 const CMDMEMSIZE: u32 = 16 * 1024;
 const DEKO_UNIFORM_BUFFER_COUNT: u32 = 16;
+const DEKO_IMMEDIATES_BINDING: u32 = DEKO_UNIFORM_BUFFER_COUNT - 1;
+const DEKO_PUSH_CONSTANTS_MAX_SIZE: u32 = 0x7FFC;
 const DEKO_UNIFORM_BUF_MAX_SIZE: u64 = 0x10000;
 const DEKO_TEXTURE_SAMPLER_COUNT: usize = 32;
 const DEKO_STORAGE_BUFFER_COUNT: u32 = 16;
@@ -874,6 +887,150 @@ impl ComputePipelineInner {
     #[cfg(target_os = "horizon")]
     pub(super) fn raw(&self) -> &ComputePipelineInnerRaw {
         &self.inner
+    }
+}
+
+impl PipelineLayoutInner {
+    fn bind_group_layouts(
+        desc: &crate::PipelineLayoutDescriptor<Resource>,
+    ) -> DeviceResult<Vec<Option<BindGroupLayoutKind>>> {
+        desc.bind_group_layouts
+            .iter()
+            .map(|layout| match layout {
+                Some(Resource::BindGroupLayout(kind)) => Ok(Some(kind.clone())),
+                Some(_) => Err(crate::DeviceError::Lost),
+                None => Ok(None),
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "horizon")]
+    fn new(
+        desc: &crate::PipelineLayoutDescriptor<Resource>,
+        pool: Arc<GpuBufferPool>,
+    ) -> DeviceResult<Self> {
+        if u64::from(desc.immediate_size) > u64::from(dk::DK_UNIFORM_BUF_MAX_SIZE) {
+            return Err(crate::DeviceError::Lost);
+        }
+        let immediate_buffer = if desc.immediate_size == 0 {
+            None
+        } else {
+            let alignment = u64::from(dk::DK_UNIFORM_BUF_ALIGNMENT);
+            let size = u64::from(desc.immediate_size)
+                .checked_add(alignment - 1)
+                .ok_or(crate::DeviceError::OutOfMemory)?
+                & !(alignment - 1);
+            Some(Buffer::new(
+                &crate::BufferDescriptor {
+                    label: None,
+                    size,
+                    usage: wgt::BufferUses::UNIFORM,
+                    memory_flags: crate::MemoryFlags::empty(),
+                },
+                pool,
+            )?)
+        };
+        Ok(Self {
+            immediate_size: desc.immediate_size,
+            bind_group_layouts: Self::bind_group_layouts(desc)?,
+            immediate_buffer,
+        })
+    }
+
+    #[cfg(not(target_os = "horizon"))]
+    fn new(desc: &crate::PipelineLayoutDescriptor<Resource>) -> DeviceResult<Self> {
+        if u64::from(desc.immediate_size) > u64::from(dk::DK_UNIFORM_BUF_MAX_SIZE) {
+            return Err(crate::DeviceError::Lost);
+        }
+        Ok(Self {
+            immediate_size: desc.immediate_size,
+            bind_group_layouts: Self::bind_group_layouts(desc)?,
+        })
+    }
+
+    pub(super) fn contains_immediate_range(&self, offset_bytes: u32, data: &[u32]) -> bool {
+        let Some(size_bytes) = u32::try_from(data.len())
+            .ok()
+            .and_then(|words| words.checked_mul(wgt::IMMEDIATE_DATA_ALIGNMENT))
+        else {
+            return false;
+        };
+        offset_bytes
+            .checked_add(size_bytes)
+            .is_some_and(|end| end <= self.immediate_size)
+    }
+
+    #[cfg(target_os = "horizon")]
+    pub(super) unsafe fn bind_immediates(
+        &self,
+        cmdbuf: dk::DkCmdBuf,
+        visibility: wgt::ShaderStages,
+    ) -> DeviceResult<()> {
+        let Some(buffer) = self.immediate_buffer.as_ref() else {
+            return Ok(());
+        };
+        let (gpu_addr, gpu_size) = buffer.gpu_binding(0, None)?;
+        for (flag, stage) in [
+            (wgt::ShaderStages::VERTEX, dk::DkStage::DkStage_Vertex),
+            (wgt::ShaderStages::FRAGMENT, dk::DkStage::DkStage_Fragment),
+            (wgt::ShaderStages::COMPUTE, dk::DkStage::DkStage_Compute),
+        ] {
+            if visibility.contains(flag) {
+                unsafe {
+                    dk::dkCmdBufBindUniformBuffer(
+                        cmdbuf,
+                        stage,
+                        DEKO_IMMEDIATES_BINDING,
+                        gpu_addr,
+                        gpu_size,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "horizon")]
+    pub(super) unsafe fn push_immediates(
+        &self,
+        cmdbuf: dk::DkCmdBuf,
+        offset_bytes: u32,
+        data: &[u32],
+    ) -> DeviceResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if !self.contains_immediate_range(offset_bytes, data) {
+            return Err(crate::DeviceError::Lost);
+        }
+        let buffer = self
+            .immediate_buffer
+            .as_ref()
+            .ok_or(crate::DeviceError::Lost)?;
+        let (gpu_addr, gpu_size) = buffer.gpu_binding(0, None)?;
+        let max_words = (DEKO_PUSH_CONSTANTS_MAX_SIZE / wgt::IMMEDIATE_DATA_ALIGNMENT) as usize;
+        for (chunk_index, chunk) in data.chunks(max_words).enumerate() {
+            let chunk_offset = u32::try_from(chunk_index)
+                .ok()
+                .and_then(|index| index.checked_mul(DEKO_PUSH_CONSTANTS_MAX_SIZE))
+                .and_then(|offset| offset_bytes.checked_add(offset))
+                .ok_or(crate::DeviceError::Lost)?;
+            let chunk_size = u32::try_from(chunk.len())
+                .ok()
+                .and_then(|words| words.checked_mul(wgt::IMMEDIATE_DATA_ALIGNMENT))
+                .ok_or(crate::DeviceError::Lost)?;
+            unsafe {
+                dk::dkCmdBufPushConstants(
+                    cmdbuf,
+                    gpu_addr,
+                    gpu_size,
+                    chunk_offset,
+                    chunk_size,
+                    chunk.as_ptr().cast(),
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1566,6 +1723,7 @@ impl RenderPipelineInner {
         if desc.multiview_mask.is_some()
             || desc.multisample.count != 1
             || desc.multisample.alpha_to_coverage_enabled
+            || !matches!(desc.cache, None | Some(Resource::PipelineCache))
         {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         }
@@ -1624,7 +1782,7 @@ impl RenderPipelineInner {
         let Resource::ShaderModule(fragment_shader) = fragment_stage.module else {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         };
-        let Resource::PipelineLayout(bind_group_layouts) = desc.layout else {
+        let Resource::PipelineLayout(pipeline_layout) = desc.layout else {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         };
 
@@ -1709,7 +1867,8 @@ impl RenderPipelineInner {
                     .depth_stencil
                     .as_ref()
                     .map_or(0xFF, |depth_stencil| depth_stencil.stencil.write_mask as u8),
-                bind_group_count: bind_group_layouts.len(),
+                pipeline_layout: pipeline_layout.clone(),
+                bind_group_count: pipeline_layout.bind_group_layouts.len(),
                 vertex_bindings: vertex_shader.inner.bindings.clone(),
                 fragment_bindings: fragment_shader.inner.bindings.clone(),
             },
@@ -1722,9 +1881,13 @@ impl ComputePipelineInner {
     fn new(
         desc: &crate::ComputePipelineDescriptor<Resource, Resource, Resource>,
     ) -> Result<Self, crate::PipelineError> {
-        if !matches!(desc.layout, Resource::PipelineLayout(_)) || desc.cache.is_some() {
+        if !matches!(desc.cache, None | Some(Resource::PipelineCache)) {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         }
+
+        let Resource::PipelineLayout(pipeline_layout) = desc.layout else {
+            return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+        };
 
         let Resource::ShaderModule(compute_shader) = desc.stage.module else {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
@@ -1732,6 +1895,7 @@ impl ComputePipelineInner {
 
         Ok(Self {
             inner: ComputePipelineInnerRaw {
+                pipeline_layout: pipeline_layout.clone(),
                 compute_shader: compute_shader.clone(),
             },
         })
@@ -3490,6 +3654,11 @@ mod tests {
     }
 
     #[test]
+    fn advertises_pipeline_cache_support() {
+        assert!(supported_features().contains(wgt::Features::PIPELINE_CACHE));
+    }
+
+    #[test]
     fn dksh_validation_rejects_truncated_and_corrupt_headers() {
         assert!(validate_dksh(&valid_dksh()[..HEADER_SIZE - 1]).is_err());
 
@@ -3852,6 +4021,7 @@ pub fn supported_features() -> wgt::Features {
     wgt::Features::PASSTHROUGH_SHADERS
         | wgt::Features::MAPPABLE_PRIMARY_BUFFERS
         | wgt::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+        | wgt::Features::PIPELINE_CACHE
         | wgt::Features::MULTI_DRAW_INDIRECT_COUNT
 }
 
@@ -4474,7 +4644,7 @@ impl crate::Device for Device {
         &self,
         desc: &crate::PipelineLayoutDescriptor<Resource>,
     ) -> DeviceResult<Resource> {
-        if desc.immediate_size != 0 || desc.bind_group_layouts.len() > 4 {
+        if desc.bind_group_layouts.len() > 4 {
             return Err(crate::DeviceError::Lost);
         }
         for layout in desc.bind_group_layouts.iter().flatten() {
@@ -4482,16 +4652,11 @@ impl crate::Device for Device {
                 return Err(crate::DeviceError::Lost);
             }
         }
-        let bind_group_layouts = desc
-            .bind_group_layouts
-            .iter()
-            .map(|layout| match layout {
-                Some(Resource::BindGroupLayout(kind)) => Ok(Some(kind.clone())),
-                Some(_) => Err(crate::DeviceError::Lost),
-                None => Ok(None),
-            })
-            .collect::<DeviceResult<Vec<_>>>()?;
-        Ok(Resource::PipelineLayout(bind_group_layouts))
+        #[cfg(target_os = "horizon")]
+        let layout = PipelineLayoutInner::new(desc, self.inner.buffer_pool.clone())?;
+        #[cfg(not(target_os = "horizon"))]
+        let layout = PipelineLayoutInner::new(desc)?;
+        Ok(Resource::PipelineLayout(Arc::new(layout)))
     }
     unsafe fn destroy_pipeline_layout(&self, pipeline_layout: Resource) {}
     unsafe fn create_bind_group(
@@ -4589,9 +4754,9 @@ impl crate::Device for Device {
     unsafe fn destroy_compute_pipeline(&self, pipeline: Resource) {}
     unsafe fn create_pipeline_cache(
         &self,
-        desc: &crate::PipelineCacheDescriptor<'_>,
+        _desc: &crate::PipelineCacheDescriptor<'_>,
     ) -> Result<Resource, crate::PipelineCacheError> {
-        Err(crate::PipelineCacheError::Device(crate::DeviceError::Lost))
+        Ok(Resource::PipelineCache)
     }
     unsafe fn destroy_pipeline_cache(&self, cache: Resource) {}
 

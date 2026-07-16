@@ -95,6 +95,11 @@ enum Command {
         group: alloc::sync::Arc<BindGroupInner>,
         dynamic_offsets: Vec<wgt::DynamicOffset>,
     },
+    SetImmediates {
+        layout: alloc::sync::Arc<super::PipelineLayoutInner>,
+        offset_bytes: u32,
+        data: Vec<u32>,
+    },
     SetViewport {
         rect: crate::Rect<f32>,
         depth_range: Range<f32>,
@@ -235,6 +240,7 @@ impl CommandBuffer {
                         Command::SetVertexBuffer { .. } => "set_vertex_buffer",
                         Command::SetIndexBuffer { .. } => "set_index_buffer",
                         Command::SetBindGroup { .. } => "set_bind_group",
+                        Command::SetImmediates { .. } => "set_immediates",
                         Command::SetViewport { .. } => "set_viewport",
                         Command::SetScissor { .. } => "set_scissor",
                         Command::SetStencilReference { .. } => "set_stencil_reference",
@@ -594,7 +600,19 @@ impl crate::CommandEncoder for CommandBuffer {
         }
     }
     unsafe fn set_immediates(&mut self, layout: &Resource, offset_bytes: u32, data: &[u32]) {
-        self.record_unsupported();
+        let Resource::PipelineLayout(layout) = layout else {
+            self.record_unsupported();
+            return;
+        };
+        if !layout.contains_immediate_range(offset_bytes, data) {
+            self.record_unsupported();
+            return;
+        }
+        self.commands.push(Command::SetImmediates {
+            layout: layout.clone(),
+            offset_bytes,
+            data: data.to_vec(),
+        });
     }
 
     unsafe fn insert_debug_marker(&mut self, label: &str) {}
@@ -1001,6 +1019,13 @@ impl Command {
                 });
                 Ok(())
             }
+            Command::SetImmediates {
+                layout,
+                offset_bytes,
+                data,
+            } => unsafe {
+                submit_set_immediates(queue, surface_queue, layout, *offset_bytes, data)
+            },
             Command::SetViewport { rect, depth_range } => {
                 state.viewport = Some((rect.clone(), depth_range.clone()));
                 Ok(())
@@ -1187,6 +1212,11 @@ mod tests {
     fn copy_dynamic_state_and_resource_transitions_encode_on_forced_host() {
         let mut encoder = CommandBuffer::new();
         let placeholder = Resource::Placeholder;
+        let layout =
+            Resource::PipelineLayout(alloc::sync::Arc::new(super::super::PipelineLayoutInner {
+                immediate_size: 16,
+                bind_group_layouts: Vec::new(),
+            }));
         unsafe {
             encoder.copy_texture_to_texture(
                 &placeholder,
@@ -1196,6 +1226,7 @@ mod tests {
             );
             encoder.set_stencil_reference(0xAB);
             encoder.set_blend_constants(&[0.25, 0.5, 0.75, 1.0]);
+            encoder.set_immediates(&layout, 4, &[1, 2]);
             encoder.transition_textures(core::iter::once(crate::TextureBarrier {
                 texture: &placeholder,
                 range: wgt::ImageSubresourceRange::default(),
@@ -1212,10 +1243,15 @@ mod tests {
                 Command::CopyTextureToTexture { .. },
                 Command::SetStencilReference { reference: 0xAB },
                 Command::SetBlendConstants { .. },
+                Command::SetImmediates {
+                    offset_bytes: 4,
+                    data,
+                    ..
+                },
                 Command::ResourceBarrier {
                     invalidate_flags: DEKO_RESOURCE_TRANSITION_INVALIDATE_FLAGS
                 }
-            ]
+            ] if data == &[1, 2]
         ));
     }
 
@@ -2128,6 +2164,9 @@ unsafe fn submit_dispatch_workgroups(
                 shader.as_ptr(),
                 shader.len() as u32,
             );
+            pipeline
+                .pipeline_layout
+                .bind_immediates(cmdbuf, wgt::ShaderStages::COMPUTE)?;
             for binding in &pipeline.compute_shader.inner.bindings {
                 let group = state
                     .bind_groups
@@ -2197,6 +2236,9 @@ unsafe fn submit_dispatch_workgroups_indirect(
                     shader.as_ptr(),
                     shader.len() as u32,
                 );
+                pipeline
+                    .pipeline_layout
+                    .bind_immediates(cmdbuf, wgt::ShaderStages::COMPUTE)?;
                 for binding in &pipeline.compute_shader.inner.bindings {
                     let group = state
                         .bind_groups
@@ -2339,6 +2381,9 @@ unsafe fn submit_deko_draw(
                 shaders.as_ptr(),
                 shaders.len() as u32,
             );
+            pipeline
+                .pipeline_layout
+                .bind_immediates(cmdbuf, wgt::ShaderStages::VERTEX_FRAGMENT)?;
             let bound_group = |index: u32| {
                 state
                     .bind_groups
@@ -2592,6 +2637,32 @@ unsafe fn submit_dispatch_workgroups_indirect(
     _state: &ExecutionState,
     _buffer: &Buffer,
     _offset: wgt::BufferAddress,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_set_immediates(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    layout: &super::PipelineLayoutInner,
+    offset_bytes: u32,
+    data: &[u32],
+) -> DeviceResult<()> {
+    unsafe {
+        submit_deko_commands(queue, surface_queue, "set_immediates", |cmdbuf| {
+            layout.push_immediates(cmdbuf, offset_bytes, data)
+        })
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_set_immediates(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _layout: &super::PipelineLayoutInner,
+    _offset_bytes: u32,
+    _data: &[u32],
 ) -> DeviceResult<()> {
     Err(crate::DeviceError::Lost)
 }
