@@ -695,6 +695,16 @@ impl<'a, W: Write> Writer<'a, W> {
         handle: Handle<crate::GlobalVariable>,
         global: &crate::GlobalVariable,
     ) -> BackendResult {
+        if matches!(global.space, crate::AddressSpace::Immediate) {
+            if let Some(binding) = self.options.immediates_binding {
+                write!(self.out, "layout(std140, binding = {binding}) uniform ")?;
+                self.write_interface_block(handle, global)?;
+                let global_name = self.get_global_name(handle, global);
+                self.reflection_names_globals.insert(handle, global_name);
+                return Ok(());
+            }
+        }
+
         self.write_global_layout(global)?;
 
         if let crate::AddressSpace::Storage { access } = global.space {

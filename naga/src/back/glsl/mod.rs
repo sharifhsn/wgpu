@@ -336,6 +336,8 @@ pub struct Options {
         serde(deserialize_with = "deserialize_binding_map")
     )]
     pub binding_map: BindingMap,
+    /// Uniform-buffer binding used to emulate the immediate address space.
+    pub immediates_binding: Option<u8>,
     /// Should workgroup variables be zero initialized (by polyfilling)?
     pub zero_initialize_workgroup_memory: bool,
 }
@@ -346,6 +348,7 @@ impl Default for Options {
             version: Version::new_gles(310),
             writer_flags: WriterFlags::ADJUST_COORDINATE_SPACE,
             binding_map: BindingMap::default(),
+            immediates_binding: None,
             zero_initialize_workgroup_memory: true,
         }
     }
