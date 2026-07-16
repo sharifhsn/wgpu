@@ -92,6 +92,7 @@ enum Command {
         clear_values: Vec<Option<wgt::Color>>,
         depth: Option<RawImage>,
         depth_clear_value: Option<f32>,
+        stencil_clear_value: Option<u32>,
         beginning_timestamp: Option<TimestampWrite>,
         end_timestamp: Option<TimestampWrite>,
     },
@@ -617,14 +618,7 @@ impl crate::CommandEncoder for CommandBuffer {
             else {
                 return Err(crate::DeviceError::Lost);
             };
-            if !matches!(
-                *format,
-                wgt::TextureFormat::Rgba8Unorm
-                    | wgt::TextureFormat::Rgba8UnormSrgb
-                    | wgt::TextureFormat::Rg16Float
-                    | wgt::TextureFormat::Rgba16Float
-            ) || *aspect != wgt::TextureAspect::All
-            {
+            if !super::is_color_attachment_format(*format) || *aspect != wgt::TextureAspect::All {
                 return Err(crate::DeviceError::Lost);
             }
             if *sample_count != desc.sample_count {
@@ -677,57 +671,78 @@ impl crate::CommandEncoder for CommandBuffer {
             resolve_images.push(resolve_image);
             clear_values.push(clear_value);
         }
-        let (depth, depth_clear_value) = match desc.depth_stencil_attachment.as_ref() {
-            None => (None, None),
-            Some(depth) => {
-                if !depth
-                    .target
-                    .usage
-                    .contains(wgt::TextureUses::DEPTH_STENCIL_WRITE)
-                {
-                    return Err(crate::DeviceError::Lost);
-                }
-                let Resource::TextureView {
-                    image,
-                    extent,
-                    sample_count,
-                    format,
-                    aspect,
-                    ..
-                } = depth.target.view
-                else {
-                    return Err(crate::DeviceError::Lost);
-                };
-                if extent.width != desc.extent.width
-                    || extent.height != desc.extent.height
-                    || !matches!(
+        let (depth, depth_clear_value, stencil_clear_value) =
+            match desc.depth_stencil_attachment.as_ref() {
+                None => (None, None, None),
+                Some(depth) => {
+                    if !depth
+                        .target
+                        .usage
+                        .contains(wgt::TextureUses::DEPTH_STENCIL_WRITE)
+                    {
+                        return Err(crate::DeviceError::Lost);
+                    }
+                    let Resource::TextureView {
+                        image,
+                        extent,
+                        sample_count,
+                        format,
+                        aspect,
+                        ..
+                    } = depth.target.view
+                    else {
+                        return Err(crate::DeviceError::Lost);
+                    };
+                    if extent.width != desc.extent.width
+                        || extent.height != desc.extent.height
+                        || !super::deko3d_texture_format_capabilities(*format)
+                            .contains(crate::TextureFormatCapabilities::DEPTH_STENCIL_ATTACHMENT)
+                        || !matches!(
+                            *aspect,
+                            wgt::TextureAspect::All | wgt::TextureAspect::DepthOnly
+                        )
+                    {
+                        return Err(crate::DeviceError::Lost);
+                    }
+                    if *sample_count != desc.sample_count {
+                        return Err(crate::DeviceError::Lost);
+                    }
+                    let has_depth = *format != wgt::TextureFormat::Stencil8;
+                    let depth_clear = if !has_depth {
+                        None
+                    } else if depth.depth_ops.contains(crate::AttachmentOps::LOAD_CLEAR) {
+                        Some(depth.clear_value.0)
+                    } else if depth.depth_ops.contains(crate::AttachmentOps::LOAD)
+                        || depth
+                            .depth_ops
+                            .contains(crate::AttachmentOps::LOAD_DONT_CARE)
+                    {
+                        None
+                    } else {
+                        return Err(crate::DeviceError::Lost);
+                    };
+                    let has_stencil = matches!(
                         *format,
-                        wgt::TextureFormat::Depth16Unorm | wgt::TextureFormat::Depth32Float
-                    )
-                    || !matches!(
-                        *aspect,
-                        wgt::TextureAspect::All | wgt::TextureAspect::DepthOnly
-                    )
-                {
-                    return Err(crate::DeviceError::Lost);
+                        wgt::TextureFormat::Stencil8
+                            | wgt::TextureFormat::Depth24PlusStencil8
+                            | wgt::TextureFormat::Depth32FloatStencil8
+                    );
+                    let stencil_clear = if !has_stencil {
+                        None
+                    } else if depth.stencil_ops.contains(crate::AttachmentOps::LOAD_CLEAR) {
+                        Some(depth.clear_value.1)
+                    } else if depth.stencil_ops.contains(crate::AttachmentOps::LOAD)
+                        || depth
+                            .stencil_ops
+                            .contains(crate::AttachmentOps::LOAD_DONT_CARE)
+                    {
+                        None
+                    } else {
+                        return Err(crate::DeviceError::Lost);
+                    };
+                    (Some(*image), depth_clear, stencil_clear)
                 }
-                if *sample_count != desc.sample_count {
-                    return Err(crate::DeviceError::Lost);
-                }
-                let clear = if depth.depth_ops.contains(crate::AttachmentOps::LOAD_CLEAR) {
-                    Some(depth.clear_value.0)
-                } else if depth.depth_ops.contains(crate::AttachmentOps::LOAD)
-                    || depth
-                        .depth_ops
-                        .contains(crate::AttachmentOps::LOAD_DONT_CARE)
-                {
-                    None
-                } else {
-                    return Err(crate::DeviceError::Lost);
-                };
-                (Some(*image), clear)
-            }
-        };
+            };
         if images.iter().all(Option::is_none) && depth.is_none() {
             return Err(crate::DeviceError::Lost);
         }
@@ -740,6 +755,7 @@ impl crate::CommandEncoder for CommandBuffer {
             clear_values,
             depth,
             depth_clear_value,
+            stencil_clear_value,
             beginning_timestamp,
             end_timestamp,
         });
@@ -1128,6 +1144,7 @@ impl Command {
                 clear_values,
                 depth,
                 depth_clear_value,
+                stencil_clear_value,
                 beginning_timestamp,
                 end_timestamp,
             } => {
@@ -1148,6 +1165,7 @@ impl Command {
                         clear_values,
                         *depth,
                         *depth_clear_value,
+                        *stencil_clear_value,
                     )?;
                     if let Some(timestamp) = beginning_timestamp {
                         submit_timestamp_write(queue, surface_queue, timestamp)?;
@@ -1533,9 +1551,10 @@ mod tests {
     #[test]
     fn render_pass_sample_counts_match_deko_modes() {
         assert!(supports_sample_count(1));
+        assert!(supports_sample_count(2));
         assert!(supports_sample_count(4));
-        assert!(!supports_sample_count(2));
-        assert!(!supports_sample_count(8));
+        assert!(supports_sample_count(8));
+        assert!(!supports_sample_count(16));
     }
 
     #[test]
@@ -1916,7 +1935,7 @@ fn timestamp_writes(
 }
 
 fn supports_sample_count(sample_count: u32) -> bool {
-    matches!(sample_count, 1 | 4)
+    matches!(sample_count, 1 | 2 | 4 | 8)
 }
 
 #[cfg(target_os = "horizon")]
@@ -2350,6 +2369,7 @@ unsafe fn submit_begin_render_pass(
     clear_values: &[Option<wgt::Color>],
     depth: Option<RawImage>,
     depth_clear_value: Option<f32>,
+    stencil_clear_value: Option<u32>,
 ) -> DeviceResult<()> {
     unsafe {
         submit_deko_commands(queue, surface_queue, "begin_render_pass", |cmdbuf| {
@@ -2384,8 +2404,18 @@ unsafe fn submit_begin_render_pass(
                     );
                 }
             }
-            if let Some(depth_clear_value) = depth_clear_value {
-                dk::dkCmdBufClearDepthStencil(cmdbuf, true, depth_clear_value, 0, 0);
+            if depth_clear_value.is_some() || stencil_clear_value.is_some() {
+                dk::dkCmdBufClearDepthStencil(
+                    cmdbuf,
+                    depth_clear_value.is_some(),
+                    depth_clear_value.unwrap_or(1.0),
+                    if stencil_clear_value.is_some() {
+                        0xff
+                    } else {
+                        0
+                    },
+                    stencil_clear_value.unwrap_or(0) as u8,
+                );
             }
             Ok(())
         })
@@ -2401,6 +2431,7 @@ unsafe fn submit_begin_render_pass(
     _clear_values: &[Option<wgt::Color>],
     _depth: Option<RawImage>,
     _depth_clear_value: Option<f32>,
+    _stencil_clear_value: Option<u32>,
 ) -> DeviceResult<()> {
     Err(crate::DeviceError::Lost)
 }
@@ -2622,6 +2653,68 @@ unsafe fn submit_draw_indexed_indirect_count(
 }
 
 #[cfg(target_os = "horizon")]
+unsafe fn bind_compute_texture_bindings(
+    cmdbuf: dk::DkCmdBuf,
+    state: &ExecutionState,
+    pipeline: &super::ComputePipelineInnerRaw,
+) -> DeviceResult<()> {
+    let textures = pipeline
+        .compute_shader
+        .inner
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind == ShaderBindingKind::Texture)
+        .collect::<Vec<_>>();
+    if textures.is_empty() {
+        return Ok(());
+    }
+    let bound_group = |index: u32| {
+        state
+            .bind_groups
+            .get(index as usize)
+            .and_then(Option::as_ref)
+            .ok_or(crate::DeviceError::Lost)
+    };
+    let (image_addr, sampler_addr, image_stride, sampler_stride) = textures
+        .iter()
+        .find_map(|binding| {
+            bound_group(binding.group)
+                .ok()
+                .and_then(|group| group.group.texture_descriptor_set())
+        })
+        .ok_or(crate::DeviceError::Lost)?;
+    for binding in textures {
+        let group = bound_group(binding.group)?;
+        unsafe {
+            group.group.push_texture_binding(
+                cmdbuf,
+                image_addr,
+                sampler_addr,
+                image_stride,
+                sampler_stride,
+                binding.group,
+                binding.binding,
+                binding.target,
+                dk::DkStage::DkStage_Compute,
+            )?;
+        }
+    }
+    unsafe {
+        dk::dkCmdBufBindImageDescriptorSet(
+            cmdbuf,
+            image_addr,
+            super::DEKO_TEXTURE_SAMPLER_COUNT as u32,
+        );
+        dk::dkCmdBufBindSamplerDescriptorSet(
+            cmdbuf,
+            sampler_addr,
+            super::DEKO_TEXTURE_SAMPLER_COUNT as u32,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "horizon")]
 unsafe fn submit_dispatch_workgroups(
     queue: &Queue,
     surface_queue: Option<RawQueueHandle>,
@@ -2648,6 +2741,7 @@ unsafe fn submit_dispatch_workgroups(
             pipeline
                 .pipeline_layout
                 .bind_immediates(cmdbuf, wgt::ShaderStages::COMPUTE)?;
+            bind_compute_texture_bindings(cmdbuf, state, pipeline)?;
             for binding in &pipeline.compute_shader.inner.bindings {
                 let group = state
                     .bind_groups
@@ -2676,7 +2770,7 @@ unsafe fn submit_dispatch_workgroups(
                         binding.target,
                         dk::DkStage::DkStage_Compute,
                     )?,
-                    _ => return Err(crate::DeviceError::Lost),
+                    ShaderBindingKind::Texture | ShaderBindingKind::Sampler => {}
                 }
             }
             dk::dkCmdBufDispatchCompute(cmdbuf, count[0], count[1], count[2]);
@@ -2720,6 +2814,7 @@ unsafe fn submit_dispatch_workgroups_indirect(
                 pipeline
                     .pipeline_layout
                     .bind_immediates(cmdbuf, wgt::ShaderStages::COMPUTE)?;
+                bind_compute_texture_bindings(cmdbuf, state, pipeline)?;
                 for binding in &pipeline.compute_shader.inner.bindings {
                     let group = state
                         .bind_groups
@@ -2748,7 +2843,7 @@ unsafe fn submit_dispatch_workgroups_indirect(
                             binding.target,
                             dk::DkStage::DkStage_Compute,
                         )?,
-                        _ => return Err(crate::DeviceError::Lost),
+                        ShaderBindingKind::Texture | ShaderBindingKind::Sampler => {}
                     }
                 }
                 dk::dkCmdBufDispatchComputeIndirect(cmdbuf, dispatch_addr);
@@ -2887,15 +2982,6 @@ unsafe fn submit_deko_draw(
                             .and_then(|group| group.group.texture_descriptor_set())
                     })
                     .ok_or(crate::DeviceError::Lost)?;
-                let descriptor_count = fragment_textures
-                    .iter()
-                    .map(|binding| binding.target)
-                    .max()
-                    .and_then(|target| target.checked_add(1))
-                    .ok_or(crate::DeviceError::Lost)?;
-                if descriptor_count > super::DEKO_TEXTURE_SAMPLER_COUNT as u32 {
-                    return Err(crate::DeviceError::Lost);
-                }
                 for binding in fragment_textures {
                     let group = bound_group(binding.group)?;
                     group.group.push_texture_binding(
@@ -2907,10 +2993,19 @@ unsafe fn submit_deko_draw(
                         binding.group,
                         binding.binding,
                         binding.target,
+                        dk::DkStage::DkStage_Fragment,
                     )?;
                 }
-                dk::dkCmdBufBindImageDescriptorSet(cmdbuf, image_addr, descriptor_count);
-                dk::dkCmdBufBindSamplerDescriptorSet(cmdbuf, sampler_addr, descriptor_count);
+                dk::dkCmdBufBindImageDescriptorSet(
+                    cmdbuf,
+                    image_addr,
+                    super::DEKO_TEXTURE_SAMPLER_COUNT as u32,
+                );
+                dk::dkCmdBufBindSamplerDescriptorSet(
+                    cmdbuf,
+                    sampler_addr,
+                    super::DEKO_TEXTURE_SAMPLER_COUNT as u32,
+                );
             }
             for (bindings, stage) in [
                 (&pipeline.vertex_bindings, dk::DkStage::DkStage_Vertex),

@@ -143,7 +143,7 @@ impl Resource {
 #[derive(Clone, Debug)]
 pub enum BindGroupLayoutKind {
     TextureSamplers {
-        bindings: Vec<(u32, Option<u32>)>,
+        bindings: Vec<(u32, Option<u32>, u32, wgt::ShaderStages)>,
         uniforms: Vec<(u32, wgt::ShaderStages, bool)>,
     },
     UniformBuffers(Vec<(u32, wgt::ShaderStages, bool)>),
@@ -161,6 +161,7 @@ pub enum BindGroupLayoutKind {
         access: wgt::StorageTextureAccess,
         format: wgt::TextureFormat,
         view_dimension: wgt::TextureViewDimension,
+        count: u32,
     },
 }
 
@@ -170,12 +171,14 @@ pub enum BufferBindGroupLayoutKind {
         binding: u32,
         visibility: wgt::ShaderStages,
         has_dynamic_offset: bool,
+        count: u32,
     },
     Storage {
         binding: u32,
         visibility: wgt::ShaderStages,
         read_only: bool,
         has_dynamic_offset: bool,
+        count: u32,
     },
 }
 
@@ -189,6 +192,12 @@ impl BufferBindGroupLayoutKind {
     fn visibility(self) -> wgt::ShaderStages {
         match self {
             Self::Uniform { visibility, .. } | Self::Storage { visibility, .. } => visibility,
+        }
+    }
+
+    fn count(self) -> u32 {
+        match self {
+            Self::Uniform { count, .. } | Self::Storage { count, .. } => count,
         }
     }
 }
@@ -414,6 +423,7 @@ pub(super) enum BindGroupInnerRaw {
 #[cfg(target_os = "horizon")]
 pub(super) struct TextureSamplerBinding {
     texture_binding: u32,
+    visibility: wgt::ShaderStages,
     view_id: u64,
     #[allow(dead_code)]
     texture: Arc<TextureInner>,
@@ -438,7 +448,9 @@ pub(super) struct UniformBufferBinding {
 #[derive(Clone, Debug)]
 pub(super) enum BufferBinding {
     Uniform(UniformBufferBinding),
+    UniformArray(Vec<UniformBufferBinding>),
     Storage(StorageBufferBinding),
+    StorageArray(Vec<StorageBufferBinding>),
 }
 
 #[cfg(target_os = "horizon")]
@@ -457,9 +469,15 @@ pub(super) struct StorageBufferBinding {
 pub(super) struct StorageTextureBinding {
     binding: u32,
     visibility: wgt::ShaderStages,
-    texture: Arc<TextureInner>,
+    elements: Vec<StorageTextureElement>,
     descriptor_mem_block: dk::DkMemBlock,
     image_descriptor_gpu_addr: dk::DkGpuAddr,
+    image_descriptor_stride: u64,
+}
+
+#[cfg(target_os = "horizon")]
+pub(super) struct StorageTextureElement {
+    texture: Arc<TextureInner>,
     image_descriptor: dk::DkImageDescriptor,
 }
 
@@ -679,6 +697,7 @@ const DEKO_COUNTER_REPORT_SIZE: wgt::BufferAddress = 16;
 const DEKO_QUERY_RESULT_SIZE: wgt::BufferAddress = 8;
 const DEKO_UNIFORM_BUF_MAX_SIZE: u64 = 0x10000;
 const DEKO_TEXTURE_SAMPLER_COUNT: usize = 32;
+const DEKO_STORAGE_TEXTURE_COUNT: u32 = 8;
 const DEKO_STORAGE_BUFFER_COUNT: u32 = 16;
 
 static DEFAULT_SURFACE_LEASED: AtomicBool = AtomicBool::new(false);
@@ -1217,54 +1236,75 @@ impl BindGroupInner {
         shader_group: u32,
         binding_number: u32,
         target: u32,
+        stage: dk::DkStage,
     ) -> DeviceResult<()> {
         let BindGroupInnerRaw::TextureSamplers { bindings, .. } = &self.inner else {
             return Err(crate::DeviceError::Lost);
         };
-        let binding = bindings
+        let matching = bindings
             .iter()
-            .find(|binding| binding.texture_binding == binding_number)
-            .ok_or(crate::DeviceError::Lost)?;
-        if target < 64 {
-            let mask = 1_u64 << target;
-            if self
-                .traced_texture_targets
-                .fetch_or(mask, Ordering::Relaxed)
-                & mask
-                == 0
-            {
-                trace::record(format_args!(
-                    "bind bind_group_id={} shader_group={} binding={} native_target={} texture_id={} view_id={} sampler_id={:?}",
-                    self.id,
-                    shader_group,
-                    binding_number,
-                    target,
-                    binding.texture.id(),
-                    binding.view_id,
-                    binding.sampler.as_ref().map(|sampler| sampler.inner.id)
-                ));
-            }
+            .filter(|binding| binding.texture_binding == binding_number)
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            return Err(crate::DeviceError::Lost);
         }
-        let target_offset = u64::from(target);
-        unsafe {
-            dk::dkCmdBufPushData(
-                cmdbuf,
-                image_descriptor_gpu_addr + target_offset * image_descriptor_stride,
-                ptr::addr_of!(binding.image_descriptor).cast(),
-                size_of::<dk::DkImageDescriptor>() as u32,
-            );
-            dk::dkCmdBufPushData(
-                cmdbuf,
-                sampler_descriptor_gpu_addr + target_offset * sampler_descriptor_stride,
-                ptr::addr_of!(binding.sampler_descriptor).cast(),
-                size_of::<dk::DkSamplerDescriptor>() as u32,
-            );
-            dk::dkCmdBufBindTexture(
-                cmdbuf,
-                dk::DkStage::DkStage_Fragment,
-                target,
-                dk::dkMakeTextureHandle(target, target),
-            );
+        let stage_visibility = match stage {
+            dk::DkStage::DkStage_Vertex => wgt::ShaderStages::VERTEX,
+            dk::DkStage::DkStage_Fragment => wgt::ShaderStages::FRAGMENT,
+            dk::DkStage::DkStage_Compute => wgt::ShaderStages::COMPUTE,
+            _ => return Err(crate::DeviceError::Lost),
+        };
+        if matching
+            .iter()
+            .any(|binding| !binding.visibility.contains(stage_visibility))
+        {
+            return Err(crate::DeviceError::Lost);
+        }
+        for (array_index, binding) in matching.into_iter().enumerate() {
+            let target = target
+                .checked_add(u32::try_from(array_index).map_err(|_| crate::DeviceError::Lost)?)
+                .ok_or(crate::DeviceError::Lost)?;
+            if target < 64 {
+                let mask = 1_u64 << target;
+                if self
+                    .traced_texture_targets
+                    .fetch_or(mask, Ordering::Relaxed)
+                    & mask
+                    == 0
+                {
+                    trace::record(format_args!(
+                        "bind bind_group_id={} shader_group={} binding={} native_target={} texture_id={} view_id={} sampler_id={:?}",
+                        self.id,
+                        shader_group,
+                        binding_number,
+                        target,
+                        binding.texture.id(),
+                        binding.view_id,
+                        binding.sampler.as_ref().map(|sampler| sampler.inner.id)
+                    ));
+                }
+            }
+            let target_offset = u64::from(target);
+            unsafe {
+                dk::dkCmdBufPushData(
+                    cmdbuf,
+                    image_descriptor_gpu_addr + target_offset * image_descriptor_stride,
+                    ptr::addr_of!(binding.image_descriptor).cast(),
+                    size_of::<dk::DkImageDescriptor>() as u32,
+                );
+                dk::dkCmdBufPushData(
+                    cmdbuf,
+                    sampler_descriptor_gpu_addr + target_offset * sampler_descriptor_stride,
+                    ptr::addr_of!(binding.sampler_descriptor).cast(),
+                    size_of::<dk::DkSamplerDescriptor>() as u32,
+                );
+                dk::dkCmdBufBindTexture(
+                    cmdbuf,
+                    stage,
+                    target,
+                    dk::dkMakeTextureHandle(target, target),
+                );
+            }
         }
         Ok(())
     }
@@ -1286,15 +1326,34 @@ impl BindGroupInner {
                 let index = bindings
                     .iter()
                     .position(|binding| {
-                        matches!(binding, BufferBinding::Uniform(uniform) if uniform.binding == binding_number)
+                        matches!(binding,
+                            BufferBinding::Uniform(uniform) if uniform.binding == binding_number
+                        ) || matches!(binding,
+                            BufferBinding::UniformArray(array) if array.first().is_some_and(|uniform| uniform.binding == binding_number)
+                        )
                     })
                     .ok_or(crate::DeviceError::Lost)?;
-                let BufferBinding::Uniform(binding) = &bindings[index] else {
-                    return Err(crate::DeviceError::Lost);
-                };
-                let dynamic_offset = grouped_dynamic_offset(bindings, index, dynamic_offsets)?;
-                return unsafe {
-                    bind_uniform_buffer(cmdbuf, binding, dynamic_offset, target, stage)
+                return match &bindings[index] {
+                    BufferBinding::Uniform(binding) => {
+                        let dynamic_offset =
+                            grouped_dynamic_offset(bindings, index, dynamic_offsets)?;
+                        unsafe {
+                            bind_uniform_buffer(cmdbuf, binding, dynamic_offset, target, stage)
+                        }
+                    }
+                    BufferBinding::UniformArray(array) if dynamic_offsets.is_empty() => {
+                        for (array_index, binding) in array.iter().enumerate() {
+                            let target = target
+                                .checked_add(
+                                    u32::try_from(array_index)
+                                        .map_err(|_| crate::DeviceError::Lost)?,
+                                )
+                                .ok_or(crate::DeviceError::Lost)?;
+                            unsafe { bind_uniform_buffer(cmdbuf, binding, 0, target, stage)? };
+                        }
+                        Ok(())
+                    }
+                    _ => Err(crate::DeviceError::Lost),
                 };
             }
             BindGroupInnerRaw::StorageTexture(_) => return Err(crate::DeviceError::Lost),
@@ -1343,39 +1402,87 @@ impl BindGroupInner {
                 let index = bindings
                     .iter()
                     .position(|binding| {
-                        matches!(binding, BufferBinding::Storage(storage) if storage.binding == binding_number)
+                        matches!(binding,
+                            BufferBinding::Storage(storage) if storage.binding == binding_number
+                        ) || matches!(binding,
+                            BufferBinding::StorageArray(array) if array.first().is_some_and(|storage| storage.binding == binding_number)
+                        )
                     })
                     .ok_or(crate::DeviceError::Lost)?;
-                let BufferBinding::Storage(binding) = &bindings[index] else {
-                    return Err(crate::DeviceError::Lost);
-                };
-                (
-                    binding,
-                    grouped_dynamic_offset(bindings, index, dynamic_offsets)?,
-                )
+                match &bindings[index] {
+                    BufferBinding::Storage(binding) => (
+                        binding,
+                        grouped_dynamic_offset(bindings, index, dynamic_offsets)?,
+                    ),
+                    BufferBinding::StorageArray(array) if dynamic_offsets.is_empty() => {
+                        for (array_index, binding) in array.iter().enumerate() {
+                            let target = target
+                                .checked_add(
+                                    u32::try_from(array_index)
+                                        .map_err(|_| crate::DeviceError::Lost)?,
+                                )
+                                .ok_or(crate::DeviceError::Lost)?;
+                            unsafe {
+                                bind_storage_buffer(
+                                    cmdbuf,
+                                    binding,
+                                    binding_number,
+                                    0,
+                                    target,
+                                    stage,
+                                )?
+                            };
+                        }
+                        return Ok(());
+                    }
+                    _ => return Err(crate::DeviceError::Lost),
+                }
             }
             _ => return Err(crate::DeviceError::Lost),
         };
-        if dynamic_offset % u64::from(wgt::STORAGE_BINDING_SIZE_ALIGNMENT) != 0
-            || binding.binding != binding_number
-            || !binding.visibility.contains(match stage {
-                dk::DkStage::DkStage_Vertex => wgt::ShaderStages::VERTEX,
-                dk::DkStage::DkStage_Fragment => wgt::ShaderStages::FRAGMENT,
-                dk::DkStage::DkStage_Compute => wgt::ShaderStages::COMPUTE,
-                _ => return Err(crate::DeviceError::Lost),
-            })
-        {
-            return Err(crate::DeviceError::Lost);
+        unsafe {
+            bind_storage_buffer(
+                cmdbuf,
+                binding,
+                binding_number,
+                dynamic_offset,
+                target,
+                stage,
+            )
         }
-        let offset = binding
-            .offset
-            .checked_add(dynamic_offset)
-            .ok_or(crate::DeviceError::Lost)?;
-        let (gpu_addr, gpu_size) = binding.buffer.gpu_binding(offset, binding.size)?;
-        unsafe { dk::dkCmdBufBindStorageBuffer(cmdbuf, stage, target, gpu_addr, gpu_size) };
-        Ok(())
     }
+}
 
+#[cfg(target_os = "horizon")]
+unsafe fn bind_storage_buffer(
+    cmdbuf: dk::DkCmdBuf,
+    binding: &StorageBufferBinding,
+    binding_number: u32,
+    dynamic_offset: u64,
+    target: u32,
+    stage: dk::DkStage,
+) -> DeviceResult<()> {
+    if dynamic_offset % u64::from(wgt::STORAGE_BINDING_SIZE_ALIGNMENT) != 0
+        || binding.binding != binding_number
+        || !binding.visibility.contains(match stage {
+            dk::DkStage::DkStage_Vertex => wgt::ShaderStages::VERTEX,
+            dk::DkStage::DkStage_Fragment => wgt::ShaderStages::FRAGMENT,
+            dk::DkStage::DkStage_Compute => wgt::ShaderStages::COMPUTE,
+            _ => return Err(crate::DeviceError::Lost),
+        })
+    {
+        return Err(crate::DeviceError::Lost);
+    }
+    let offset = binding
+        .offset
+        .checked_add(dynamic_offset)
+        .ok_or(crate::DeviceError::Lost)?;
+    let (gpu_addr, gpu_size) = binding.buffer.gpu_binding(offset, binding.size)?;
+    unsafe { dk::dkCmdBufBindStorageBuffer(cmdbuf, stage, target, gpu_addr, gpu_size) };
+    Ok(())
+}
+
+impl BindGroupInner {
     #[cfg(target_os = "horizon")]
     pub(super) unsafe fn bind_storage_texture(
         &self,
@@ -1401,14 +1508,32 @@ impl BindGroupInner {
             return Err(crate::DeviceError::Lost);
         }
         unsafe {
-            dk::dkCmdBufPushData(
+            for (array_index, element) in binding.elements.iter().enumerate() {
+                let index = u32::try_from(array_index).map_err(|_| crate::DeviceError::Lost)?;
+                let descriptor_address = binding
+                    .image_descriptor_gpu_addr
+                    .checked_add(u64::from(index) * binding.image_descriptor_stride)
+                    .ok_or(crate::DeviceError::Lost)?;
+                dk::dkCmdBufPushData(
+                    cmdbuf,
+                    descriptor_address,
+                    ptr::addr_of!(element.image_descriptor).cast(),
+                    size_of::<dk::DkImageDescriptor>() as u32,
+                );
+            }
+            dk::dkCmdBufBindImageDescriptorSet(
                 cmdbuf,
                 binding.image_descriptor_gpu_addr,
-                ptr::addr_of!(binding.image_descriptor).cast(),
-                size_of::<dk::DkImageDescriptor>() as u32,
+                binding.elements.len() as u32,
             );
-            dk::dkCmdBufBindImageDescriptorSet(cmdbuf, binding.image_descriptor_gpu_addr, 1);
-            dk::dkCmdBufBindImage(cmdbuf, stage, target, dk::dkMakeImageHandle(0));
+            for index in 0..binding.elements.len() as u32 {
+                dk::dkCmdBufBindImage(
+                    cmdbuf,
+                    stage,
+                    target.checked_add(index).ok_or(crate::DeviceError::Lost)?,
+                    dk::dkMakeImageHandle(index),
+                );
+            }
         }
         Ok(())
     }
@@ -1422,13 +1547,17 @@ fn grouped_dynamic_offset(
 ) -> DeviceResult<u64> {
     let has_dynamic_offset = match &bindings[binding_index] {
         BufferBinding::Uniform(binding) => binding.has_dynamic_offset,
+        BufferBinding::UniformArray(_) => false,
         BufferBinding::Storage(binding) => binding.has_dynamic_offset,
+        BufferBinding::StorageArray(_) => false,
     };
     let dynamic_count = bindings
         .iter()
         .filter(|binding| match binding {
             BufferBinding::Uniform(binding) => binding.has_dynamic_offset,
+            BufferBinding::UniformArray(_) => false,
             BufferBinding::Storage(binding) => binding.has_dynamic_offset,
+            BufferBinding::StorageArray(_) => false,
         })
         .count();
     if dynamic_count != dynamic_offsets.len() {
@@ -1441,7 +1570,9 @@ fn grouped_dynamic_offset(
         .iter()
         .filter(|binding| match binding {
             BufferBinding::Uniform(binding) => binding.has_dynamic_offset,
+            BufferBinding::UniformArray(_) => false,
             BufferBinding::Storage(binding) => binding.has_dynamic_offset,
+            BufferBinding::StorageArray(_) => false,
         })
         .count();
     dynamic_offsets
@@ -1843,13 +1974,7 @@ impl RenderPipelineInner {
                 blend_states.push(dk::DkBlendState::defaults());
                 continue;
             };
-            if !matches!(
-                target.format,
-                wgt::TextureFormat::Rgba8Unorm
-                    | wgt::TextureFormat::Rgba8UnormSrgb
-                    | wgt::TextureFormat::Rg16Float
-                    | wgt::TextureFormat::Rgba16Float
-            ) {
+            if !is_color_attachment_format(target.format) {
                 return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
             }
             let (mapped_color_state, blend_state) = map_blend_state(target.blend)?;
@@ -2020,7 +2145,9 @@ fn map_primitive_topology(
 fn map_sample_count(sample_count: u32) -> DeviceResult<dk::DkMsMode> {
     match sample_count {
         1 => Ok(dk::DkMsMode::DkMsMode_1x),
+        2 => Ok(dk::DkMsMode::DkMsMode_2x),
         4 => Ok(dk::DkMsMode::DkMsMode_4x),
+        8 => Ok(dk::DkMsMode::DkMsMode_8x),
         _ => Err(crate::DeviceError::Lost),
     }
 }
@@ -2089,7 +2216,7 @@ fn map_depth_stencil_state_expanded(
     Ok(state)
 }
 
-#[cfg(target_os = "horizon")]
+#[cfg(any(target_os = "horizon", test))]
 fn map_stencil_face_state(
     state: &mut dk::DkDepthStencilState,
     front: bool,
@@ -2107,7 +2234,7 @@ fn map_stencil_face_state(
     Ok(())
 }
 
-#[cfg(target_os = "horizon")]
+#[cfg(any(target_os = "horizon", test))]
 fn map_stencil_operation(operation: wgt::StencilOperation) -> dk::DkStencilOp {
     match operation {
         wgt::StencilOperation::Keep => dk::DkStencilOp::DkStencilOp_Keep,
@@ -2121,7 +2248,7 @@ fn map_stencil_operation(operation: wgt::StencilOperation) -> dk::DkStencilOp {
     }
 }
 
-#[cfg(target_os = "horizon")]
+#[cfg(any(target_os = "horizon", test))]
 fn map_compare_function_expanded(compare: wgt::CompareFunction) -> dk::DkCompareOp {
     match compare {
         wgt::CompareFunction::Never => dk::DkCompareOp::DkCompareOp_Never,
@@ -2250,21 +2377,9 @@ fn map_blend_factor(factor: wgt::BlendFactor) -> Result<dk::DkBlendFactor, crate
 #[cfg(target_os = "horizon")]
 impl TextureInner {
     unsafe fn new(raw_device: dk::DkDevice, desc: &crate::TextureDescriptor) -> DeviceResult<Self> {
-        if !matches!(
-            desc.format,
-            wgt::TextureFormat::Rgba8Unorm
-                | wgt::TextureFormat::Rgba8UnormSrgb
-                | wgt::TextureFormat::R8Unorm
-                | wgt::TextureFormat::Rg8Unorm
-                | wgt::TextureFormat::Rg16Float
-                | wgt::TextureFormat::Rgba16Float
-                | wgt::TextureFormat::Rgba32Float
-                | wgt::TextureFormat::Rgb9e5Ufloat
-                | wgt::TextureFormat::R32Float
-                | wgt::TextureFormat::Depth16Unorm
-                | wgt::TextureFormat::Depth32Float
-        ) || desc.mip_level_count == 0
-            || !matches!(desc.sample_count, 1 | 4)
+        if map_texture_image_format(desc.format).is_none()
+            || desc.mip_level_count == 0
+            || !matches!(desc.sample_count, 1 | 2 | 4 | 8)
             || desc.size.width == 0
             || desc.size.height == 0
             || desc.size.depth_or_array_layers == 0
@@ -2280,7 +2395,11 @@ impl TextureInner {
         }
         let is_depth = matches!(
             desc.format,
-            wgt::TextureFormat::Depth16Unorm | wgt::TextureFormat::Depth32Float
+            wgt::TextureFormat::Depth16Unorm
+                | wgt::TextureFormat::Depth32Float
+                | wgt::TextureFormat::Depth24PlusStencil8
+                | wgt::TextureFormat::Depth32FloatStencil8
+                | wgt::TextureFormat::Stencil8
         );
         if is_depth && !desc.usage.contains(wgt::TextureUses::DEPTH_STENCIL_WRITE) {
             return Err(crate::DeviceError::Lost);
@@ -2464,6 +2583,7 @@ impl BindGroupInner {
                 access,
                 format,
                 view_dimension,
+                count,
             } => unsafe {
                 Self::new_storage_texture(
                     raw_device,
@@ -2473,6 +2593,7 @@ impl BindGroupInner {
                     *access,
                     *format,
                     *view_dimension,
+                    *count,
                 )
             },
         }
@@ -2481,108 +2602,140 @@ impl BindGroupInner {
     unsafe fn new_texture_samplers(
         raw_device: dk::DkDevice,
         desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
-        layout_bindings: &[(u32, Option<u32>)],
+        layout_bindings: &[(u32, Option<u32>, u32, wgt::ShaderStages)],
         uniform_layouts: &[(u32, wgt::ShaderStages, bool)],
     ) -> DeviceResult<Self> {
         if layout_bindings.is_empty()
-            || layout_bindings.len() > DEKO_TEXTURE_SAMPLER_COUNT
+            || layout_bindings
+                .iter()
+                .map(|(_, _, count, _)| *count as usize)
+                .sum::<usize>()
+                > DEKO_TEXTURE_SAMPLER_COUNT
             || desc.buffers.len() != uniform_layouts.len()
             || desc.samplers.len()
                 != layout_bindings
                     .iter()
-                    .filter(|(_, sampler)| sampler.is_some())
-                    .count()
-            || desc.textures.len() != layout_bindings.len()
+                    .filter_map(|(_, sampler, count, _)| sampler.map(|_| *count as usize))
+                    .sum::<usize>()
+            || desc.textures.len()
+                != layout_bindings
+                    .iter()
+                    .map(|(_, _, count, _)| *count as usize)
+                    .sum::<usize>()
             || !desc.acceleration_structures.is_empty()
             || !desc.external_textures.is_empty()
             || desc.entries.len()
-                != layout_bindings.len() + desc.samplers.len() + uniform_layouts.len()
+                != layout_bindings.len()
+                    + layout_bindings
+                        .iter()
+                        .filter(|(_, sampler, _, _)| sampler.is_some())
+                        .count()
+                    + uniform_layouts.len()
         {
             return Err(crate::DeviceError::Lost);
         }
-        let mut bindings = Vec::with_capacity(layout_bindings.len());
-        for (index, &(texture_binding, sampler_binding)) in layout_bindings.iter().enumerate() {
+        let mut bindings = Vec::with_capacity(desc.textures.len());
+        for &(texture_binding, sampler_binding, count, visibility) in layout_bindings {
             let texture_entry = desc
                 .entries
                 .iter()
                 .find(|entry| entry.binding == texture_binding)
                 .ok_or(crate::DeviceError::Lost)?;
-            if texture_entry.count != 1 {
+            if texture_entry.count != count {
                 return Err(crate::DeviceError::Lost);
             }
             let texture_resource_index = usize::try_from(texture_entry.resource_index)
                 .map_err(|_| crate::DeviceError::Lost)?;
-            let sampler = if let Some(sampler_binding) = sampler_binding {
+            let sampler_entry = if let Some(sampler_binding) = sampler_binding {
                 let sampler_entry = desc
                     .entries
                     .iter()
                     .find(|entry| entry.binding == sampler_binding)
                     .ok_or(crate::DeviceError::Lost)?;
-                if sampler_entry.count != 1 {
+                if sampler_entry.count != count {
                     return Err(crate::DeviceError::Lost);
                 }
-                let sampler_resource_index = usize::try_from(sampler_entry.resource_index)
-                    .map_err(|_| crate::DeviceError::Lost)?;
-                let Resource::Sampler(sampler) = desc
-                    .samplers
-                    .get(sampler_resource_index)
-                    .ok_or(crate::DeviceError::Lost)?
-                else {
-                    return Err(crate::DeviceError::Lost);
-                };
-                Some(sampler.clone())
+                Some(sampler_entry)
             } else {
                 None
             };
-            let texture = desc
-                .textures
-                .get(texture_resource_index)
-                .ok_or(crate::DeviceError::Lost)?;
-            if !texture.usage.contains(wgt::TextureUses::RESOURCE) {
-                return Err(crate::DeviceError::Lost);
+            for array_index in 0..usize::try_from(count).map_err(|_| crate::DeviceError::Lost)? {
+                let sampler = if let Some(sampler_entry) = sampler_entry {
+                    let sampler_resource_index = usize::try_from(sampler_entry.resource_index)
+                        .map_err(|_| crate::DeviceError::Lost)?
+                        .checked_add(array_index)
+                        .ok_or(crate::DeviceError::Lost)?;
+                    let Resource::Sampler(sampler) = desc
+                        .samplers
+                        .get(sampler_resource_index)
+                        .ok_or(crate::DeviceError::Lost)?
+                    else {
+                        return Err(crate::DeviceError::Lost);
+                    };
+                    Some(sampler.clone())
+                } else {
+                    None
+                };
+                let texture = desc
+                    .textures
+                    .get(
+                        texture_resource_index
+                            .checked_add(array_index)
+                            .ok_or(crate::DeviceError::Lost)?,
+                    )
+                    .ok_or(crate::DeviceError::Lost)?;
+                if !texture.usage.contains(wgt::TextureUses::RESOURCE) {
+                    return Err(crate::DeviceError::Lost);
+                }
+                let Resource::TextureView {
+                    id: view_id,
+                    image,
+                    format,
+                    aspect,
+                    view_dimension,
+                    owner: Some(owner),
+                    ..
+                } = texture.view
+                else {
+                    return Err(crate::DeviceError::Lost);
+                };
+                if !matches!(
+                    aspect,
+                    wgt::TextureAspect::All | wgt::TextureAspect::DepthOnly
+                ) {
+                    return Err(crate::DeviceError::Lost);
+                }
+                let mut image_descriptor = dk::DkImageDescriptor::zeroed();
+                let mut image_view = image.1;
+                image_view.format =
+                    map_texture_image_format(*format).ok_or(crate::DeviceError::Lost)?;
+                if let Some(view_type) = map_texture_view_dimension(*view_dimension) {
+                    image_view.type_ = view_type;
+                }
+                let mut sampler_descriptor = dk::DkSamplerDescriptor::zeroed();
+                let default_sampler = dk::DkSampler::defaults();
+                let raw_sampler = sampler
+                    .as_ref()
+                    .map_or(&default_sampler, |sampler| &sampler.inner.sampler);
+                unsafe {
+                    dk::dkImageDescriptorInitialize(
+                        &mut image_descriptor,
+                        &image_view,
+                        false,
+                        false,
+                    );
+                    dk::dkSamplerDescriptorInitialize(&mut sampler_descriptor, raw_sampler);
+                }
+                bindings.push(TextureSamplerBinding {
+                    texture_binding,
+                    visibility,
+                    view_id: *view_id,
+                    texture: owner.clone(),
+                    sampler,
+                    image_descriptor,
+                    sampler_descriptor,
+                });
             }
-            let Resource::TextureView {
-                id: view_id,
-                image,
-                format,
-                aspect,
-                view_dimension,
-                owner: Some(owner),
-                ..
-            } = texture.view
-            else {
-                return Err(crate::DeviceError::Lost);
-            };
-            if !matches!(
-                aspect,
-                wgt::TextureAspect::All | wgt::TextureAspect::DepthOnly
-            ) {
-                return Err(crate::DeviceError::Lost);
-            }
-            let mut image_descriptor = dk::DkImageDescriptor::zeroed();
-            let mut image_view = image.1;
-            image_view.format =
-                map_texture_image_format(*format).ok_or(crate::DeviceError::Lost)?;
-            if let Some(view_type) = map_texture_view_dimension(*view_dimension) {
-                image_view.type_ = view_type;
-            }
-            let mut sampler_descriptor = dk::DkSamplerDescriptor::zeroed();
-            let default_sampler = dk::DkSampler::defaults();
-            let raw_sampler = sampler
-                .as_ref()
-                .map_or(&default_sampler, |sampler| &sampler.inner.sampler);
-            unsafe {
-                dk::dkImageDescriptorInitialize(&mut image_descriptor, &image_view, false, false);
-                dk::dkSamplerDescriptorInitialize(&mut sampler_descriptor, raw_sampler);
-            }
-            bindings.push(TextureSamplerBinding {
-                texture_binding,
-                view_id: *view_id,
-                texture: owner.clone(),
-                sampler,
-                image_descriptor,
-                sampler_descriptor,
-            });
         }
         let uniforms = Self::uniform_buffer_bindings(desc, uniform_layouts)?;
 
@@ -2638,10 +2791,11 @@ impl BindGroupInner {
         access: wgt::StorageTextureAccess,
         format: wgt::TextureFormat,
         view_dimension: wgt::TextureViewDimension,
+        count: u32,
     ) -> DeviceResult<Self> {
         if !desc.buffers.is_empty()
             || !desc.samplers.is_empty()
-            || desc.textures.len() != 1
+            || desc.textures.len() != count as usize
             || !desc.acceleration_structures.is_empty()
             || !desc.external_textures.is_empty()
             || desc.entries.len() != 1
@@ -2649,7 +2803,7 @@ impl BindGroupInner {
             return Err(crate::DeviceError::Lost);
         }
         let entry = &desc.entries[0];
-        if entry.binding != binding || entry.resource_index != 0 || entry.count != 1 {
+        if entry.binding != binding || entry.resource_index != 0 || entry.count != count {
             return Err(crate::DeviceError::Lost);
         }
         let required_usage = match access {
@@ -2658,28 +2812,13 @@ impl BindGroupInner {
             wgt::StorageTextureAccess::ReadWrite => wgt::TextureUses::STORAGE_READ_WRITE,
             _ => return Err(crate::DeviceError::Lost),
         };
-        let texture_binding = &desc.textures[0];
-        if !texture_binding.usage.contains(required_usage) {
-            return Err(crate::DeviceError::Lost);
-        }
-        let Resource::TextureView {
-            image,
-            format: view_format,
-            view_dimension: actual_dimension,
-            owner: Some(texture),
-            ..
-        } = texture_binding.view
-        else {
-            return Err(crate::DeviceError::Lost);
-        };
-        if *view_format != format || *actual_dimension != view_dimension {
-            return Err(crate::DeviceError::Lost);
-        }
-
-        let descriptor_size = align_up(
+        let descriptor_stride = align_up(
             size_of::<dk::DkImageDescriptor>() as u32,
             dk::DK_IMAGE_DESCRIPTOR_ALIGNMENT,
         );
+        let descriptor_size = descriptor_stride
+            .checked_mul(count)
+            .ok_or(crate::DeviceError::OutOfMemory)?;
         let allocation_size = align_up(descriptor_size, dk::DK_MEMBLOCK_ALIGNMENT);
         let mut maker = dk::DkMemBlockMaker::defaults(raw_device, allocation_size);
         maker.flags = dk::DkMemBlockFlags_CpuUncached | dk::DkMemBlockFlags_GpuCached;
@@ -2692,16 +2831,41 @@ impl BindGroupInner {
             unsafe { dk::dkMemBlockDestroy(descriptor_mem_block) };
             return Err(crate::DeviceError::Lost);
         }
-        let mut image_descriptor = dk::DkImageDescriptor::zeroed();
-        unsafe { dk::dkImageDescriptorInitialize(&mut image_descriptor, &image.1, true, false) };
+        let mut elements = Vec::with_capacity(count as usize);
+        for texture_binding in desc.textures {
+            if !texture_binding.usage.contains(required_usage) {
+                return Err(crate::DeviceError::Lost);
+            }
+            let Resource::TextureView {
+                image,
+                format: view_format,
+                view_dimension: actual_dimension,
+                owner: Some(texture),
+                ..
+            } = texture_binding.view
+            else {
+                return Err(crate::DeviceError::Lost);
+            };
+            if *view_format != format || *actual_dimension != view_dimension {
+                return Err(crate::DeviceError::Lost);
+            }
+            let mut image_descriptor = dk::DkImageDescriptor::zeroed();
+            unsafe {
+                dk::dkImageDescriptorInitialize(&mut image_descriptor, &image.1, true, false)
+            };
+            elements.push(StorageTextureElement {
+                texture: texture.clone(),
+                image_descriptor,
+            });
+        }
         Ok(Self {
             inner: BindGroupInnerRaw::StorageTexture(StorageTextureBinding {
                 binding,
                 visibility,
-                texture: texture.clone(),
+                elements,
                 descriptor_mem_block,
                 image_descriptor_gpu_addr,
-                image_descriptor,
+                image_descriptor_stride: u64::from(descriptor_stride),
             }),
             id: trace::resource_id(),
             label: desc.label.map(String::from),
@@ -2808,7 +2972,13 @@ impl BindGroupInner {
         desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
         layout_entries: &[BufferBindGroupLayoutKind],
     ) -> DeviceResult<Self> {
-        if desc.buffers.len() != layout_entries.len()
+        let expected_buffers = layout_entries
+            .iter()
+            .try_fold(0usize, |total, entry| {
+                total.checked_add(entry.count() as usize)
+            })
+            .ok_or(crate::DeviceError::Lost)?;
+        if desc.buffers.len() != expected_buffers
             || !desc.samplers.is_empty()
             || !desc.textures.is_empty()
             || !desc.acceleration_structures.is_empty()
@@ -2827,10 +2997,16 @@ impl BindGroupInner {
             else {
                 return Err(crate::DeviceError::Lost);
             };
-            if entry.count != 1 {
+            if entry.count != layout_entry.count() {
                 return Err(crate::DeviceError::Lost);
             }
-            let Some(buffer) = desc.buffers.get(entry.resource_index as usize) else {
+            let start =
+                usize::try_from(entry.resource_index).map_err(|_| crate::DeviceError::Lost)?;
+            let count = usize::try_from(entry.count).map_err(|_| crate::DeviceError::Lost)?;
+            let Some(resources) = desc
+                .buffers
+                .get(start..start.checked_add(count).ok_or(crate::DeviceError::Lost)?)
+            else {
                 return Err(crate::DeviceError::Lost);
             };
 
@@ -2839,27 +3015,49 @@ impl BindGroupInner {
                     binding,
                     visibility,
                     has_dynamic_offset,
+                    count,
                 } => {
-                    bindings.push(BufferBinding::Uniform(Self::make_uniform_buffer_binding(
-                        binding,
-                        visibility,
-                        has_dynamic_offset,
-                        buffer,
-                    )?));
+                    let array = resources
+                        .iter()
+                        .map(|buffer| {
+                            Self::make_uniform_buffer_binding(
+                                binding,
+                                visibility,
+                                has_dynamic_offset,
+                                buffer,
+                            )
+                        })
+                        .collect::<DeviceResult<Vec<_>>>()?;
+                    if count == 1 {
+                        bindings.push(BufferBinding::Uniform(array.into_iter().next().unwrap()));
+                    } else {
+                        bindings.push(BufferBinding::UniformArray(array));
+                    }
                 }
                 BufferBindGroupLayoutKind::Storage {
                     binding,
                     visibility,
                     read_only,
                     has_dynamic_offset,
+                    count,
                 } => {
-                    bindings.push(BufferBinding::Storage(Self::make_storage_buffer_binding(
-                        binding,
-                        visibility,
-                        read_only,
-                        has_dynamic_offset,
-                        buffer,
-                    )?));
+                    let array = resources
+                        .iter()
+                        .map(|buffer| {
+                            Self::make_storage_buffer_binding(
+                                binding,
+                                visibility,
+                                read_only,
+                                has_dynamic_offset,
+                                buffer,
+                            )
+                        })
+                        .collect::<DeviceResult<Vec<_>>>()?;
+                    if count == 1 {
+                        bindings.push(BufferBinding::Storage(array.into_iter().next().unwrap()));
+                    } else {
+                        bindings.push(BufferBinding::StorageArray(array));
+                    }
                 }
             }
         }
@@ -3139,21 +3337,150 @@ fn map_color_write_state(mask: wgt::ColorWrites) -> dk::DkColorWriteState {
 #[cfg(any(target_os = "horizon", test))]
 fn map_texture_image_format(format: wgt::TextureFormat) -> Option<dk::DkImageFormat> {
     match format {
+        wgt::TextureFormat::R8Unorm => Some(dk::DkImageFormat::DkImageFormat_R8_Unorm),
+        wgt::TextureFormat::R8Uint => Some(dk::DkImageFormat::DkImageFormat_R8_Uint),
+        wgt::TextureFormat::R8Sint => Some(dk::DkImageFormat::DkImageFormat_R8_Sint),
+        wgt::TextureFormat::R8Snorm => Some(dk::DkImageFormat::DkImageFormat_R8_Snorm),
+        wgt::TextureFormat::Rg8Unorm => Some(dk::DkImageFormat::DkImageFormat_RG8_Unorm),
+        wgt::TextureFormat::Rg8Uint => Some(dk::DkImageFormat::DkImageFormat_RG8_Uint),
+        wgt::TextureFormat::Rg8Sint => Some(dk::DkImageFormat::DkImageFormat_RG8_Sint),
+        wgt::TextureFormat::Rg8Snorm => Some(dk::DkImageFormat::DkImageFormat_RG8_Snorm),
+        wgt::TextureFormat::R16Float => Some(dk::DkImageFormat::DkImageFormat_R16_Float),
+        wgt::TextureFormat::R16Unorm => Some(dk::DkImageFormat::DkImageFormat_R16_Unorm),
+        wgt::TextureFormat::R16Snorm => Some(dk::DkImageFormat::DkImageFormat_R16_Snorm),
+        wgt::TextureFormat::R16Uint => Some(dk::DkImageFormat::DkImageFormat_R16_Uint),
+        wgt::TextureFormat::R16Sint => Some(dk::DkImageFormat::DkImageFormat_R16_Sint),
+        wgt::TextureFormat::Rg16Float => Some(dk::DkImageFormat::DkImageFormat_RG16_Float),
+        wgt::TextureFormat::Rg16Unorm => Some(dk::DkImageFormat::DkImageFormat_RG16_Unorm),
+        wgt::TextureFormat::Rg16Snorm => Some(dk::DkImageFormat::DkImageFormat_RG16_Snorm),
+        wgt::TextureFormat::Rg16Uint => Some(dk::DkImageFormat::DkImageFormat_RG16_Uint),
+        wgt::TextureFormat::Rg16Sint => Some(dk::DkImageFormat::DkImageFormat_RG16_Sint),
+        wgt::TextureFormat::R32Float => Some(dk::DkImageFormat::DkImageFormat_R32_Float),
+        wgt::TextureFormat::R32Uint => Some(dk::DkImageFormat::DkImageFormat_R32_Uint),
+        wgt::TextureFormat::R32Sint => Some(dk::DkImageFormat::DkImageFormat_R32_Sint),
+        wgt::TextureFormat::Rg32Float => Some(dk::DkImageFormat::DkImageFormat_RG32_Float),
+        wgt::TextureFormat::Rg32Uint => Some(dk::DkImageFormat::DkImageFormat_RG32_Uint),
+        wgt::TextureFormat::Rg32Sint => Some(dk::DkImageFormat::DkImageFormat_RG32_Sint),
+        wgt::TextureFormat::Rgb9e5Ufloat => Some(dk::DkImageFormat::DkImageFormat_E5BGR9_Float),
+        wgt::TextureFormat::Depth16Unorm => Some(dk::DkImageFormat::DkImageFormat_Z16),
+        wgt::TextureFormat::Depth32Float => Some(dk::DkImageFormat::DkImageFormat_ZF32),
+        wgt::TextureFormat::Depth24PlusStencil8 => Some(dk::DkImageFormat::DkImageFormat_Z24S8),
+        wgt::TextureFormat::Depth32FloatStencil8 => {
+            Some(dk::DkImageFormat::DkImageFormat_ZF32_X24S8)
+        }
+        wgt::TextureFormat::Stencil8 => Some(dk::DkImageFormat::DkImageFormat_S8),
         wgt::TextureFormat::Rgba8Unorm => Some(dk::DkImageFormat::DkImageFormat_RGBA8_Unorm),
         wgt::TextureFormat::Rgba8UnormSrgb => {
             Some(dk::DkImageFormat::DkImageFormat_RGBA8_Unorm_sRGB)
         }
-        wgt::TextureFormat::R8Unorm => Some(dk::DkImageFormat::DkImageFormat_R8_Unorm),
-        wgt::TextureFormat::Rg8Unorm => Some(dk::DkImageFormat::DkImageFormat_RG8_Unorm),
-        wgt::TextureFormat::Rg16Float => Some(dk::DkImageFormat::DkImageFormat_RG16_Float),
+        wgt::TextureFormat::Bgra8Unorm => Some(dk::DkImageFormat::DkImageFormat_BGRA8_Unorm),
+        wgt::TextureFormat::Bgra8UnormSrgb => {
+            Some(dk::DkImageFormat::DkImageFormat_BGRA8_Unorm_sRGB)
+        }
+        wgt::TextureFormat::Rgba8Uint => Some(dk::DkImageFormat::DkImageFormat_RGBA8_Uint),
+        wgt::TextureFormat::Rgba8Sint => Some(dk::DkImageFormat::DkImageFormat_RGBA8_Sint),
+        wgt::TextureFormat::Rgba8Snorm => Some(dk::DkImageFormat::DkImageFormat_RGBA8_Snorm),
+        wgt::TextureFormat::Rgba16Unorm => Some(dk::DkImageFormat::DkImageFormat_RGBA16_Unorm),
+        wgt::TextureFormat::Rgba16Snorm => Some(dk::DkImageFormat::DkImageFormat_RGBA16_Snorm),
+        wgt::TextureFormat::Rgba16Uint => Some(dk::DkImageFormat::DkImageFormat_RGBA16_Uint),
+        wgt::TextureFormat::Rgba16Sint => Some(dk::DkImageFormat::DkImageFormat_RGBA16_Sint),
         wgt::TextureFormat::Rgba16Float => Some(dk::DkImageFormat::DkImageFormat_RGBA16_Float),
         wgt::TextureFormat::Rgba32Float => Some(dk::DkImageFormat::DkImageFormat_RGBA32_Float),
-        wgt::TextureFormat::Rgb9e5Ufloat => Some(dk::DkImageFormat::DkImageFormat_E5BGR9_Float),
-        wgt::TextureFormat::R32Float => Some(dk::DkImageFormat::DkImageFormat_R32_Float),
-        wgt::TextureFormat::Depth16Unorm => Some(dk::DkImageFormat::DkImageFormat_Z16),
-        wgt::TextureFormat::Depth32Float => Some(dk::DkImageFormat::DkImageFormat_ZF32),
+        wgt::TextureFormat::Rgba32Uint => Some(dk::DkImageFormat::DkImageFormat_RGBA32_Uint),
+        wgt::TextureFormat::Rgba32Sint => Some(dk::DkImageFormat::DkImageFormat_RGBA32_Sint),
         _ => None,
     }
+}
+
+fn deko3d_texture_format_capabilities(
+    format: wgt::TextureFormat,
+) -> crate::TextureFormatCapabilities {
+    use crate::TextureFormatCapabilities as C;
+    let mut capabilities = match format {
+        wgt::TextureFormat::Rgba8Unorm
+        | wgt::TextureFormat::Rgba8UnormSrgb
+        | wgt::TextureFormat::Bgra8Unorm
+        | wgt::TextureFormat::Bgra8UnormSrgb
+        | wgt::TextureFormat::Rgba16Float => {
+            C::SAMPLED | C::COLOR_ATTACHMENT | C::COLOR_ATTACHMENT_BLEND | C::COPY_SRC | C::COPY_DST
+        }
+        wgt::TextureFormat::Rg16Float
+        | wgt::TextureFormat::Rgba8Uint
+        | wgt::TextureFormat::Rgba8Sint => {
+            C::SAMPLED | C::COLOR_ATTACHMENT | C::COPY_SRC | C::COPY_DST
+        }
+        wgt::TextureFormat::Depth16Unorm | wgt::TextureFormat::Depth32Float => {
+            C::SAMPLED | C::DEPTH_STENCIL_ATTACHMENT | C::COPY_SRC | C::COPY_DST
+        }
+        wgt::TextureFormat::Depth24PlusStencil8 | wgt::TextureFormat::Depth32FloatStencil8 => {
+            C::SAMPLED | C::DEPTH_STENCIL_ATTACHMENT
+        }
+        wgt::TextureFormat::Stencil8 => C::DEPTH_STENCIL_ATTACHMENT | C::COPY_SRC | C::COPY_DST,
+        wgt::TextureFormat::R8Unorm
+        | wgt::TextureFormat::Rg8Unorm
+        | wgt::TextureFormat::R8Uint
+        | wgt::TextureFormat::R8Sint
+        | wgt::TextureFormat::Rg8Uint
+        | wgt::TextureFormat::Rg8Sint
+        | wgt::TextureFormat::R8Snorm
+        | wgt::TextureFormat::Rg8Snorm
+        | wgt::TextureFormat::Rgba8Snorm
+        | wgt::TextureFormat::R16Float
+        | wgt::TextureFormat::R16Unorm
+        | wgt::TextureFormat::R16Snorm
+        | wgt::TextureFormat::R16Uint
+        | wgt::TextureFormat::R16Sint
+        | wgt::TextureFormat::Rg16Unorm
+        | wgt::TextureFormat::Rg16Snorm
+        | wgt::TextureFormat::Rg16Uint
+        | wgt::TextureFormat::Rg16Sint
+        | wgt::TextureFormat::Rgba16Unorm
+        | wgt::TextureFormat::Rgba16Snorm
+        | wgt::TextureFormat::Rgba16Uint
+        | wgt::TextureFormat::Rgba16Sint
+        | wgt::TextureFormat::R32Float
+        | wgt::TextureFormat::R32Uint
+        | wgt::TextureFormat::R32Sint
+        | wgt::TextureFormat::Rg32Float
+        | wgt::TextureFormat::Rg32Uint
+        | wgt::TextureFormat::Rg32Sint
+        | wgt::TextureFormat::Rgba32Float
+        | wgt::TextureFormat::Rgba32Uint
+        | wgt::TextureFormat::Rgba32Sint
+        | wgt::TextureFormat::Rgb9e5Ufloat => C::SAMPLED | C::COPY_SRC | C::COPY_DST,
+        _ => C::empty(),
+    };
+    if matches!(
+        format,
+        wgt::TextureFormat::R8Unorm
+            | wgt::TextureFormat::Rg8Unorm
+            | wgt::TextureFormat::R32Float
+            | wgt::TextureFormat::R32Uint
+            | wgt::TextureFormat::R32Sint
+            | wgt::TextureFormat::Rgba8Unorm
+            | wgt::TextureFormat::Rgba8Uint
+            | wgt::TextureFormat::Rgba8Sint
+            | wgt::TextureFormat::Rgba16Float
+            | wgt::TextureFormat::Rgba16Uint
+            | wgt::TextureFormat::Rgba16Sint
+            | wgt::TextureFormat::Rgba32Float
+            | wgt::TextureFormat::Rgba32Uint
+            | wgt::TextureFormat::Rgba32Sint
+    ) {
+        capabilities |= C::STORAGE_READ_ONLY | C::STORAGE_WRITE_ONLY | C::STORAGE_READ_WRITE;
+    }
+    if capabilities.intersects(C::COLOR_ATTACHMENT | C::DEPTH_STENCIL_ATTACHMENT) {
+        capabilities |= C::MULTISAMPLE_X2 | C::MULTISAMPLE_X4 | C::MULTISAMPLE_X8;
+    }
+    if capabilities.contains(C::COLOR_ATTACHMENT) {
+        capabilities |= C::MULTISAMPLE_RESOLVE;
+    }
+    capabilities
+}
+
+pub(super) fn is_color_attachment_format(format: wgt::TextureFormat) -> bool {
+    deko3d_texture_format_capabilities(format)
+        .contains(crate::TextureFormatCapabilities::COLOR_ATTACHMENT)
 }
 
 #[cfg(any(target_os = "horizon", test))]
@@ -3162,9 +3489,12 @@ fn map_depth_stencil_state(
 ) -> Result<dk::DkDepthStencilState, crate::PipelineError> {
     if !matches!(
         state.format,
-        wgt::TextureFormat::Depth16Unorm | wgt::TextureFormat::Depth32Float
-    ) || state.stencil != wgt::StencilState::default()
-        || state.bias != wgt::DepthBiasState::default()
+        wgt::TextureFormat::Depth16Unorm
+            | wgt::TextureFormat::Depth32Float
+            | wgt::TextureFormat::Depth24PlusStencil8
+            | wgt::TextureFormat::Depth32FloatStencil8
+            | wgt::TextureFormat::Stencil8
+    ) || state.bias != wgt::DepthBiasState::default()
     {
         return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
     }
@@ -3183,6 +3513,13 @@ fn map_depth_stencil_state(
             wgt::CompareFunction::Always => dk::DkCompareOp::DkCompareOp_Always,
         },
     );
+    if state.stencil.is_enabled() {
+        result.set_stencil_test_enable(true);
+        map_stencil_face_state(&mut result, true, state.stencil.front)?;
+        map_stencil_face_state(&mut result, false, state.stencil.back)?;
+    } else {
+        result.set_stencil_test_enable(false);
+    }
     Ok(result)
 }
 
@@ -3284,7 +3621,8 @@ fn supported_bind_group_layout_kind(
     entries: &[wgt::BindGroupLayoutEntry],
 ) -> Option<BindGroupLayoutKind> {
     if let [entry] = entries {
-        if entry.count.is_none()
+        let count = entry.count.map(core::num::NonZeroU32::get).unwrap_or(1);
+        if count <= DEKO_STORAGE_TEXTURE_COUNT
             && !entry.visibility.is_empty()
             && (wgt::ShaderStages::VERTEX_FRAGMENT | wgt::ShaderStages::COMPUTE)
                 .contains(entry.visibility)
@@ -3295,12 +3633,24 @@ fn supported_bind_group_layout_kind(
                 view_dimension,
             } = entry.ty
             {
+                let required = match access {
+                    wgt::StorageTextureAccess::ReadOnly => {
+                        crate::TextureFormatCapabilities::STORAGE_READ_ONLY
+                    }
+                    wgt::StorageTextureAccess::WriteOnly => {
+                        crate::TextureFormatCapabilities::STORAGE_WRITE_ONLY
+                    }
+                    wgt::StorageTextureAccess::ReadWrite => {
+                        crate::TextureFormatCapabilities::STORAGE_READ_WRITE
+                    }
+                    _ => return None,
+                };
                 if matches!(
                     access,
                     wgt::StorageTextureAccess::ReadOnly
                         | wgt::StorageTextureAccess::WriteOnly
                         | wgt::StorageTextureAccess::ReadWrite
-                ) && format == wgt::TextureFormat::R32Float
+                ) && deko3d_texture_format_capabilities(format).contains(required)
                     && matches!(
                         view_dimension,
                         wgt::TextureViewDimension::D2 | wgt::TextureViewDimension::D3
@@ -3312,6 +3662,7 @@ fn supported_bind_group_layout_kind(
                         access,
                         format,
                         view_dimension,
+                        count,
                     });
                 }
             }
@@ -3338,6 +3689,7 @@ fn supported_bind_group_layout_kind(
                     visibility,
                     read_only,
                     has_dynamic_offset,
+                    count: 1,
                 } = buffer_entries[0]
                 {
                     return Some(BindGroupLayoutKind::StorageBuffer {
@@ -3350,7 +3702,7 @@ fn supported_bind_group_layout_kind(
             }
             if buffer_entries
                 .iter()
-                .all(|entry| matches!(entry, BufferBindGroupLayoutKind::Uniform { .. }))
+                .all(|entry| matches!(entry, BufferBindGroupLayoutKind::Uniform { count: 1, .. }))
             {
                 let uniforms = buffer_entries
                     .iter()
@@ -3359,6 +3711,7 @@ fn supported_bind_group_layout_kind(
                             binding,
                             visibility,
                             has_dynamic_offset,
+                            count: 1,
                         } => (binding, visibility, has_dynamic_offset),
                         _ => unreachable!(),
                     })
@@ -3375,10 +3728,11 @@ fn supported_bind_group_layout_kind(
     let mut occupied_bindings = Vec::new();
     let mut storage = None;
     for entry in entries {
-        if entry.count.is_some() || occupied_bindings.contains(&entry.binding) {
+        if occupied_bindings.contains(&entry.binding) {
             return None;
         }
         occupied_bindings.push(entry.binding);
+        let count = entry.count.map(core::num::NonZeroU32::get).unwrap_or(1);
         match entry.ty {
             wgt::BindingType::Texture {
                 sample_type:
@@ -3393,15 +3747,21 @@ fn supported_bind_group_layout_kind(
                     | wgt::TextureViewDimension::Cube
                     | wgt::TextureViewDimension::CubeArray,
                 multisampled: false,
-            } if entry.visibility.contains(wgt::ShaderStages::FRAGMENT) => {
-                texture_bindings.push(entry.binding);
+            } if !entry.visibility.is_empty()
+                && (wgt::ShaderStages::VERTEX_FRAGMENT | wgt::ShaderStages::COMPUTE)
+                    .contains(entry.visibility) =>
+            {
+                texture_bindings.push((entry.binding, count, entry.visibility));
             }
             wgt::BindingType::Sampler(
                 wgt::SamplerBindingType::Filtering
                 | wgt::SamplerBindingType::NonFiltering
                 | wgt::SamplerBindingType::Comparison,
-            ) if entry.visibility.contains(wgt::ShaderStages::FRAGMENT) => {
-                sampler_bindings.push(entry.binding);
+            ) if !entry.visibility.is_empty()
+                && (wgt::ShaderStages::VERTEX_FRAGMENT | wgt::ShaderStages::COMPUTE)
+                    .contains(entry.visibility) =>
+            {
+                sampler_bindings.push((entry.binding, count, entry.visibility));
             }
             wgt::BindingType::Buffer {
                 ty: wgt::BufferBindingType::Uniform,
@@ -3410,6 +3770,9 @@ fn supported_bind_group_layout_kind(
             } if !entry.visibility.is_empty()
                 && min_binding_size.is_none_or(|size| size.get() <= DEKO_UNIFORM_BUF_MAX_SIZE) =>
             {
+                if count != 1 {
+                    return None;
+                }
                 uniforms.push((entry.binding, entry.visibility, has_dynamic_offset));
             }
             wgt::BindingType::Buffer {
@@ -3417,6 +3780,7 @@ fn supported_bind_group_layout_kind(
                 has_dynamic_offset,
                 ..
             } if entries.len() == 1
+                && count == 1
                 && !entry.visibility.is_empty()
                 && (wgt::ShaderStages::VERTEX_FRAGMENT | wgt::ShaderStages::COMPUTE)
                     .contains(entry.visibility)
@@ -3439,28 +3803,41 @@ fn supported_bind_group_layout_kind(
         return (uniforms.len() == entries.len())
             .then_some(BindGroupLayoutKind::UniformBuffers(uniforms));
     }
-    texture_bindings.sort_unstable();
-    sampler_bindings.sort_unstable();
+    texture_bindings.sort_unstable_by_key(|(binding, _, _)| *binding);
+    sampler_bindings.sort_unstable_by_key(|(binding, _, _)| *binding);
     uniforms.sort_unstable_by_key(|&(binding, _, _)| binding);
-    if texture_bindings.len() > DEKO_TEXTURE_SAMPLER_COUNT
+    if texture_bindings
+        .iter()
+        .map(|(_, count, _)| *count as usize)
+        .sum::<usize>()
+        > DEKO_TEXTURE_SAMPLER_COUNT
         || uniforms.len() > DEKO_UNIFORM_BUFFER_COUNT as usize
     {
         return None;
     }
     let bindings = texture_bindings
         .into_iter()
-        .map(|texture| {
+        .map(|(texture, count, visibility)| {
             let sampler = sampler_bindings
                 .iter()
-                .copied()
-                .find(|&sampler| sampler == texture + 1);
-            (texture, sampler)
+                .find(|&&(sampler, sampler_count, sampler_visibility)| {
+                    sampler == texture + 1
+                        && sampler_count == count
+                        && sampler_visibility == visibility
+                })
+                .map(|&(sampler, _, _)| sampler);
+            (texture, sampler, count, visibility)
         })
         .collect::<Vec<_>>();
-    if sampler_bindings
-        .iter()
-        .any(|sampler| !bindings.iter().any(|(_, paired)| paired == &Some(*sampler)))
-    {
+    if sampler_bindings.iter().any(|(sampler, count, visibility)| {
+        !bindings
+            .iter()
+            .any(|(_, paired, paired_count, paired_visibility)| {
+                paired == &Some(*sampler)
+                    && paired_count == count
+                    && paired_visibility == visibility
+            })
+    }) {
         return None;
     }
     Some(BindGroupLayoutKind::TextureSamplers { bindings, uniforms })
@@ -3469,9 +3846,10 @@ fn supported_bind_group_layout_kind(
 fn supported_buffer_binding_layout_kind(
     entry: wgt::BindGroupLayoutEntry,
 ) -> Option<BufferBindGroupLayoutKind> {
-    if entry.count.is_some() || entry.visibility.is_empty() {
+    if entry.visibility.is_empty() {
         return None;
     }
+    let count = entry.count.map(core::num::NonZeroU32::get).unwrap_or(1);
     let supported_stages = wgt::ShaderStages::VERTEX_FRAGMENT | wgt::ShaderStages::COMPUTE;
     if !supported_stages.contains(entry.visibility) {
         return None;
@@ -3481,25 +3859,30 @@ fn supported_buffer_binding_layout_kind(
             ty: wgt::BufferBindingType::Uniform,
             has_dynamic_offset,
             min_binding_size,
-        } if entry.binding < DEKO_UNIFORM_BUFFER_COUNT
+        } if entry.binding.checked_add(count)? <= DEKO_UNIFORM_BUFFER_COUNT
+            && !(has_dynamic_offset && count > 1)
             && min_binding_size.is_none_or(|size| size.get() <= DEKO_UNIFORM_BUF_MAX_SIZE) =>
         {
             Some(BufferBindGroupLayoutKind::Uniform {
                 binding: entry.binding,
                 visibility: entry.visibility,
                 has_dynamic_offset,
+                count,
             })
         }
         wgt::BindingType::Buffer {
             ty: wgt::BufferBindingType::Storage { read_only },
             has_dynamic_offset,
             ..
-        } if entry.binding < DEKO_STORAGE_BUFFER_COUNT => {
+        } if entry.binding.checked_add(count)? <= DEKO_STORAGE_BUFFER_COUNT
+            && !(has_dynamic_offset && count > 1) =>
+        {
             Some(BufferBindGroupLayoutKind::Storage {
                 binding: entry.binding,
                 visibility: entry.visibility,
                 read_only,
                 has_dynamic_offset,
+                count,
             })
         }
         _ => None,
@@ -3569,7 +3952,14 @@ mod tests {
             map_texture_image_format(wgt::TextureFormat::Depth32Float),
             Some(dk::DkImageFormat::DkImageFormat_ZF32)
         );
-        assert!(map_texture_image_format(wgt::TextureFormat::Bgra8Unorm).is_none());
+        assert_eq!(
+            map_texture_image_format(wgt::TextureFormat::Bgra8Unorm),
+            Some(dk::DkImageFormat::DkImageFormat_BGRA8_Unorm)
+        );
+        assert_eq!(
+            map_texture_image_format(wgt::TextureFormat::Depth24PlusStencil8),
+            Some(dk::DkImageFormat::DkImageFormat_Z24S8)
+        );
         for format in [
             wgt::VertexFormat::Float32x2,
             wgt::VertexFormat::Float32x3,
@@ -3700,7 +4090,13 @@ mod tests {
         let BindGroupLayoutKind::TextureSamplers { bindings, uniforms } = kind else {
             panic!("expected texture/sampler layout");
         };
-        assert_eq!(bindings, vec![(0, Some(1)), (2, Some(3))]);
+        assert_eq!(
+            bindings,
+            vec![
+                (0, Some(1), 1, wgt::ShaderStages::FRAGMENT),
+                (2, Some(3), 1, wgt::ShaderStages::FRAGMENT),
+            ]
+        );
         assert_eq!(uniforms.len(), 2);
         assert!(supported_bind_group_layout_kind(&[texture(0), sampler(3)]).is_none());
         assert!(supported_bind_group_layout_kind(&[texture(0), uniform(0), sampler(1)]).is_none());
@@ -3742,6 +4138,70 @@ mod tests {
     }
 
     #[test]
+    fn buffer_binding_arrays_reserve_consecutive_slots() {
+        let entry = wgt::BindGroupLayoutEntry {
+            binding: 3,
+            visibility: wgt::ShaderStages::COMPUTE,
+            ty: wgt::BindingType::Buffer {
+                ty: wgt::BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: core::num::NonZeroU32::new(4),
+        };
+        let Some(BindGroupLayoutKind::BufferGroup(entries)) =
+            supported_bind_group_layout_kind(&[entry])
+        else {
+            panic!("expected a buffer array layout");
+        };
+        assert!(matches!(
+            entries.as_slice(),
+            [BufferBindGroupLayoutKind::Storage {
+                binding: 3,
+                count: 4,
+                ..
+            }]
+        ));
+
+        let mut dynamic = entry;
+        dynamic.ty = wgt::BindingType::Buffer {
+            ty: wgt::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: true,
+            min_binding_size: None,
+        };
+        assert!(supported_bind_group_layout_kind(&[dynamic]).is_none());
+    }
+
+    #[test]
+    fn sampled_texture_and_sampler_arrays_share_a_physical_range() {
+        let count = core::num::NonZeroU32::new(3);
+        let entries = [
+            wgt::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgt::ShaderStages::FRAGMENT,
+                ty: wgt::BindingType::Texture {
+                    sample_type: wgt::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgt::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count,
+            },
+            wgt::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgt::ShaderStages::FRAGMENT,
+                ty: wgt::BindingType::Sampler(wgt::SamplerBindingType::Filtering),
+                count,
+            },
+        ];
+        let Some(BindGroupLayoutKind::TextureSamplers { bindings, .. }) =
+            supported_bind_group_layout_kind(&entries)
+        else {
+            panic!("expected texture array layout");
+        };
+        assert_eq!(bindings, vec![(4, Some(5), 3, wgt::ShaderStages::FRAGMENT)]);
+    }
+
+    #[test]
     fn storage_texture_layout_accepts_r32_compute_images() {
         let layout = supported_bind_group_layout_kind(&[wgt::BindGroupLayoutEntry {
             binding: 3,
@@ -3760,6 +4220,20 @@ mod tests {
                 access: wgt::StorageTextureAccess::ReadWrite,
                 ..
             })
+        ));
+        let array = supported_bind_group_layout_kind(&[wgt::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgt::ShaderStages::COMPUTE,
+            ty: wgt::BindingType::StorageTexture {
+                access: wgt::StorageTextureAccess::WriteOnly,
+                format: wgt::TextureFormat::Rgba8Unorm,
+                view_dimension: wgt::TextureViewDimension::D2,
+            },
+            count: core::num::NonZeroU32::new(4),
+        }]);
+        assert!(matches!(
+            array,
+            Some(BindGroupLayoutKind::StorageTexture { count: 4, .. })
         ));
     }
 
@@ -4357,58 +4831,7 @@ impl crate::Adapter for Adapter {
         &self,
         format: wgt::TextureFormat,
     ) -> crate::TextureFormatCapabilities {
-        if format == wgt::TextureFormat::Rgba8Unorm {
-            crate::TextureFormatCapabilities::SAMPLED
-                | crate::TextureFormatCapabilities::COLOR_ATTACHMENT
-                | crate::TextureFormatCapabilities::COLOR_ATTACHMENT_BLEND
-                | crate::TextureFormatCapabilities::COPY_SRC
-                | crate::TextureFormatCapabilities::COPY_DST
-        } else if format == wgt::TextureFormat::Rgba8UnormSrgb {
-            crate::TextureFormatCapabilities::SAMPLED
-                | crate::TextureFormatCapabilities::COLOR_ATTACHMENT
-                | crate::TextureFormatCapabilities::COLOR_ATTACHMENT_BLEND
-                | crate::TextureFormatCapabilities::COPY_SRC
-                | crate::TextureFormatCapabilities::COPY_DST
-        } else if matches!(
-            format,
-            wgt::TextureFormat::Depth16Unorm | wgt::TextureFormat::Depth32Float
-        ) {
-            crate::TextureFormatCapabilities::SAMPLED
-                | crate::TextureFormatCapabilities::DEPTH_STENCIL_ATTACHMENT
-        } else if matches!(
-            format,
-            wgt::TextureFormat::R8Unorm | wgt::TextureFormat::Rg8Unorm
-        ) {
-            crate::TextureFormatCapabilities::SAMPLED
-                | crate::TextureFormatCapabilities::COPY_SRC
-                | crate::TextureFormatCapabilities::COPY_DST
-        } else if format == wgt::TextureFormat::Rgba16Float {
-            crate::TextureFormatCapabilities::SAMPLED
-                | crate::TextureFormatCapabilities::COLOR_ATTACHMENT
-                | crate::TextureFormatCapabilities::COLOR_ATTACHMENT_BLEND
-                | crate::TextureFormatCapabilities::COPY_SRC
-                | crate::TextureFormatCapabilities::COPY_DST
-        } else if format == wgt::TextureFormat::Rg16Float {
-            crate::TextureFormatCapabilities::SAMPLED
-                | crate::TextureFormatCapabilities::COLOR_ATTACHMENT
-                | crate::TextureFormatCapabilities::COPY_SRC
-                | crate::TextureFormatCapabilities::COPY_DST
-        } else if format == wgt::TextureFormat::Rgba32Float {
-            crate::TextureFormatCapabilities::SAMPLED
-                | crate::TextureFormatCapabilities::COPY_SRC
-                | crate::TextureFormatCapabilities::COPY_DST
-        } else if format == wgt::TextureFormat::Rgb9e5Ufloat {
-            crate::TextureFormatCapabilities::SAMPLED
-                | crate::TextureFormatCapabilities::COPY_SRC
-                | crate::TextureFormatCapabilities::COPY_DST
-        } else if format == wgt::TextureFormat::R32Float {
-            crate::TextureFormatCapabilities::SAMPLED
-                | crate::TextureFormatCapabilities::STORAGE_READ_ONLY
-                | crate::TextureFormatCapabilities::STORAGE_WRITE_ONLY
-                | crate::TextureFormatCapabilities::STORAGE_READ_WRITE
-        } else {
-            crate::TextureFormatCapabilities::empty()
-        }
+        deko3d_texture_format_capabilities(format)
     }
 
     unsafe fn surface_capabilities(&self, surface: &Surface) -> Option<crate::SurfaceCapabilities> {
