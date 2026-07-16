@@ -2149,6 +2149,13 @@ unsafe fn submit_dispatch_workgroups(
                         binding.target,
                         dk::DkStage::DkStage_Compute,
                     )?,
+                    ShaderBindingKind::StorageTexture => group.group.bind_storage_texture(
+                        cmdbuf,
+                        &group.dynamic_offsets,
+                        binding.binding,
+                        binding.target,
+                        dk::DkStage::DkStage_Compute,
+                    )?,
                     _ => return Err(crate::DeviceError::Lost),
                 }
             }
@@ -2205,6 +2212,13 @@ unsafe fn submit_dispatch_workgroups_indirect(
                             dk::DkStage::DkStage_Compute,
                         )?,
                         ShaderBindingKind::Storage => group.group.bind_storage_binding(
+                            cmdbuf,
+                            &group.dynamic_offsets,
+                            binding.binding,
+                            binding.target,
+                            dk::DkStage::DkStage_Compute,
+                        )?,
+                        ShaderBindingKind::StorageTexture => group.group.bind_storage_texture(
                             cmdbuf,
                             &group.dynamic_offsets,
                             binding.binding,
@@ -2395,6 +2409,19 @@ unsafe fn submit_deko_draw(
                 {
                     let group = bound_group(binding.group)?;
                     group.group.bind_storage_binding(
+                        cmdbuf,
+                        &group.dynamic_offsets,
+                        binding.binding,
+                        binding.target,
+                        stage,
+                    )?;
+                }
+                for binding in bindings
+                    .iter()
+                    .filter(|binding| binding.kind == ShaderBindingKind::StorageTexture)
+                {
+                    let group = bound_group(binding.group)?;
+                    group.group.bind_storage_texture(
                         cmdbuf,
                         &group.dynamic_offsets,
                         binding.binding,
