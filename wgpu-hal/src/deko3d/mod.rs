@@ -5,6 +5,8 @@ use alloc::boxed::Box;
 use alloc::{string::String, vec, vec::Vec};
 #[cfg(any(target_os = "horizon", test))]
 use core::mem::{align_of, size_of};
+#[cfg(all(deko3d, not(target_os = "horizon")))]
+use core::sync::atomic::AtomicUsize;
 use core::{
     ptr,
     sync::atomic::{AtomicBool, Ordering},
@@ -280,7 +282,7 @@ pub(super) struct RenderPipelineInnerRaw {
     rasterizer_state: dk::DkRasterizerState,
     color_state: dk::DkColorState,
     color_write_state: dk::DkColorWriteState,
-    blend_state: dk::DkBlendState,
+    blend_states: Vec<dk::DkBlendState>,
     depth_stencil_state: dk::DkDepthStencilState,
     uses_depth_stencil: bool,
     bind_group_count: usize,
@@ -1299,30 +1301,35 @@ impl RenderPipelineInner {
         {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         }
-        let (color_state, blend_state, color_write_state) = match desc.color_targets {
-            [] => {
-                let (color_state, blend_state) = map_blend_state(None)?;
-                (
-                    color_state,
-                    blend_state,
-                    map_color_write_state(wgt::ColorWrites::empty()),
-                )
+        if desc.color_targets.len() > 8 {
+            return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
+        }
+        let mut color_state = dk::DkColorState::defaults();
+        let mut color_write_state = dk::DkColorWriteState::defaults();
+        let mut blend_states = Vec::with_capacity(desc.color_targets.len());
+        for (index, target) in desc.color_targets.iter().enumerate() {
+            let Some(target) = target else {
+                color_write_state.set_mask(index as u32, 0);
+                blend_states.push(dk::DkBlendState::defaults());
+                continue;
+            };
+            if !matches!(
+                target.format,
+                wgt::TextureFormat::Rgba8Unorm
+                    | wgt::TextureFormat::Rgba8UnormSrgb
+                    | wgt::TextureFormat::Rg16Float
+                    | wgt::TextureFormat::Rgba16Float
+            ) {
+                return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
             }
-            [Some(color_target)]
-                if matches!(
-                    color_target.format,
-                    wgt::TextureFormat::Rgba8Unorm | wgt::TextureFormat::Rgba8UnormSrgb
-                ) =>
-            {
-                let (color_state, blend_state) = map_blend_state(color_target.blend)?;
-                (
-                    color_state,
-                    blend_state,
-                    map_color_write_state(color_target.write_mask),
-                )
-            }
-            _ => return Err(crate::PipelineError::Device(crate::DeviceError::Lost)),
-        };
+            let (mapped_color_state, blend_state) = map_blend_state(target.blend)?;
+            color_state.set_blend_enable(index as u32, mapped_color_state.bits & 1 != 0);
+            color_write_state.set_mask(
+                index as u32,
+                map_color_write_state(target.write_mask).masks & 0xf,
+            );
+            blend_states.push(blend_state);
+        }
 
         let crate::VertexProcessor::Standard {
             vertex_buffers,
@@ -1415,7 +1422,7 @@ impl RenderPipelineInner {
                 rasterizer_state,
                 color_state,
                 color_write_state,
-                blend_state,
+                blend_states,
                 depth_stencil_state,
                 uses_depth_stencil,
                 bind_group_count: bind_group_layouts.len(),
@@ -1435,7 +1442,9 @@ impl TextureInner {
                 | wgt::TextureFormat::Rgba8UnormSrgb
                 | wgt::TextureFormat::R8Unorm
                 | wgt::TextureFormat::Rg8Unorm
+                | wgt::TextureFormat::Rg16Float
                 | wgt::TextureFormat::Rgba16Float
+                | wgt::TextureFormat::Rgba32Float
                 | wgt::TextureFormat::Rgb9e5Ufloat
                 | wgt::TextureFormat::R32Float
                 | wgt::TextureFormat::Depth16Unorm
@@ -1828,7 +1837,6 @@ impl BindGroupInner {
     }
 }
 
-#[cfg(any(target_os = "horizon", test))]
 fn map_vertex_format(
     format: wgt::VertexFormat,
 ) -> Result<(dk::DkVtxAttribSize, dk::DkVtxAttribType), crate::PipelineError> {
@@ -2053,7 +2061,9 @@ fn map_texture_image_format(format: wgt::TextureFormat) -> Option<dk::DkImageFor
         }
         wgt::TextureFormat::R8Unorm => Some(dk::DkImageFormat::DkImageFormat_R8_Unorm),
         wgt::TextureFormat::Rg8Unorm => Some(dk::DkImageFormat::DkImageFormat_RG8_Unorm),
+        wgt::TextureFormat::Rg16Float => Some(dk::DkImageFormat::DkImageFormat_RG16_Float),
         wgt::TextureFormat::Rgba16Float => Some(dk::DkImageFormat::DkImageFormat_RGBA16_Float),
+        wgt::TextureFormat::Rgba32Float => Some(dk::DkImageFormat::DkImageFormat_RGBA32_Float),
         wgt::TextureFormat::Rgb9e5Ufloat => Some(dk::DkImageFormat::DkImageFormat_E5BGR9_Float),
         wgt::TextureFormat::R32Float => Some(dk::DkImageFormat::DkImageFormat_R32_Float),
         wgt::TextureFormat::Depth16Unorm => Some(dk::DkImageFormat::DkImageFormat_Z16),
@@ -2227,7 +2237,6 @@ fn supported_bind_group_layout_kind(
                 has_dynamic_offset,
                 min_binding_size,
             } if !entry.visibility.is_empty()
-                && entry.binding < DEKO_UNIFORM_BUFFER_COUNT
                 && min_binding_size.is_none_or(|size| size.get() <= DEKO_UNIFORM_BUF_MAX_SIZE) =>
             {
                 uniforms.push((entry.binding, entry.visibility, has_dynamic_offset));
@@ -2371,6 +2380,40 @@ mod tests {
     }
 
     #[test]
+    fn supported_color_targets_report_expected_capabilities() {
+        for format in [
+            wgt::TextureFormat::Rgba8Unorm,
+            wgt::TextureFormat::Rgba8UnormSrgb,
+            wgt::TextureFormat::Rgba16Float,
+        ] {
+            let capabilities = unsafe {
+                <Adapter as crate::Adapter>::texture_format_capabilities(&Adapter, format)
+            };
+            assert!(
+                capabilities.contains(crate::TextureFormatCapabilities::COLOR_ATTACHMENT_BLEND),
+                "{format:?} must support WebGPU color blending"
+            );
+        }
+        let rg16 = unsafe {
+            <Adapter as crate::Adapter>::texture_format_capabilities(
+                &Adapter,
+                wgt::TextureFormat::Rg16Float,
+            )
+        };
+        assert!(rg16.contains(crate::TextureFormatCapabilities::SAMPLED));
+        assert!(rg16.contains(crate::TextureFormatCapabilities::COLOR_ATTACHMENT));
+
+        let rgba32 = unsafe {
+            <Adapter as crate::Adapter>::texture_format_capabilities(
+                &Adapter,
+                wgt::TextureFormat::Rgba32Float,
+            )
+        };
+        assert!(rgba32.contains(crate::TextureFormatCapabilities::SAMPLED));
+        assert!(rgba32.contains(crate::TextureFormatCapabilities::COPY_DST));
+    }
+
+    #[test]
     fn ui_blend_and_color_write_states_are_conservative() {
         let (straight, _) = map_blend_state(Some(wgt::BlendState::ALPHA_BLENDING)).unwrap();
         let (premultiplied, _) =
@@ -2426,24 +2469,16 @@ mod tests {
         let BindGroupLayoutKind::TextureSamplers { bindings, uniforms } = kind else {
             panic!("expected texture/sampler layout");
         };
-        assert_eq!(bindings, vec![(0, 1), (2, 3)]);
+        assert_eq!(bindings, vec![(0, Some(1)), (2, Some(3))]);
         assert_eq!(uniforms.len(), 2);
         assert!(supported_bind_group_layout_kind(&[texture(0), sampler(3)]).is_none());
         assert!(supported_bind_group_layout_kind(&[texture(0), uniform(0), sampler(1)]).is_none());
-        let too_many = [
-            texture(0),
-            sampler(1),
-            texture(2),
-            sampler(3),
-            texture(4),
-            sampler(5),
-            texture(6),
-            sampler(7),
-            texture(10),
-            sampler(11),
-        ];
+        let too_many = (0..=DEKO_TEXTURE_SAMPLER_COUNT as u32)
+            .flat_map(|index| [texture(index * 2), sampler(index * 2 + 1)])
+            .collect::<Vec<_>>();
         assert!(supported_bind_group_layout_kind(&too_many).is_none());
         assert!(supported_bind_group_layout_kind(&[uniform(0), uniform(1)]).is_some());
+        assert!(supported_bind_group_layout_kind(&[uniform(100)]).is_some());
 
         let texture_3d = wgt::BindGroupLayoutEntry {
             binding: 3,
@@ -3047,11 +3082,13 @@ impl crate::Adapter for Adapter {
         if format == wgt::TextureFormat::Rgba8Unorm {
             crate::TextureFormatCapabilities::SAMPLED
                 | crate::TextureFormatCapabilities::COLOR_ATTACHMENT
+                | crate::TextureFormatCapabilities::COLOR_ATTACHMENT_BLEND
                 | crate::TextureFormatCapabilities::COPY_SRC
                 | crate::TextureFormatCapabilities::COPY_DST
         } else if format == wgt::TextureFormat::Rgba8UnormSrgb {
             crate::TextureFormatCapabilities::SAMPLED
                 | crate::TextureFormatCapabilities::COLOR_ATTACHMENT
+                | crate::TextureFormatCapabilities::COLOR_ATTACHMENT_BLEND
                 | crate::TextureFormatCapabilities::COPY_SRC
                 | crate::TextureFormatCapabilities::COPY_DST
         } else if matches!(
@@ -3070,6 +3107,16 @@ impl crate::Adapter for Adapter {
         } else if format == wgt::TextureFormat::Rgba16Float {
             crate::TextureFormatCapabilities::SAMPLED
                 | crate::TextureFormatCapabilities::COLOR_ATTACHMENT
+                | crate::TextureFormatCapabilities::COLOR_ATTACHMENT_BLEND
+                | crate::TextureFormatCapabilities::COPY_SRC
+                | crate::TextureFormatCapabilities::COPY_DST
+        } else if format == wgt::TextureFormat::Rg16Float {
+            crate::TextureFormatCapabilities::SAMPLED
+                | crate::TextureFormatCapabilities::COLOR_ATTACHMENT
+                | crate::TextureFormatCapabilities::COPY_SRC
+                | crate::TextureFormatCapabilities::COPY_DST
+        } else if format == wgt::TextureFormat::Rgba32Float {
+            crate::TextureFormatCapabilities::SAMPLED
                 | crate::TextureFormatCapabilities::COPY_SRC
                 | crate::TextureFormatCapabilities::COPY_DST
         } else if format == wgt::TextureFormat::Rgb9e5Ufloat {
@@ -3519,9 +3566,20 @@ impl crate::Device for Device {
     ) -> Result<Resource, crate::PipelineError> {
         #[cfg(target_os = "horizon")]
         {
-            Ok(Resource::RenderPipeline(Arc::new(
-                RenderPipelineInner::new(desc)?,
-            )))
+            match RenderPipelineInner::new(desc) {
+                Ok(pipeline) => Ok(Resource::RenderPipeline(Arc::new(pipeline))),
+                Err(error) => {
+                    trace::record(format_args!(
+                        "failure kind=render_pipeline_create label={:?} topology={:?} color_targets={:?} depth_stencil={:?} error={error:?}",
+                        desc.label,
+                        desc.primitive.topology,
+                        desc.color_targets,
+                        desc.depth_stencil.as_ref().map(|state| state.format),
+                    ));
+                    trace::dump("render_pipeline_create");
+                    Err(error)
+                }
+            }
         }
         #[cfg(not(target_os = "horizon"))]
         {
