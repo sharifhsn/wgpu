@@ -12,10 +12,12 @@ use deko3d_sys as dk;
 
 #[cfg(target_os = "horizon")]
 use super::ShaderBindingKind;
+#[cfg(target_os = "horizon")]
+use super::DEKO_QUERY_RESULT_SIZE;
 
 use super::{
-    Api, BindGroupInner, Buffer, ComputePipelineInner, DeviceResult, Queue, RawImage,
-    RawQueueHandle, RenderPipelineInner, Resource, TextureInner,
+    Api, BindGroupInner, Buffer, ComputePipelineInner, DeviceResult, QuerySetInner, Queue,
+    RawImage, RawQueueHandle, RenderPipelineInner, Resource, TextureInner,
 };
 
 const DEKO_INVALIDATE_IMAGE: u32 = 1 << 0;
@@ -60,6 +62,26 @@ enum Command {
         dst: Buffer,
         regions: Vec<crate::BufferTextureCopy>,
     },
+    CopyQueryResults {
+        query_set: alloc::sync::Arc<QuerySetInner>,
+        range: Range<u32>,
+        buffer: Buffer,
+        offset: wgt::BufferAddress,
+        stride: wgt::BufferSize,
+    },
+    ResetQueries {
+        query_set: alloc::sync::Arc<QuerySetInner>,
+        range: Range<u32>,
+    },
+    BeginOcclusionQuery {
+        query_set: alloc::sync::Arc<QuerySetInner>,
+        index: u32,
+    },
+    EndOcclusionQuery {
+        query_set: alloc::sync::Arc<QuerySetInner>,
+        index: u32,
+    },
+    WriteTimestamp(TimestampWrite),
     ResourceBarrier {
         invalidate_flags: u32,
     },
@@ -69,11 +91,17 @@ enum Command {
         clear_values: Vec<Option<wgt::Color>>,
         depth: Option<RawImage>,
         depth_clear_value: Option<f32>,
+        beginning_timestamp: Option<TimestampWrite>,
+        end_timestamp: Option<TimestampWrite>,
     },
+    EndRenderPass,
     SetRenderPipeline {
         pipeline: alloc::sync::Arc<RenderPipelineInner>,
     },
-    BeginComputePass,
+    BeginComputePass {
+        beginning_timestamp: Option<TimestampWrite>,
+        end_timestamp: Option<TimestampWrite>,
+    },
     EndComputePass,
     SetComputePipeline {
         pipeline: alloc::sync::Arc<ComputePipelineInner>,
@@ -159,6 +187,12 @@ enum Command {
     },
 }
 
+#[derive(Clone, Debug)]
+struct TimestampWrite {
+    query_set: alloc::sync::Arc<QuerySetInner>,
+    index: u32,
+}
+
 #[derive(Default)]
 struct ExecutionState {
     target: Option<RenderTarget>,
@@ -172,6 +206,8 @@ struct ExecutionState {
     scissor: Option<crate::Rect<u32>>,
     stencil_reference: u8,
     blend_constants: [f32; 4],
+    render_pass_end_timestamp: Option<TimestampWrite>,
+    compute_pass_end_timestamp: Option<TimestampWrite>,
 }
 
 #[allow(dead_code)]
@@ -231,9 +267,15 @@ impl CommandBuffer {
                         Command::CopyBufferToTexture { .. } => "copy_buffer_to_texture",
                         Command::CopyTextureToTexture { .. } => "copy_texture_to_texture",
                         Command::CopyTextureToBuffer { .. } => "copy_texture_to_buffer",
+                        Command::CopyQueryResults { .. } => "copy_query_results",
+                        Command::ResetQueries { .. } => "reset_queries",
+                        Command::BeginOcclusionQuery { .. } => "begin_occlusion_query",
+                        Command::EndOcclusionQuery { .. } => "end_occlusion_query",
+                        Command::WriteTimestamp(_) => "write_timestamp",
                         Command::ResourceBarrier { .. } => "resource_barrier",
                         Command::BeginRenderPass { .. } => "begin_render_pass",
-                        Command::BeginComputePass => "begin_compute_pass",
+                        Command::EndRenderPass => "end_render_pass",
+                        Command::BeginComputePass { .. } => "begin_compute_pass",
                         Command::EndComputePass => "end_compute_pass",
                         Command::SetRenderPipeline { .. } => "set_render_pipeline",
                         Command::SetComputePipeline { .. } => "set_compute_pipeline",
@@ -429,13 +471,58 @@ impl crate::CommandEncoder for CommandBuffer {
     }
 
     unsafe fn begin_query(&mut self, set: &Resource, index: u32) {
-        self.record_unsupported();
+        let Resource::QuerySet(query_set) = set else {
+            self.record_unsupported();
+            return;
+        };
+        let Some(end) = index.checked_add(1) else {
+            self.record_unsupported();
+            return;
+        };
+        if !query_set.is_occlusion() || query_set.validate_range(index..end).is_err() {
+            self.record_unsupported();
+            return;
+        }
+        self.commands.push(Command::BeginOcclusionQuery {
+            query_set: query_set.clone(),
+            index,
+        });
     }
     unsafe fn end_query(&mut self, set: &Resource, index: u32) {
-        self.record_unsupported();
+        let Resource::QuerySet(query_set) = set else {
+            self.record_unsupported();
+            return;
+        };
+        let Some(end) = index.checked_add(1) else {
+            self.record_unsupported();
+            return;
+        };
+        if !query_set.is_occlusion() || query_set.validate_range(index..end).is_err() {
+            self.record_unsupported();
+            return;
+        }
+        self.commands.push(Command::EndOcclusionQuery {
+            query_set: query_set.clone(),
+            index,
+        });
     }
     unsafe fn write_timestamp(&mut self, set: &Resource, index: u32) {
-        self.record_unsupported();
+        let Resource::QuerySet(query_set) = set else {
+            self.record_unsupported();
+            return;
+        };
+        let Some(end) = index.checked_add(1) else {
+            self.record_unsupported();
+            return;
+        };
+        if !query_set.is_timestamp() || query_set.validate_range(index..end).is_err() {
+            self.record_unsupported();
+            return;
+        }
+        self.commands.push(Command::WriteTimestamp(TimestampWrite {
+            query_set: query_set.clone(),
+            index,
+        }));
     }
     unsafe fn read_acceleration_structure_compact_size(
         &mut self,
@@ -445,7 +532,18 @@ impl crate::CommandEncoder for CommandBuffer {
         self.record_unsupported();
     }
     unsafe fn reset_queries(&mut self, set: &Resource, range: Range<u32>) {
-        self.record_unsupported();
+        let Resource::QuerySet(query_set) = set else {
+            self.record_unsupported();
+            return;
+        };
+        if query_set.validate_range(range.clone()).is_err() {
+            self.record_unsupported();
+            return;
+        }
+        self.commands.push(Command::ResetQueries {
+            query_set: query_set.clone(),
+            range,
+        });
     }
     unsafe fn copy_query_results(
         &mut self,
@@ -455,7 +553,21 @@ impl crate::CommandEncoder for CommandBuffer {
         offset: wgt::BufferAddress,
         stride: wgt::BufferSize,
     ) {
-        self.record_unsupported();
+        let Resource::QuerySet(query_set) = set else {
+            self.record_unsupported();
+            return;
+        };
+        if query_set.validate_range(range.clone()).is_err() {
+            self.record_unsupported();
+            return;
+        }
+        self.commands.push(Command::CopyQueryResults {
+            query_set: query_set.clone(),
+            range,
+            buffer: buffer.clone(),
+            offset,
+            stride,
+        });
     }
 
     // render
@@ -464,12 +576,16 @@ impl crate::CommandEncoder for CommandBuffer {
         &mut self,
         desc: &crate::RenderPassDescriptor<Resource, Resource>,
     ) -> DeviceResult<()> {
-        if desc.multiview_mask.is_some()
-            || desc.timestamp_writes.is_some()
-            || desc.occlusion_query_set.is_some()
-            || desc.sample_count != 1
-        {
+        if desc.multiview_mask.is_some() || desc.sample_count != 1 {
             return Err(crate::DeviceError::Lost);
+        }
+        if let Some(query_set) = desc.occlusion_query_set {
+            let Resource::QuerySet(query_set) = query_set else {
+                return Err(crate::DeviceError::Lost);
+            };
+            if !query_set.is_occlusion() {
+                return Err(crate::DeviceError::Lost);
+            }
         }
 
         if desc.color_attachments.len() > 8 {
@@ -573,16 +689,22 @@ impl crate::CommandEncoder for CommandBuffer {
         if images.iter().all(Option::is_none) && depth.is_none() {
             return Err(crate::DeviceError::Lost);
         }
+        let (beginning_timestamp, end_timestamp) =
+            timestamp_writes(desc.timestamp_writes.as_ref())?;
         self.commands.push(Command::BeginRenderPass {
             images,
             extent: desc.extent,
             clear_values,
             depth,
             depth_clear_value,
+            beginning_timestamp,
+            end_timestamp,
         });
         Ok(())
     }
-    unsafe fn end_render_pass(&mut self) {}
+    unsafe fn end_render_pass(&mut self) {
+        self.commands.push(Command::EndRenderPass);
+    }
 
     unsafe fn set_bind_group(
         &mut self,
@@ -802,11 +924,15 @@ impl crate::CommandEncoder for CommandBuffer {
     // compute
 
     unsafe fn begin_compute_pass(&mut self, desc: &crate::ComputePassDescriptor<Resource>) {
-        if desc.timestamp_writes.is_some() {
-            self.record_unsupported();
-            return;
+        match timestamp_writes(desc.timestamp_writes.as_ref()) {
+            Ok((beginning_timestamp, end_timestamp)) => {
+                self.commands.push(Command::BeginComputePass {
+                    beginning_timestamp,
+                    end_timestamp,
+                });
+            }
+            Err(_) => self.record_unsupported(),
         }
-        self.commands.push(Command::BeginComputePass);
     }
     unsafe fn end_compute_pass(&mut self) {
         self.commands.push(Command::EndComputePass);
@@ -920,6 +1046,35 @@ impl Command {
                 let src = src.as_ref().ok_or(crate::DeviceError::Lost)?;
                 unsafe { submit_copy_texture_to_buffer(queue, surface_queue, src, dst, regions) }
             }
+            Command::CopyQueryResults {
+                query_set,
+                range,
+                buffer,
+                offset,
+                stride,
+            } => unsafe {
+                submit_copy_query_results(
+                    queue,
+                    surface_queue,
+                    query_set,
+                    range.clone(),
+                    buffer,
+                    *offset,
+                    *stride,
+                )
+            },
+            Command::ResetQueries { query_set, range } => unsafe {
+                submit_reset_query_results(queue, surface_queue, query_set, range.clone())
+            },
+            Command::BeginOcclusionQuery { query_set, index } => unsafe {
+                submit_begin_occlusion_query(queue, surface_queue, query_set, *index)
+            },
+            Command::EndOcclusionQuery { query_set, index } => unsafe {
+                submit_end_occlusion_query(queue, surface_queue, query_set, *index)
+            },
+            Command::WriteTimestamp(timestamp) => unsafe {
+                submit_timestamp_write(queue, surface_queue, timestamp)
+            },
             Command::ResourceBarrier { invalidate_flags } => unsafe {
                 submit_resource_barrier(queue, surface_queue, *invalidate_flags)
             },
@@ -929,6 +1084,8 @@ impl Command {
                 clear_values,
                 depth,
                 depth_clear_value,
+                beginning_timestamp,
+                end_timestamp,
             } => {
                 state.target = Some(RenderTarget {
                     images: images.clone(),
@@ -946,21 +1103,43 @@ impl Command {
                         clear_values,
                         *depth,
                         *depth_clear_value,
-                    )
+                    )?;
+                    if let Some(timestamp) = beginning_timestamp {
+                        submit_timestamp_write(queue, surface_queue, timestamp)?;
+                    }
                 }
+                state.render_pass_end_timestamp = end_timestamp.clone();
+                Ok(())
+            }
+            Command::EndRenderPass => {
+                if let Some(timestamp) = state.render_pass_end_timestamp.take() {
+                    unsafe { submit_timestamp_write(queue, surface_queue, &timestamp)? };
+                }
+                state.target = None;
+                Ok(())
             }
             Command::SetRenderPipeline { pipeline } => {
                 state.pipeline = Some(pipeline.clone());
                 Ok(())
             }
-            Command::BeginComputePass => {
+            Command::BeginComputePass {
+                beginning_timestamp,
+                end_timestamp,
+            } => {
                 state.in_compute_pass = true;
                 state.compute_pipeline = None;
+                state.compute_pass_end_timestamp = end_timestamp.clone();
+                if let Some(timestamp) = beginning_timestamp {
+                    unsafe { submit_timestamp_write(queue, surface_queue, timestamp)? };
+                }
                 Ok(())
             }
             Command::EndComputePass => {
                 if !state.in_compute_pass {
                     return Err(crate::DeviceError::Lost);
+                }
+                if let Some(timestamp) = state.compute_pass_end_timestamp.take() {
+                    unsafe { submit_timestamp_write(queue, surface_queue, &timestamp)? };
                 }
                 state.in_compute_pass = false;
                 state.compute_pipeline = None;
@@ -1201,7 +1380,7 @@ mod tests {
         assert!(matches!(
             encoded.commands.as_slice(),
             [
-                Command::BeginComputePass,
+                Command::BeginComputePass { .. },
                 Command::DispatchWorkgroups { count: [2, 3, 4] },
                 Command::EndComputePass
             ]
@@ -1276,6 +1455,35 @@ mod tests {
             });
         }
         assert!(unsafe { encoder.end_encoding() }.is_ok());
+    }
+
+    #[test]
+    fn timestamp_and_occlusion_queries_encode_on_forced_host() {
+        let timestamp = Resource::QuerySet(alloc::sync::Arc::new(QuerySetInner {
+            query_type: wgt::QueryType::Timestamp,
+            count: 2,
+        }));
+        let occlusion = Resource::QuerySet(alloc::sync::Arc::new(QuerySetInner {
+            query_type: wgt::QueryType::Occlusion,
+            count: 2,
+        }));
+        let mut encoder = CommandBuffer::new();
+        unsafe {
+            encoder.reset_queries(&timestamp, 0..2);
+            encoder.write_timestamp(&timestamp, 1);
+            encoder.begin_query(&occlusion, 0);
+            encoder.end_query(&occlusion, 0);
+        }
+        let encoded = unsafe { encoder.end_encoding() }.unwrap();
+        assert!(matches!(
+            encoded.commands.as_slice(),
+            [
+                Command::ResetQueries { range, .. },
+                Command::WriteTimestamp(TimestampWrite { index: 1, .. }),
+                Command::BeginOcclusionQuery { index: 0, .. },
+                Command::EndOcclusionQuery { index: 0, .. },
+            ] if range == &(0..2)
+        ));
     }
 
     #[test]
@@ -1625,6 +1833,194 @@ unsafe fn submit_copy_texture_to_texture(
             Ok(())
         })
     }
+}
+
+fn timestamp_writes(
+    writes: Option<&crate::PassTimestampWrites<Resource>>,
+) -> DeviceResult<(Option<TimestampWrite>, Option<TimestampWrite>)> {
+    let Some(writes) = writes else {
+        return Ok((None, None));
+    };
+    let Resource::QuerySet(query_set) = writes.query_set else {
+        return Err(crate::DeviceError::Lost);
+    };
+    if !query_set.is_timestamp() {
+        return Err(crate::DeviceError::Lost);
+    }
+    let timestamp = |index: Option<u32>| -> DeviceResult<Option<TimestampWrite>> {
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        query_set.validate_range(index..index.checked_add(1).ok_or(crate::DeviceError::Lost)?)?;
+        Ok(Some(TimestampWrite {
+            query_set: query_set.clone(),
+            index,
+        }))
+    };
+    Ok((
+        timestamp(writes.beginning_of_pass_write_index)?,
+        timestamp(writes.end_of_pass_write_index)?,
+    ))
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_timestamp_write(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    timestamp: &TimestampWrite,
+) -> DeviceResult<()> {
+    let address = timestamp.query_set.report_address(timestamp.index)?;
+    unsafe {
+        submit_deko_commands(queue, surface_queue, "write_timestamp", |cmdbuf| {
+            dk::dkCmdBufReportCounter(cmdbuf, dk::DkCounter::DkCounter_Timestamp, address);
+            Ok(())
+        })
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_timestamp_write(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _timestamp: &TimestampWrite,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_reset_query_results(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    query_set: &QuerySetInner,
+    range: Range<u32>,
+) -> DeviceResult<()> {
+    query_set.validate_range(range.clone())?;
+    unsafe {
+        submit_deko_commands(queue, surface_queue, "reset_queries", |cmdbuf| {
+            for index in range {
+                dk::dkCmdBufReportValue(cmdbuf, 0, query_set.report_address(index)?);
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_reset_query_results(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _query_set: &QuerySetInner,
+    _range: Range<u32>,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_begin_occlusion_query(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    query_set: &QuerySetInner,
+    index: u32,
+) -> DeviceResult<()> {
+    if !query_set.is_occlusion() {
+        return Err(crate::DeviceError::Lost);
+    }
+    query_set.validate_range(index..index.checked_add(1).ok_or(crate::DeviceError::Lost)?)?;
+    unsafe {
+        submit_deko_commands(queue, surface_queue, "begin_occlusion_query", |cmdbuf| {
+            dk::dkCmdBufResetCounter(cmdbuf, dk::DkCounter::DkCounter_SamplesPassed);
+            Ok(())
+        })
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_begin_occlusion_query(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _query_set: &QuerySetInner,
+    _index: u32,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_end_occlusion_query(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    query_set: &QuerySetInner,
+    index: u32,
+) -> DeviceResult<()> {
+    if !query_set.is_occlusion() {
+        return Err(crate::DeviceError::Lost);
+    }
+    let address = query_set.report_address(index)?;
+    unsafe {
+        submit_deko_commands(queue, surface_queue, "end_occlusion_query", |cmdbuf| {
+            dk::dkCmdBufReportCounter(cmdbuf, dk::DkCounter::DkCounter_SamplesPassed, address);
+            Ok(())
+        })
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_end_occlusion_query(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _query_set: &QuerySetInner,
+    _index: u32,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_copy_query_results(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    query_set: &QuerySetInner,
+    range: Range<u32>,
+    buffer: &Buffer,
+    offset: wgt::BufferAddress,
+    stride: wgt::BufferSize,
+) -> DeviceResult<()> {
+    query_set.validate_range(range.clone())?;
+    if stride.get() < DEKO_QUERY_RESULT_SIZE {
+        return Err(crate::DeviceError::Lost);
+    }
+    let result_size =
+        wgt::BufferSize::new(DEKO_QUERY_RESULT_SIZE).ok_or(crate::DeviceError::Lost)?;
+    unsafe {
+        submit_deko_commands(queue, surface_queue, "copy_query_results", |cmdbuf| {
+            for (destination_index, query_index) in range.enumerate() {
+                let destination_index =
+                    u64::try_from(destination_index).map_err(|_| crate::DeviceError::Lost)?;
+                let destination_offset = offset
+                    .checked_add(
+                        destination_index
+                            .checked_mul(stride.get())
+                            .ok_or(crate::DeviceError::Lost)?,
+                    )
+                    .ok_or(crate::DeviceError::Lost)?;
+                let source = query_set.report_address(query_index)?;
+                let (destination, _) = buffer.gpu_binding(destination_offset, Some(result_size))?;
+                dk::dkCmdBufCopyBuffer(cmdbuf, source, destination, DEKO_QUERY_RESULT_SIZE as u32);
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_copy_query_results(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _query_set: &QuerySetInner,
+    _range: Range<u32>,
+    _buffer: &Buffer,
+    _offset: wgt::BufferAddress,
+    _stride: wgt::BufferSize,
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
 }
 
 #[cfg(target_os = "horizon")]

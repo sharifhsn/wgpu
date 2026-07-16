@@ -88,6 +88,7 @@ pub enum Resource {
     BindGroupLayout(BindGroupLayoutKind),
     PipelineLayout(Arc<PipelineLayoutInner>),
     PipelineCache,
+    QuerySet(Arc<QuerySetInner>),
     ShaderModule(Arc<ShaderModuleInner>),
     RenderPipeline(Arc<RenderPipelineInner>),
     ComputePipeline(Arc<ComputePipelineInner>),
@@ -253,6 +254,14 @@ pub struct PipelineLayoutInner {
     bind_group_layouts: Vec<Option<BindGroupLayoutKind>>,
     #[cfg(target_os = "horizon")]
     immediate_buffer: Option<Buffer>,
+}
+
+#[derive(Debug)]
+pub struct QuerySetInner {
+    query_type: wgt::QueryType,
+    count: u32,
+    #[cfg(target_os = "horizon")]
+    report_buffer: Buffer,
 }
 
 pub struct TextureInner {
@@ -659,6 +668,10 @@ const CMDMEMSIZE: u32 = 16 * 1024;
 const DEKO_UNIFORM_BUFFER_COUNT: u32 = 16;
 const DEKO_IMMEDIATES_BINDING: u32 = DEKO_UNIFORM_BUFFER_COUNT - 1;
 const DEKO_PUSH_CONSTANTS_MAX_SIZE: u32 = 0x7FFC;
+#[cfg(target_os = "horizon")]
+const DEKO_COUNTER_REPORT_SIZE: wgt::BufferAddress = 16;
+#[cfg(target_os = "horizon")]
+const DEKO_QUERY_RESULT_SIZE: wgt::BufferAddress = 8;
 const DEKO_UNIFORM_BUF_MAX_SIZE: u64 = 0x10000;
 const DEKO_TEXTURE_SAMPLER_COUNT: usize = 32;
 const DEKO_STORAGE_BUFFER_COUNT: u32 = 16;
@@ -1031,6 +1044,71 @@ impl PipelineLayoutInner {
             }
         }
         Ok(())
+    }
+}
+
+impl QuerySetInner {
+    pub(super) fn is_timestamp(&self) -> bool {
+        matches!(self.query_type, wgt::QueryType::Timestamp)
+    }
+
+    pub(super) fn is_occlusion(&self) -> bool {
+        matches!(self.query_type, wgt::QueryType::Occlusion)
+    }
+
+    fn is_supported(&self) -> bool {
+        self.is_timestamp() || self.is_occlusion()
+    }
+
+    pub(super) fn validate_range(&self, range: core::ops::Range<u32>) -> DeviceResult<()> {
+        if !self.is_supported() || range.start > range.end || range.end > self.count {
+            return Err(crate::DeviceError::Lost);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "horizon")]
+    fn new(
+        desc: &wgt::QuerySetDescriptor<crate::Label>,
+        pool: Arc<GpuBufferPool>,
+    ) -> DeviceResult<Self> {
+        if !matches!(
+            desc.ty,
+            wgt::QueryType::Timestamp | wgt::QueryType::Occlusion
+        ) || desc.count == 0
+        {
+            return Err(crate::DeviceError::Lost);
+        }
+        let size = u64::from(desc.count)
+            .checked_mul(DEKO_COUNTER_REPORT_SIZE)
+            .ok_or(crate::DeviceError::OutOfMemory)?;
+        let report_buffer = Buffer::new(
+            &crate::BufferDescriptor {
+                label: None,
+                size,
+                usage: wgt::BufferUses::COPY_SRC,
+                memory_flags: crate::MemoryFlags::empty(),
+            },
+            pool,
+        )?;
+        Ok(Self {
+            query_type: desc.ty,
+            count: desc.count,
+            report_buffer,
+        })
+    }
+
+    #[cfg(target_os = "horizon")]
+    pub(super) fn report_address(&self, index: u32) -> DeviceResult<dk::DkGpuAddr> {
+        self.validate_range(index..index.checked_add(1).ok_or(crate::DeviceError::Lost)?)?;
+        let offset = u64::from(index)
+            .checked_mul(DEKO_COUNTER_REPORT_SIZE)
+            .ok_or(crate::DeviceError::Lost)?;
+        let size =
+            wgt::BufferSize::new(DEKO_COUNTER_REPORT_SIZE).ok_or(crate::DeviceError::Lost)?;
+        self.report_buffer
+            .gpu_binding(offset, Some(size))
+            .map(|(address, _)| address)
     }
 }
 
@@ -3659,6 +3737,19 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_and_occlusion_query_ranges_are_checked() {
+        for query_type in [wgt::QueryType::Timestamp, wgt::QueryType::Occlusion] {
+            let query_set = QuerySetInner {
+                query_type,
+                count: 2,
+            };
+            assert!(query_set.validate_range(0..2).is_ok());
+            assert!(query_set.validate_range(2..2).is_ok());
+            assert!(query_set.validate_range(1..3).is_err());
+        }
+    }
+
+    #[test]
     fn dksh_validation_rejects_truncated_and_corrupt_headers() {
         assert!(validate_dksh(&valid_dksh()[..HEADER_SIZE - 1]).is_err());
 
@@ -4022,6 +4113,7 @@ pub fn supported_features() -> wgt::Features {
         | wgt::Features::MAPPABLE_PRIMARY_BUFFERS
         | wgt::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
         | wgt::Features::PIPELINE_CACHE
+        | wgt::Features::TIMESTAMP_QUERY
         | wgt::Features::MULTI_DRAW_INDIRECT_COUNT
 }
 
@@ -4444,7 +4536,14 @@ impl crate::Queue for Queue {
     }
 
     unsafe fn get_timestamp_period(&self) -> f32 {
-        1.0
+        #[cfg(target_os = "horizon")]
+        {
+            625.0 / 384.0
+        }
+        #[cfg(not(target_os = "horizon"))]
+        {
+            1.0
+        }
     }
 }
 
@@ -4764,7 +4863,18 @@ impl crate::Device for Device {
         &self,
         desc: &wgt::QuerySetDescriptor<crate::Label>,
     ) -> DeviceResult<Resource> {
-        Err(crate::DeviceError::Lost)
+        #[cfg(target_os = "horizon")]
+        {
+            Ok(Resource::QuerySet(Arc::new(QuerySetInner::new(
+                desc,
+                self.inner.buffer_pool.clone(),
+            )?)))
+        }
+        #[cfg(not(target_os = "horizon"))]
+        {
+            let _ = desc;
+            Err(crate::DeviceError::Lost)
+        }
     }
     unsafe fn destroy_query_set(&self, set: Resource) {}
     unsafe fn create_fence(&self) -> DeviceResult<Fence> {
