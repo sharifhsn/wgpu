@@ -196,6 +196,7 @@ impl Device {
         shader: &ShaderModule,
         stage: Deko3dWgslArtifactStage,
         entry_point: Option<&str>,
+        multiview_mask: Option<core::num::NonZeroU32>,
     ) -> Result<Option<ShaderModule>, Deko3dWgslArtifactError> {
         if self.adapter_info().backend != Backend::Deko3d {
             return Ok(None);
@@ -214,6 +215,7 @@ impl Device {
                 wgsl_sha256,
                 stage,
                 entry_point,
+                multiview_mask,
             },
         )?;
         Ok(Some(unsafe {
@@ -484,6 +486,7 @@ impl Device {
                 desc.vertex.module,
                 Deko3dWgslArtifactStage::Vertex,
                 desc.vertex.entry_point,
+                desc.multiview_mask,
             )
             .unwrap_or_else(|error| panic!("Deko3D WGSL artifact resolution failed: {error}"));
         let fragment_artifact = desc
@@ -494,6 +497,7 @@ impl Device {
                     fragment.module,
                     Deko3dWgslArtifactStage::Fragment,
                     fragment.entry_point,
+                    None,
                 )
             })
             .transpose()
@@ -545,6 +549,7 @@ impl Device {
                 desc.module,
                 Deko3dWgslArtifactStage::Compute,
                 desc.entry_point,
+                None,
             )
             .unwrap_or_else(|error| panic!("Deko3D WGSL artifact resolution failed: {error}"));
         let descriptor = ComputePipelineDescriptor {
@@ -1187,7 +1192,13 @@ mod deko3d_artifact_tests {
 
     struct Provider {
         expected: [u8; 32],
-        seen: std::sync::Mutex<Vec<(Deko3dWgslArtifactStage, String)>>,
+        seen: std::sync::Mutex<
+            Vec<(
+                Deko3dWgslArtifactStage,
+                String,
+                Option<core::num::NonZeroU32>,
+            )>,
+        >,
         artifact: Arc<[u8]>,
     }
 
@@ -1196,10 +1207,11 @@ mod deko3d_artifact_tests {
             if request.wgsl_sha256 != self.expected {
                 return Err("WGSL SHA-256 does not match the manifest".into());
             }
-            self.seen
-                .lock()
-                .unwrap()
-                .push((request.stage, request.entry_point.into()));
+            self.seen.lock().unwrap().push((
+                request.stage,
+                request.entry_point.into(),
+                request.multiview_mask,
+            ));
             Ok(self.artifact.clone())
         }
     }
@@ -1217,6 +1229,7 @@ mod deko3d_artifact_tests {
             wgsl_sha256,
             stage,
             entry_point,
+            multiview_mask: None,
         }
     }
 
@@ -1236,11 +1249,9 @@ mod deko3d_artifact_tests {
             state.install(provider.clone()),
             Err(Deko3dWgslArtifactError::AlreadyInstalled)
         );
-        resolve_deko3d_wgsl_artifact(
-            &state,
-            request(wgsl, Deko3dWgslArtifactStage::Vertex, "vertex_main"),
-        )
-        .unwrap();
+        let mut vertex_request = request(wgsl, Deko3dWgslArtifactStage::Vertex, "vertex_main");
+        vertex_request.multiview_mask = core::num::NonZeroU32::new(0b101);
+        resolve_deko3d_wgsl_artifact(&state, vertex_request).unwrap();
         resolve_deko3d_wgsl_artifact(
             &state,
             request(wgsl, Deko3dWgslArtifactStage::Fragment, "fragment_main"),
@@ -1249,10 +1260,15 @@ mod deko3d_artifact_tests {
         assert_eq!(
             *provider.seen.lock().unwrap(),
             vec![
-                (Deko3dWgslArtifactStage::Vertex, String::from("vertex_main")),
+                (
+                    Deko3dWgslArtifactStage::Vertex,
+                    String::from("vertex_main"),
+                    core::num::NonZeroU32::new(0b101)
+                ),
                 (
                     Deko3dWgslArtifactStage::Fragment,
-                    String::from("fragment_main")
+                    String::from("fragment_main"),
+                    None
                 ),
             ]
         );

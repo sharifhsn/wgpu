@@ -375,6 +375,8 @@ pub(super) struct RenderPipelineInnerRaw {
     bind_group_count: usize,
     vertex_bindings: Vec<ShaderBinding>,
     fragment_bindings: Vec<ShaderBinding>,
+    multiview_mask: Option<core::num::NonZeroU32>,
+    multiview_buffer: Option<Buffer>,
 }
 
 #[cfg(target_os = "horizon")]
@@ -690,6 +692,7 @@ const DEFAULT_HEIGHT: u32 = 720;
 const CMDMEMSIZE: u32 = 16 * 1024;
 const DEKO_UNIFORM_BUFFER_COUNT: u32 = 16;
 const DEKO_IMMEDIATES_BINDING: u32 = DEKO_UNIFORM_BUFFER_COUNT - 1;
+const DEKO_MULTIVIEW_BINDING: u32 = DEKO_UNIFORM_BUFFER_COUNT - 2;
 const DEKO_PUSH_CONSTANTS_MAX_SIZE: u32 = 0x7FFC;
 #[cfg(target_os = "horizon")]
 const DEKO_COUNTER_REPORT_SIZE: wgt::BufferAddress = 16;
@@ -1943,9 +1946,9 @@ impl ShaderModuleInner {
 impl RenderPipelineInner {
     fn new(
         desc: &crate::RenderPipelineDescriptor<Resource, Resource, Resource>,
+        buffer_pool: Arc<GpuBufferPool>,
     ) -> Result<Self, crate::PipelineError> {
-        if desc.multiview_mask.is_some()
-            || desc.multisample.alpha_to_coverage_enabled
+        if desc.multisample.alpha_to_coverage_enabled
             || !matches!(desc.cache, None | Some(Resource::PipelineCache))
         {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
@@ -2069,6 +2072,21 @@ impl RenderPipelineInner {
         let mut multisample_state = dk::DkMultisampleState::defaults();
         multisample_state.set_mode(ms_mode);
         multisample_state.set_rasterizer_mode(ms_mode);
+        let multiview_buffer = desc
+            .multiview_mask
+            .map(|_| {
+                Buffer::new(
+                    &crate::BufferDescriptor {
+                        label: None,
+                        size: u64::from(dk::DK_UNIFORM_BUF_ALIGNMENT),
+                        usage: wgt::BufferUses::UNIFORM,
+                        memory_flags: crate::MemoryFlags::empty(),
+                    },
+                    buffer_pool,
+                )
+            })
+            .transpose()
+            .map_err(crate::PipelineError::Device)?;
 
         Ok(Self {
             inner: RenderPipelineInnerRaw {
@@ -2097,6 +2115,8 @@ impl RenderPipelineInner {
                 bind_group_count: pipeline_layout.bind_group_layouts.len(),
                 vertex_bindings: vertex_shader.inner.bindings.clone(),
                 fragment_bindings: fragment_shader.inner.bindings.clone(),
+                multiview_mask: desc.multiview_mask,
+                multiview_buffer,
             },
         })
     }
@@ -4621,6 +4641,12 @@ pub fn supported_features() -> wgt::Features {
         | wgt::Features::PIPELINE_CACHE
         | wgt::Features::TIMESTAMP_QUERY
         | wgt::Features::MULTI_DRAW_INDIRECT_COUNT
+        | wgt::Features::TEXTURE_BINDING_ARRAY
+        | wgt::Features::BUFFER_BINDING_ARRAY
+        | wgt::Features::STORAGE_RESOURCE_BINDING_ARRAY
+        | wgt::Features::UNIFORM_BUFFER_BINDING_ARRAYS
+        | wgt::Features::MULTIVIEW
+        | wgt::Features::SELECTIVE_MULTIVIEW
 }
 
 /// Conservative capabilities for the first Deko3D adapter slice.
@@ -4629,7 +4655,11 @@ pub fn supported_features() -> wgt::Features {
 /// path is implemented and validated.
 pub fn capabilities() -> crate::Capabilities {
     let mut limits = wgt::Limits::downlevel_defaults();
-    limits.max_storage_buffers_per_shader_stage = 0;
+    limits.max_storage_buffers_per_shader_stage = DEKO_STORAGE_BUFFER_COUNT;
+    limits.max_storage_textures_per_shader_stage = DEKO_STORAGE_TEXTURE_COUNT;
+    limits.max_binding_array_elements_per_shader_stage = DEKO_TEXTURE_SAMPLER_COUNT as u32;
+    limits.max_binding_array_sampler_elements_per_shader_stage = DEKO_TEXTURE_SAMPLER_COUNT as u32;
+    limits.max_multiview_view_count = u32::BITS;
     crate::Capabilities {
         limits,
         alignments: crate::Alignments {
@@ -5271,7 +5301,7 @@ impl crate::Device for Device {
     ) -> Result<Resource, crate::PipelineError> {
         #[cfg(target_os = "horizon")]
         {
-            match RenderPipelineInner::new(desc) {
+            match RenderPipelineInner::new(desc, self.inner.buffer_pool.clone()) {
                 Ok(pipeline) => Ok(Resource::RenderPipeline(Arc::new(pipeline))),
                 Err(error) => {
                     trace::record(format_args!(

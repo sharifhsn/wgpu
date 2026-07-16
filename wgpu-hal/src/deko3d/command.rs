@@ -95,6 +95,7 @@ enum Command {
         stencil_clear_value: Option<u32>,
         beginning_timestamp: Option<TimestampWrite>,
         end_timestamp: Option<TimestampWrite>,
+        multiview_mask: Option<core::num::NonZeroU32>,
     },
     EndRenderPass,
     SetRenderPipeline {
@@ -219,6 +220,7 @@ struct RenderTarget {
     resolve_images: Vec<Option<RawImage>>,
     extent: wgt::Extent3d,
     depth: Option<RawImage>,
+    multiview_mask: Option<core::num::NonZeroU32>,
 }
 
 #[allow(dead_code)]
@@ -579,7 +581,7 @@ impl crate::CommandEncoder for CommandBuffer {
         &mut self,
         desc: &crate::RenderPassDescriptor<Resource, Resource>,
     ) -> DeviceResult<()> {
-        if desc.multiview_mask.is_some() || !supports_sample_count(desc.sample_count) {
+        if !supports_sample_count(desc.sample_count) {
             return Err(crate::DeviceError::Lost);
         }
         if let Some(query_set) = desc.occlusion_query_set {
@@ -758,6 +760,7 @@ impl crate::CommandEncoder for CommandBuffer {
             stencil_clear_value,
             beginning_timestamp,
             end_timestamp,
+            multiview_mask: desc.multiview_mask,
         });
         Ok(())
     }
@@ -1147,12 +1150,14 @@ impl Command {
                 stencil_clear_value,
                 beginning_timestamp,
                 end_timestamp,
+                multiview_mask,
             } => {
                 state.target = Some(RenderTarget {
                     images: images.clone(),
                     resolve_images: resolve_images.clone(),
                     extent: *extent,
                     depth: *depth,
+                    multiview_mask: *multiview_mask,
                 });
                 state.viewport = None;
                 state.scissor = None;
@@ -1399,6 +1404,15 @@ fn upload_after_host_write(buffer: &Buffer) -> DeviceResult<()> {
 #[cfg(all(test, deko3d, not(target_os = "horizon")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selective_multiview_replays_only_active_view_indices() {
+        let mask = core::num::NonZeroU32::new(0b10101).unwrap();
+        assert_eq!(
+            active_multiview_indices(mask).collect::<Vec<_>>(),
+            [0, 2, 4]
+        );
+    }
     use crate::{CommandEncoder as _, Queue as _};
     use std::sync::Mutex;
 
@@ -2907,11 +2921,14 @@ unsafe fn submit_deko_draw(
     queue: &Queue,
     surface_queue: Option<RawQueueHandle>,
     state: &ExecutionState,
-    draw: impl FnOnce(dk::DkCmdBuf, &super::RenderPipelineInnerRaw) -> DeviceResult<()>,
+    mut draw: impl FnMut(dk::DkCmdBuf, &super::RenderPipelineInnerRaw) -> DeviceResult<()>,
 ) -> DeviceResult<()> {
     let target = state.target.as_ref().ok_or(crate::DeviceError::Lost)?;
     let pipeline = state.pipeline.as_ref().ok_or(crate::DeviceError::Lost)?;
     let pipeline = pipeline.raw();
+    if target.multiview_mask != pipeline.multiview_mask {
+        return Err(crate::DeviceError::Lost);
+    }
     unsafe {
         submit_deko_commands(queue, surface_queue, "draw", |cmdbuf| {
             let depth_view = target.depth.map(|depth| depth.1);
@@ -3105,9 +3122,41 @@ unsafe fn submit_deko_draw(
                 pipeline.vertex_buffers.as_ptr(),
                 pipeline.vertex_buffers.len() as u32,
             );
-            draw(cmdbuf, pipeline)
+            if let Some(mask) = pipeline.multiview_mask {
+                let buffer = pipeline
+                    .multiview_buffer
+                    .as_ref()
+                    .ok_or(crate::DeviceError::Lost)?;
+                let (gpu_addr, gpu_size) = buffer.gpu_binding(0, None)?;
+                dk::dkCmdBufBindUniformBuffer(
+                    cmdbuf,
+                    dk::DkStage::DkStage_Vertex,
+                    super::DEKO_MULTIVIEW_BINDING,
+                    gpu_addr,
+                    gpu_size,
+                );
+                for view_index in active_multiview_indices(mask) {
+                    dk::dkCmdBufPushConstants(
+                        cmdbuf,
+                        gpu_addr,
+                        gpu_size,
+                        0,
+                        core::mem::size_of::<u32>() as u32,
+                        core::ptr::from_ref(&view_index).cast(),
+                    );
+                    draw(cmdbuf, pipeline)?;
+                }
+                Ok(())
+            } else {
+                draw(cmdbuf, pipeline)
+            }
         })
     }
+}
+
+fn active_multiview_indices(mask: core::num::NonZeroU32) -> impl Iterator<Item = u32> {
+    let bits = mask.get();
+    (0..u32::BITS).filter(move |index| bits & (1 << index) != 0)
 }
 
 #[cfg(target_os = "horizon")]
