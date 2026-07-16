@@ -1151,6 +1151,15 @@ unsafe fn bind_uniform_buffer(
     target: u32,
     stage: dk::DkStage,
 ) -> DeviceResult<()> {
+    let required_visibility = match stage {
+        dk::DkStage::DkStage_Vertex => wgt::ShaderStages::VERTEX,
+        dk::DkStage::DkStage_Fragment => wgt::ShaderStages::FRAGMENT,
+        dk::DkStage::DkStage_Compute => wgt::ShaderStages::COMPUTE,
+        _ => return Err(crate::DeviceError::Lost),
+    };
+    if !binding.visibility.contains(required_visibility) {
+        return Err(crate::DeviceError::Lost);
+    }
     let offset = binding
         .offset
         .checked_add(dynamic_offset)
@@ -1649,7 +1658,7 @@ impl ComputePipelineInner {
     fn new(
         desc: &crate::ComputePipelineDescriptor<Resource, Resource, Resource>,
     ) -> Result<Self, crate::PipelineError> {
-        if !matches!(desc.layout, Resource::PipelineLayout) || desc.cache.is_some() {
+        if !matches!(desc.layout, Resource::PipelineLayout(_)) || desc.cache.is_some() {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         }
 
@@ -1705,7 +1714,7 @@ fn map_rasterizer_state(primitive: &wgt::PrimitiveState) -> dk::DkRasterizerStat
 }
 
 #[cfg(target_os = "horizon")]
-fn map_depth_stencil_state(
+fn map_depth_stencil_state_expanded(
     depth_stencil: Option<&wgt::DepthStencilState>,
 ) -> Result<dk::DkDepthStencilState, crate::PipelineError> {
     let mut state = dk::DkDepthStencilState::defaults();
@@ -1760,7 +1769,7 @@ fn map_stencil_face_state(
     let fail = map_stencil_operation(face.fail_op);
     let pass = map_stencil_operation(face.pass_op);
     let depth_fail = map_stencil_operation(face.depth_fail_op);
-    let compare = map_compare_function(face.compare);
+    let compare = map_compare_function_expanded(face.compare);
     if front {
         state.set_stencil_front(fail, pass, depth_fail, compare);
     } else {
@@ -1784,7 +1793,7 @@ fn map_stencil_operation(operation: wgt::StencilOperation) -> dk::DkStencilOp {
 }
 
 #[cfg(target_os = "horizon")]
-fn map_compare_function(compare: wgt::CompareFunction) -> dk::DkCompareOp {
+fn map_compare_function_expanded(compare: wgt::CompareFunction) -> dk::DkCompareOp {
     match compare {
         wgt::CompareFunction::Never => dk::DkCompareOp::DkCompareOp_Never,
         wgt::CompareFunction::Less => dk::DkCompareOp::DkCompareOp_Less,
@@ -1819,13 +1828,13 @@ fn map_color_targets(
         let Some(color_target) = color_target else {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         };
-        if map_color_image_format(color_target.format).is_none() {
+        if map_texture_image_format(color_target.format).is_none() {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         }
         let index = u32::try_from(index)
             .map_err(|_| crate::PipelineError::Device(crate::DeviceError::Lost))?;
         color_write_state.set_mask(index, map_color_write_mask(color_target.write_mask));
-        let (blend_enable, blend_state) = map_blend_state(color_target.blend)?;
+        let (blend_enable, blend_state) = map_blend_state_expanded(color_target.blend)?;
         color_state.set_blend_enable(index, blend_enable);
         blend_states.push(blend_state);
     }
@@ -1853,7 +1862,7 @@ fn map_color_write_mask(write_mask: wgt::ColorWrites) -> u32 {
 }
 
 #[cfg(target_os = "horizon")]
-fn map_blend_state(
+fn map_blend_state_expanded(
     blend: Option<wgt::BlendState>,
 ) -> Result<(bool, dk::DkBlendState), crate::PipelineError> {
     let mut blend_state = dk::DkBlendState::defaults();
