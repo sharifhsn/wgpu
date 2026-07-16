@@ -30,7 +30,9 @@ cfg_if::cfg_if! {
     }
 }
 
-#[cfg(any(target_os = "horizon", test))]
+// Keep the raw ABI types available on host platforms as well as Horizon. deko3d-sys deliberately
+// performs no native linking off-target, which lets pure backend mapping and validation code compile
+// and run in ordinary host CI.
 use deko3d_sys as dk;
 
 mod buffer;
@@ -285,6 +287,8 @@ pub(super) struct RenderPipelineInnerRaw {
     blend_states: Vec<dk::DkBlendState>,
     depth_stencil_state: dk::DkDepthStencilState,
     uses_depth_stencil: bool,
+    stencil_read_mask: u8,
+    stencil_write_mask: u8,
     bind_group_count: usize,
     vertex_bindings: Vec<ShaderBinding>,
     fragment_bindings: Vec<ShaderBinding>,
@@ -1425,6 +1429,14 @@ impl RenderPipelineInner {
                 blend_states,
                 depth_stencil_state,
                 uses_depth_stencil,
+                stencil_read_mask: desc
+                    .depth_stencil
+                    .as_ref()
+                    .map_or(0xFF, |depth_stencil| depth_stencil.stencil.read_mask as u8),
+                stencil_write_mask: desc
+                    .depth_stencil
+                    .as_ref()
+                    .map_or(0xFF, |depth_stencil| depth_stencil.stencil.write_mask as u8),
                 bind_group_count: bind_group_layouts.len(),
                 vertex_bindings: vertex_shader.inner.bindings.clone(),
                 fragment_bindings: fragment_shader.inner.bindings.clone(),

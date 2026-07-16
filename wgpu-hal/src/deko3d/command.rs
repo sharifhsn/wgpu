@@ -15,6 +15,15 @@ use super::{
     RenderPipelineInner, Resource, TextureInner,
 };
 
+const DEKO_INVALIDATE_IMAGE: u32 = 1 << 0;
+const DEKO_INVALIDATE_SHADER: u32 = 1 << 1;
+const DEKO_INVALIDATE_DESCRIPTORS: u32 = 1 << 2;
+const DEKO_INVALIDATE_L2_CACHE: u32 = 1 << 4;
+const DEKO_RESOURCE_TRANSITION_INVALIDATE_FLAGS: u32 = DEKO_INVALIDATE_IMAGE
+    | DEKO_INVALIDATE_SHADER
+    | DEKO_INVALIDATE_DESCRIPTORS
+    | DEKO_INVALIDATE_L2_CACHE;
+
 /// Command buffer type, which performs double duty as the command encoder type too.
 #[derive(Debug)]
 pub struct CommandBuffer {
@@ -38,10 +47,18 @@ enum Command {
         dst: Option<alloc::sync::Arc<TextureInner>>,
         regions: Vec<crate::BufferTextureCopy>,
     },
+    CopyTextureToTexture {
+        src: Option<alloc::sync::Arc<TextureInner>>,
+        dst: Option<alloc::sync::Arc<TextureInner>>,
+        regions: Vec<crate::TextureCopy>,
+    },
     CopyTextureToBuffer {
         src: Option<alloc::sync::Arc<TextureInner>>,
         dst: Buffer,
         regions: Vec<crate::BufferTextureCopy>,
+    },
+    ResourceBarrier {
+        invalidate_flags: u32,
     },
     BeginRenderPass {
         images: Vec<Option<RawImage>>,
@@ -77,6 +94,12 @@ enum Command {
     SetScissor {
         rect: crate::Rect<u32>,
     },
+    SetStencilReference {
+        reference: u8,
+    },
+    SetBlendConstants {
+        color: [f32; 4],
+    },
     Draw {
         first_vertex: u32,
         vertex_count: u32,
@@ -101,6 +124,8 @@ struct ExecutionState {
     bind_groups: Vec<Option<BoundBindGroup>>,
     viewport: Option<(crate::Rect<f32>, Range<f32>)>,
     scissor: Option<crate::Rect<u32>>,
+    stencil_reference: u8,
+    blend_constants: [f32; 4],
 }
 
 #[allow(dead_code)]
@@ -158,7 +183,9 @@ impl CommandBuffer {
                         Command::ClearBuffer { .. } => "clear_buffer",
                         Command::CopyBufferToBuffer { .. } => "copy_buffer_to_buffer",
                         Command::CopyBufferToTexture { .. } => "copy_buffer_to_texture",
+                        Command::CopyTextureToTexture { .. } => "copy_texture_to_texture",
                         Command::CopyTextureToBuffer { .. } => "copy_texture_to_buffer",
+                        Command::ResourceBarrier { .. } => "resource_barrier",
                         Command::BeginRenderPass { .. } => "begin_render_pass",
                         Command::SetRenderPipeline { .. } => "set_render_pipeline",
                         Command::SetVertexBuffer { .. } => "set_vertex_buffer",
@@ -166,6 +193,8 @@ impl CommandBuffer {
                         Command::SetBindGroup { .. } => "set_bind_group",
                         Command::SetViewport { .. } => "set_viewport",
                         Command::SetScissor { .. } => "set_scissor",
+                        Command::SetStencilReference { .. } => "set_stencil_reference",
+                        Command::SetBlendConstants { .. } => "set_blend_constants",
                         Command::Draw { .. } => "draw",
                         Command::DrawIndexed { .. } => "draw_indexed",
                     }
@@ -227,12 +256,28 @@ impl crate::CommandEncoder for CommandBuffer {
     where
         T: Iterator<Item = crate::BufferBarrier<'a, Buffer>>,
     {
+        if barriers
+            .into_iter()
+            .any(|barrier| barrier.usage.from != barrier.usage.to)
+        {
+            self.commands.push(Command::ResourceBarrier {
+                invalidate_flags: DEKO_RESOURCE_TRANSITION_INVALIDATE_FLAGS,
+            });
+        }
     }
 
     unsafe fn transition_textures<'a, T>(&mut self, barriers: T)
     where
         T: Iterator<Item = crate::TextureBarrier<'a, Resource>>,
     {
+        if barriers
+            .into_iter()
+            .any(|barrier| barrier.usage.from != barrier.usage.to)
+        {
+            self.commands.push(Command::ResourceBarrier {
+                invalidate_flags: DEKO_RESOURCE_TRANSITION_INVALIDATE_FLAGS,
+            });
+        }
     }
 
     unsafe fn clear_buffer(&mut self, buffer: &Buffer, range: crate::MemoryRange) {
@@ -269,11 +314,25 @@ impl crate::CommandEncoder for CommandBuffer {
     unsafe fn copy_texture_to_texture<T>(
         &mut self,
         src: &Resource,
-        src_usage: wgt::TextureUses,
+        _src_usage: wgt::TextureUses,
         dst: &Resource,
         regions: T,
-    ) {
-        self.record_unsupported();
+    ) where
+        T: Iterator<Item = crate::TextureCopy>,
+    {
+        let src = match src {
+            Resource::Texture(texture) => Some(texture.clone()),
+            _ => None,
+        };
+        let dst = match dst {
+            Resource::Texture(texture) => Some(texture.clone()),
+            _ => None,
+        };
+        self.commands.push(Command::CopyTextureToTexture {
+            src,
+            dst,
+            regions: regions.collect(),
+        });
     }
 
     unsafe fn copy_buffer_to_texture<T>(&mut self, src: &Buffer, dst: &Resource, regions: T)
@@ -548,10 +607,13 @@ impl crate::CommandEncoder for CommandBuffer {
             .push(Command::SetScissor { rect: rect.clone() });
     }
     unsafe fn set_stencil_reference(&mut self, value: u32) {
-        self.record_unsupported();
+        self.commands.push(Command::SetStencilReference {
+            reference: value as u8,
+        });
     }
     unsafe fn set_blend_constants(&mut self, color: &[f32; 4]) {
-        self.record_unsupported();
+        self.commands
+            .push(Command::SetBlendConstants { color: *color });
     }
 
     unsafe fn draw(
@@ -746,10 +808,18 @@ impl Command {
                 let dst = dst.as_ref().ok_or(crate::DeviceError::Lost)?;
                 unsafe { submit_copy_buffer_to_texture(queue, surface_queue, src, dst, regions) }
             }
+            Command::CopyTextureToTexture { src, dst, regions } => {
+                let src = src.as_ref().ok_or(crate::DeviceError::Lost)?;
+                let dst = dst.as_ref().ok_or(crate::DeviceError::Lost)?;
+                unsafe { submit_copy_texture_to_texture(queue, surface_queue, src, dst, regions) }
+            }
             Command::CopyTextureToBuffer { src, dst, regions } => {
                 let src = src.as_ref().ok_or(crate::DeviceError::Lost)?;
                 unsafe { submit_copy_texture_to_buffer(queue, surface_queue, src, dst, regions) }
             }
+            Command::ResourceBarrier { invalidate_flags } => unsafe {
+                submit_resource_barrier(queue, surface_queue, *invalidate_flags)
+            },
             Command::BeginRenderPass {
                 images,
                 extent,
@@ -834,6 +904,14 @@ impl Command {
                 state.scissor = Some(rect.clone());
                 Ok(())
             }
+            Command::SetStencilReference { reference } => {
+                state.stencil_reference = *reference;
+                Ok(())
+            }
+            Command::SetBlendConstants { color } => {
+                state.blend_constants = *color;
+                Ok(())
+            }
             Command::Draw {
                 first_vertex,
                 vertex_count,
@@ -899,19 +977,47 @@ mod tests {
     #[test]
     fn unsupported_void_commands_fail_encoding_on_forced_host() {
         assert_end_fails(|encoder| unsafe {
-            encoder.copy_texture_to_texture(
-                &Resource::Placeholder,
-                wgt::TextureUses::COPY_SRC,
-                &Resource::Placeholder,
-                core::iter::empty(),
-            );
-        });
-        assert_end_fails(|encoder| unsafe {
             encoder.draw_mesh_tasks(1, 1, 1);
         });
         assert_end_fails(|encoder| unsafe {
             encoder.dispatch([1, 1, 1]);
         });
+    }
+
+    #[test]
+    fn copy_dynamic_state_and_resource_transitions_encode_on_forced_host() {
+        let mut encoder = CommandBuffer::new();
+        let placeholder = Resource::Placeholder;
+        unsafe {
+            encoder.copy_texture_to_texture(
+                &placeholder,
+                wgt::TextureUses::COPY_SRC,
+                &placeholder,
+                core::iter::empty(),
+            );
+            encoder.set_stencil_reference(0xAB);
+            encoder.set_blend_constants(&[0.25, 0.5, 0.75, 1.0]);
+            encoder.transition_textures(core::iter::once(crate::TextureBarrier {
+                texture: &placeholder,
+                range: wgt::ImageSubresourceRange::default(),
+                usage: crate::StateTransition {
+                    from: wgt::TextureUses::COPY_SRC,
+                    to: wgt::TextureUses::COPY_DST,
+                },
+            }));
+        }
+        let encoded = unsafe { encoder.end_encoding() }.unwrap();
+        assert!(matches!(
+            encoded.commands.as_slice(),
+            [
+                Command::CopyTextureToTexture { .. },
+                Command::SetStencilReference { reference: 0xAB },
+                Command::SetBlendConstants { .. },
+                Command::ResourceBarrier {
+                    invalidate_flags: DEKO_RESOURCE_TRANSITION_INVALIDATE_FLAGS
+                }
+            ]
+        ));
     }
 
     #[test]
@@ -1183,6 +1289,124 @@ unsafe fn submit_copy_buffer_to_texture(
 }
 
 #[cfg(target_os = "horizon")]
+fn texture_copy_view_and_rect(
+    texture: &TextureInner,
+    base: &crate::TextureCopyBase,
+    size: crate::CopyExtent,
+) -> DeviceResult<(dk::DkImageView, dk::DkImageRect)> {
+    let expected_aspect = match texture.format() {
+        wgt::TextureFormat::Depth16Unorm | wgt::TextureFormat::Depth32Float => {
+            crate::FormatAspects::DEPTH
+        }
+        _ => crate::FormatAspects::COLOR,
+    };
+    if base.aspect != expected_aspect || size.depth == 0 {
+        return Err(crate::DeviceError::Lost);
+    }
+    let extent = texture.extent();
+    let mip_width = extent.width.checked_shr(base.mip_level).unwrap_or(0).max(1);
+    let mip_height = extent
+        .height
+        .checked_shr(base.mip_level)
+        .unwrap_or(0)
+        .max(1);
+    let end_x = base
+        .origin
+        .x
+        .checked_add(size.width)
+        .ok_or(crate::DeviceError::Lost)?;
+    let end_y = base
+        .origin
+        .y
+        .checked_add(size.height)
+        .ok_or(crate::DeviceError::Lost)?;
+    if end_x > mip_width || end_y > mip_height {
+        return Err(crate::DeviceError::Lost);
+    }
+
+    let mut view = texture.raw_image().1;
+    view.mipLevelOffset = u8::try_from(base.mip_level).map_err(|_| crate::DeviceError::Lost)?;
+    view.mipLevelCount = 1;
+    let z = if texture.dimension() == wgt::TextureDimension::D3 {
+        if base.array_layer != 0
+            || base
+                .origin
+                .z
+                .checked_add(size.depth)
+                .ok_or(crate::DeviceError::Lost)?
+                > extent.depth_or_array_layers
+        {
+            return Err(crate::DeviceError::Lost);
+        }
+        view.type_ = dk::DkImageType::DkImageType_3D;
+        base.origin.z
+    } else {
+        if base.origin.z != 0
+            || base
+                .array_layer
+                .checked_add(size.depth)
+                .ok_or(crate::DeviceError::Lost)?
+                > extent.depth_or_array_layers
+        {
+            return Err(crate::DeviceError::Lost);
+        }
+        view.layerOffset = u16::try_from(base.array_layer).map_err(|_| crate::DeviceError::Lost)?;
+        view.layerCount = u16::try_from(size.depth).map_err(|_| crate::DeviceError::Lost)?;
+        0
+    };
+    Ok((
+        view,
+        dk::DkImageRect {
+            x: base.origin.x,
+            y: base.origin.y,
+            z,
+            width: size.width,
+            height: size.height,
+            depth: size.depth,
+        },
+    ))
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_copy_texture_to_texture(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    src: &TextureInner,
+    dst: &TextureInner,
+    regions: &[crate::TextureCopy],
+) -> DeviceResult<()> {
+    if src.format().remove_srgb_suffix() != dst.format().remove_srgb_suffix() {
+        return Err(crate::DeviceError::Lost);
+    }
+    unsafe {
+        submit_deko_commands(queue, surface_queue, "copy_texture_to_texture", |cmdbuf| {
+            for region in regions {
+                let (src_view, src_rect) =
+                    texture_copy_view_and_rect(src, &region.src_base, region.size)?;
+                let (dst_view, dst_rect) =
+                    texture_copy_view_and_rect(dst, &region.dst_base, region.size)?;
+                dk::dkCmdBufCopyImage(cmdbuf, &src_view, &src_rect, &dst_view, &dst_rect, 0);
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(target_os = "horizon")]
+unsafe fn submit_resource_barrier(
+    queue: &Queue,
+    surface_queue: Option<RawQueueHandle>,
+    invalidate_flags: u32,
+) -> DeviceResult<()> {
+    unsafe {
+        submit_deko_commands(queue, surface_queue, "resource_barrier", |cmdbuf| {
+            dk::dkCmdBufBarrier(cmdbuf, dk::DkBarrier::DkBarrier_Full, invalidate_flags);
+            Ok(())
+        })
+    }
+}
+
+#[cfg(target_os = "horizon")]
 unsafe fn submit_copy_texture_to_buffer(
     queue: &Queue,
     surface_queue: Option<RawQueueHandle>,
@@ -1373,6 +1597,26 @@ unsafe fn submit_copy_texture_to_buffer(
     _regions: &[crate::BufferTextureCopy],
 ) -> DeviceResult<()> {
     Err(crate::DeviceError::Lost)
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_copy_texture_to_texture(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _src: &TextureInner,
+    _dst: &TextureInner,
+    _regions: &[crate::TextureCopy],
+) -> DeviceResult<()> {
+    Err(crate::DeviceError::Lost)
+}
+
+#[cfg(not(target_os = "horizon"))]
+unsafe fn submit_resource_barrier(
+    _queue: &Queue,
+    _surface_queue: Option<RawQueueHandle>,
+    _invalidate_flags: u32,
+) -> DeviceResult<()> {
+    Ok(())
 }
 
 #[cfg(not(target_os = "horizon"))]
@@ -1708,6 +1952,20 @@ unsafe fn submit_deko_draw(
                 return Err(crate::DeviceError::Lost);
             }
             dk::dkCmdBufBindDepthStencilState(cmdbuf, &pipeline.depth_stencil_state);
+            dk::dkCmdBufSetStencil(
+                cmdbuf,
+                dk::DkFace_FrontAndBack,
+                pipeline.stencil_write_mask,
+                state.stencil_reference,
+                pipeline.stencil_read_mask,
+            );
+            dk::dkCmdBufSetBlendConst(
+                cmdbuf,
+                state.blend_constants[0],
+                state.blend_constants[1],
+                state.blend_constants[2],
+                state.blend_constants[3],
+            );
             for (index, binding) in state.vertex_buffers.iter().enumerate() {
                 let Some(binding) = binding else {
                     continue;

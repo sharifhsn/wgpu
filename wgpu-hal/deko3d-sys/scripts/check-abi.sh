@@ -23,4 +23,10 @@ skip_if_missing "$DEVKITPRO/libnx/include/switch.h"
   -I "$DEVKITPRO/libnx/include" \
   "$ROOT_DIR/abi/deko3d_sys_b1_abi_check.cpp"
 
-echo "deko3d-sys B1 ABI check passed against $DEVKITPRO"
+"$CXX" \
+  -std=c++14 \
+  -fsyntax-only \
+  -I "$DEVKITPRO/libnx/include" \
+  "$ROOT_DIR/abi/deko3d_sys_abi_check.cpp"
+
+echo "deko3d-sys narrow and extended ABI checks passed against $DEVKITPRO"

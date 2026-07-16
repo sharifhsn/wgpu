@@ -1,12 +1,29 @@
 [package]
 name = "deko3d-sys"
 version = "0.1.0"
+authors = ["Sharif Hsn", "gfx-rs developers"]
 edition.workspace = true
 rust-version.workspace = true
 links = "deko3d"
 build = "build.rs"
-description = "Deko3D and libnx link integration for the experimental wgpu Horizon backend."
+description = "Raw no_std Rust bindings and link integration for the Deko3D Nintendo Switch homebrew graphics API."
+documentation = "https://docs.rs/deko3d-sys"
+homepage = "https://github.com/devkitPro/deko3d"
+repository = "https://github.com/sharifhsn/wgpu"
+readme = "README.md"
 license = "Zlib"
+keywords = ["deko3d", "nintendo-switch", "graphics", "ffi", "no-std"]
+categories = ["external-ffi-bindings", "graphics", "no-std"]
+include = [
+    "src/**/*.rs",
+    "abi/**/*.cpp",
+    "scripts/*.sh",
+    "build.rs",
+    "Cargo.toml",
+    "CHANGELOG.md",
+    "LICENSE",
+    "README.md",
+]
 
 [lib]
 path = "src/lib.rs"
@@ -15,3 +32,10 @@ path = "src/lib.rs"
 default = []
 debug-deko3d = []
 release-deko3d = []
+
+[package.metadata.docs.rs]
+default-target = "x86_64-unknown-linux-gnu"
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+
+[lints]
+workspace = true

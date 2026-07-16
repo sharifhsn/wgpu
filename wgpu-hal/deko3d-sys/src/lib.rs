@@ -1,10 +1,8 @@
 #![no_std]
+#![doc = include_str!("../README.md")]
+#![deny(unsafe_op_in_unsafe_fn)]
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
-#![allow(
-    clippy::identity_op,
-    clippy::missing_safety_doc,
-    clippy::new_without_default
-)]
+#![allow(clippy::identity_op, clippy::new_without_default)]
 
 use core::ffi::{c_char, c_int, c_void};
 
@@ -187,6 +185,21 @@ pub const DkQueueFlags_DisableZcull: u32 = 1 << 4;
 pub enum DkCounter {
     DkCounter_TimestampPipelineTop = 0,
     DkCounter_Timestamp = 1,
+    DkCounter_SamplesPassed = 2,
+    DkCounter_ZcullStats = 3,
+    DkCounter_InputVertices = 4,
+    DkCounter_InputPrimitives = 5,
+    DkCounter_VertexShaderInvocations = 6,
+    DkCounter_TessControlShaderInvocations = 7,
+    DkCounter_TessEvaluationShaderInvocations = 8,
+    DkCounter_GeometryShaderInvocations = 9,
+    DkCounter_FragmentShaderInvocations = 10,
+    DkCounter_TessEvaluationShaderPrimitives = 11,
+    DkCounter_GeometryShaderPrimitives = 12,
+    DkCounter_ClipperInputPrimitives = 13,
+    DkCounter_ClipperOutputPrimitives = 14,
+    DkCounter_PrimitivesGenerated = 15,
+    DkCounter_TransformFeedbackPrimitivesWritten = 16,
 }
 
 #[repr(C)]
@@ -413,6 +426,10 @@ impl DkMultisampleState {
     pub fn set_rasterizer_mode(&mut self, mode: DkMsMode) {
         self.bits = (self.bits & !(0b111 << 3)) | (((mode as u32) & 0b111) << 3);
     }
+
+    pub fn set_alpha_to_coverage_enable(&mut self, enable: bool) {
+        self.bits = (self.bits & !(1 << 6)) | (u32::from(enable) << 6);
+    }
 }
 
 #[repr(C)]
@@ -554,6 +571,10 @@ impl DkRasterizerState {
 
     pub fn set_front_face(&mut self, front_face: u32) {
         self.bits = (self.bits & !(0b1 << 9)) | ((front_face & 0b1) << 9);
+    }
+
+    pub fn set_depth_bias_enable(&mut self, enable: bool) {
+        self.bits = (self.bits & !(0b111 << 14)) | (u32::from(enable) * 0b100 << 14);
     }
 }
 
@@ -1093,6 +1114,9 @@ unsafe extern "C" {
     pub fn dkMemBlockDestroy(obj: DkMemBlock);
     pub fn dkMemBlockGetCpuAddr(obj: DkMemBlock) -> *mut c_void;
     pub fn dkMemBlockGetGpuAddr(obj: DkMemBlock) -> DkGpuAddr;
+    pub fn dkMemBlockGetSize(obj: DkMemBlock) -> u32;
+    pub fn dkMemBlockFlushCpuCache(obj: DkMemBlock, offset: u32, size: u32) -> DkResult;
+    pub fn dkFenceWait(obj: *mut DkFence, timeout_ns: i64) -> DkResult;
 
     pub fn dkCmdBufCreate(maker: *const DkCmdBufMaker) -> DkCmdBuf;
     pub fn dkCmdBufDestroy(obj: DkCmdBuf);
@@ -1147,6 +1171,27 @@ unsafe extern "C" {
         numStates: u32,
     );
     pub fn dkCmdBufBindDepthStencilState(obj: DkCmdBuf, state: *const DkDepthStencilState);
+    pub fn dkCmdBufBindMultisampleState(obj: DkCmdBuf, state: *const DkMultisampleState);
+    pub fn dkCmdBufSetBlendConst(obj: DkCmdBuf, red: f32, green: f32, blue: f32, alpha: f32);
+    pub fn dkCmdBufSetSampleMask(obj: DkCmdBuf, mask: u32);
+    pub fn dkCmdBufSetDepthBias(obj: DkCmdBuf, constantFactor: f32, clamp: f32, slopeFactor: f32);
+    pub fn dkCmdBufSetPrimitiveRestart(obj: DkCmdBuf, enable: bool, index: u32);
+    pub fn dkCmdBufSetStencil(obj: DkCmdBuf, face: u32, mask: u8, funcRef: u8, funcMask: u8);
+    pub fn dkCmdBufDiscardColor(obj: DkCmdBuf, targetId: u32);
+    pub fn dkCmdBufDiscardDepthStencil(obj: DkCmdBuf);
+    pub fn dkCmdBufResolveImage(
+        obj: DkCmdBuf,
+        srcView: *const DkImageView,
+        dstView: *const DkImageView,
+    );
+    pub fn dkCmdBufPushConstants(
+        obj: DkCmdBuf,
+        uboAddr: DkGpuAddr,
+        uboSize: u32,
+        offset: u32,
+        size: u32,
+        data: *const c_void,
+    );
     pub fn dkCmdBufPushData(obj: DkCmdBuf, addr: DkGpuAddr, data: *const c_void, size: u32);
     pub fn dkCmdBufCopyBuffer(obj: DkCmdBuf, srcAddr: DkGpuAddr, dstAddr: DkGpuAddr, size: u32);
     pub fn dkCmdBufBindTextures(
@@ -1166,6 +1211,13 @@ unsafe extern "C" {
     pub fn dkCmdBufBindImageDescriptorSet(obj: DkCmdBuf, setAddr: DkGpuAddr, numDescriptors: u32);
     pub fn dkCmdBufBindSamplerDescriptorSet(obj: DkCmdBuf, setAddr: DkGpuAddr, numDescriptors: u32);
     pub fn dkCmdBufBindUniformBuffers(
+        obj: DkCmdBuf,
+        stage: DkStage,
+        firstId: u32,
+        buffers: *const DkBufExtents,
+        numBuffers: u32,
+    );
+    pub fn dkCmdBufBindStorageBuffers(
         obj: DkCmdBuf,
         stage: DkStage,
         firstId: u32,
@@ -1197,6 +1249,7 @@ unsafe extern "C" {
         firstVertex: u32,
         firstInstance: u32,
     );
+    pub fn dkCmdBufDrawIndirect(obj: DkCmdBuf, prim: DkPrimitive, indirect: DkGpuAddr);
     pub fn dkCmdBufDrawIndexed(
         obj: DkCmdBuf,
         prim: DkPrimitive,
@@ -1206,6 +1259,14 @@ unsafe extern "C" {
         vertexOffset: i32,
         firstInstance: u32,
     );
+    pub fn dkCmdBufDrawIndexedIndirect(obj: DkCmdBuf, prim: DkPrimitive, indirect: DkGpuAddr);
+    pub fn dkCmdBufDispatchCompute(
+        obj: DkCmdBuf,
+        numGroupsX: u32,
+        numGroupsY: u32,
+        numGroupsZ: u32,
+    );
+    pub fn dkCmdBufDispatchComputeIndirect(obj: DkCmdBuf, indirect: DkGpuAddr);
     pub fn dkCmdBufCopyBufferToImage(
         obj: DkCmdBuf,
         src: *const DkCopyBuf,
@@ -1228,6 +1289,9 @@ unsafe extern "C" {
         dstRect: *const DkImageRect,
         flags: u32,
     );
+    pub fn dkCmdBufReportCounter(obj: DkCmdBuf, type_: DkCounter, addr: DkGpuAddr);
+    pub fn dkCmdBufReportValue(obj: DkCmdBuf, value: u32, addr: DkGpuAddr);
+    pub fn dkCmdBufResetCounter(obj: DkCmdBuf, type_: DkCounter);
 
     pub fn dkQueueCreate(maker: *const DkQueueMaker) -> DkQueue;
     pub fn dkQueueDestroy(obj: DkQueue);
@@ -1266,6 +1330,12 @@ unsafe extern "C" {
     pub fn nwindowGetDefault() -> *mut NWindow;
 }
 
+/// Binds a single color target and an optional depth target.
+///
+/// # Safety
+///
+/// `obj` and every non-null image view must be valid for the active command-buffer recording, and
+/// the attachments must satisfy Deko3D's format, layout, and lifetime requirements.
 pub unsafe fn dkCmdBufBindRenderTarget(
     obj: DkCmdBuf,
     colorTarget: *const DkImageView,
@@ -1274,6 +1344,12 @@ pub unsafe fn dkCmdBufBindRenderTarget(
     unsafe { dkCmdBufBindRenderTargets(obj, &colorTarget, 1, depthTarget) };
 }
 
+/// Clears one color attachment using four floating-point components.
+///
+/// # Safety
+///
+/// `obj` must be a valid recording command buffer and `targetId` and `clearMask` must describe a
+/// currently bound, compatible color attachment.
 pub unsafe fn dkCmdBufClearColorFloat(
     obj: DkCmdBuf,
     targetId: u32,
@@ -1287,10 +1363,22 @@ pub unsafe fn dkCmdBufClearColorFloat(
     unsafe { dkCmdBufClearColor(obj, targetId, clearMask, data.as_ptr().cast()) };
 }
 
+/// Binds one blend-state value.
+///
+/// # Safety
+///
+/// `obj` must be a valid recording command buffer and `state` must point to a valid
+/// `DkBlendState` for the duration of this call.
 pub unsafe fn dkCmdBufBindBlendState(obj: DkCmdBuf, id: u32, state: *const DkBlendState) {
     unsafe { dkCmdBufBindBlendStates(obj, id, state, 1) };
 }
 
+/// Binds one vertex-buffer address range.
+///
+/// # Safety
+///
+/// `obj` must be valid and recording. The GPU address range must remain allocated, correctly
+/// aligned, and accessible to the queue until execution completes.
 pub unsafe fn dkCmdBufBindVtxBuffer(obj: DkCmdBuf, id: u32, bufAddr: DkGpuAddr, bufSize: u32) {
     let ext = DkBufExtents {
         addr: bufAddr,
@@ -1299,6 +1387,12 @@ pub unsafe fn dkCmdBufBindVtxBuffer(obj: DkCmdBuf, id: u32, bufAddr: DkGpuAddr, 
     unsafe { dkCmdBufBindVtxBuffers(obj, id, &ext, 1) };
 }
 
+/// Binds one uniform-buffer address range to a shader stage.
+///
+/// # Safety
+///
+/// `obj` must be valid and recording. The GPU address range must meet Deko3D's uniform-buffer
+/// alignment and size requirements and remain accessible until execution completes.
 pub unsafe fn dkCmdBufBindUniformBuffer(
     obj: DkCmdBuf,
     stage: DkStage,
@@ -1313,6 +1407,26 @@ pub unsafe fn dkCmdBufBindUniformBuffer(
     unsafe { dkCmdBufBindUniformBuffers(obj, stage, id, &ext, 1) };
 }
 
+/// Binds one storage-buffer address range to a shader stage.
+///
+/// # Safety
+///
+/// `obj` must be valid and recording. The GPU address range must meet Deko3D's storage-buffer
+/// requirements and remain accessible until execution completes.
+pub unsafe fn dkCmdBufBindStorageBuffer(
+    obj: DkCmdBuf,
+    stage: DkStage,
+    id: u32,
+    bufAddr: DkGpuAddr,
+    bufSize: u32,
+) {
+    let ext = DkBufExtents {
+        addr: bufAddr,
+        size: bufSize,
+    };
+    unsafe { dkCmdBufBindStorageBuffers(obj, stage, id, &ext, 1) };
+}
+
 pub const fn dkMakeImageHandle(id: u32) -> DkResHandle {
     id & ((1 << 20) - 1)
 }
@@ -1325,15 +1439,28 @@ pub const fn dkMakeTextureHandle(imageId: u32, samplerId: u32) -> DkResHandle {
     dkMakeImageHandle(imageId) | dkMakeSamplerHandle(samplerId)
 }
 
+/// Binds one combined texture handle.
+///
+/// # Safety
+///
+/// `obj` must be valid and recording, and `handle` must reference live image and sampler
+/// descriptors compatible with `stage`.
 pub unsafe fn dkCmdBufBindTexture(obj: DkCmdBuf, stage: DkStage, id: u32, handle: DkResHandle) {
     unsafe { dkCmdBufBindTextures(obj, stage, id, &handle, 1) };
 }
 
+/// Binds one storage-image handle.
+///
+/// # Safety
+///
+/// `obj` must be valid and recording, and `handle` must reference a live image descriptor with
+/// load/store usage compatible with `stage`.
 pub unsafe fn dkCmdBufBindImage(obj: DkCmdBuf, stage: DkStage, id: u32, handle: DkResHandle) {
     unsafe { dkCmdBufBindImages(obj, stage, id, &handle, 1) };
 }
 
-pub fn milestone_1_compile_smoke() {
+#[cfg(test)]
+fn abi_surface_compile_smoke() {
     let _ = core::mem::size_of::<DkDeviceMaker>();
     let _ = core::mem::size_of::<DkQueue>();
     let _ = core::mem::size_of::<DkCmdBuf>();
@@ -1347,7 +1474,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn milestone_1_surface_is_nameable() {
+    fn abi_surface_is_nameable() {
         let _device_maker = DkDeviceMaker::defaults();
         let _cmd_maker = DkCmdBufMaker::defaults(core::ptr::null_mut());
         let _queue_maker = DkQueueMaker::defaults(core::ptr::null_mut());
@@ -1357,12 +1484,30 @@ mod tests {
             core::ptr::null(),
             0,
         );
-        milestone_1_compile_smoke();
+        abi_surface_compile_smoke();
     }
 
     #[test]
     fn bgra8_image_format_values_match_deko3d() {
         assert_eq!(DkImageFormat::DkImageFormat_BGRA8_Unorm as u32, 117);
         assert_eq!(DkImageFormat::DkImageFormat_BGRA8_Unorm_sRGB as u32, 119);
+    }
+
+    #[test]
+    fn advanced_counter_and_state_values_match_deko3d() {
+        assert_eq!(DkCounter::DkCounter_SamplesPassed as u32, 2);
+        assert_eq!(DkCounter::DkCounter_FragmentShaderInvocations as u32, 10);
+
+        let mut multisample = DkMultisampleState::defaults();
+        multisample.set_alpha_to_coverage_enable(true);
+        assert_ne!(multisample.bits & (1 << 6), 0);
+        multisample.set_alpha_to_coverage_enable(false);
+        assert_eq!(multisample.bits & (1 << 6), 0);
+
+        let mut rasterizer = DkRasterizerState::defaults();
+        rasterizer.set_depth_bias_enable(true);
+        assert_eq!((rasterizer.bits >> 14) & 0b111, 0b100);
+        rasterizer.set_depth_bias_enable(false);
+        assert_eq!((rasterizer.bits >> 14) & 0b111, 0);
     }
 }
