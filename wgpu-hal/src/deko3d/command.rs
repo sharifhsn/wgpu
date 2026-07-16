@@ -337,9 +337,11 @@ impl crate::CommandEncoder for CommandBuffer {
     type A = Api;
 
     unsafe fn begin_encoding(&mut self, label: crate::Label) -> DeviceResult<()> {
-        assert!(self.commands.is_empty());
-        assert!(self.error.is_none());
-        Ok(())
+        if self.commands.is_empty() && self.error.is_none() {
+            Ok(())
+        } else {
+            Err(crate::DeviceError::Lost)
+        }
     }
     unsafe fn discard_encoding(&mut self) {
         self.commands.clear();
@@ -1067,7 +1069,7 @@ impl Command {
             Command::ClearBuffer { ref buffer, range } => {
                 // SAFETY:
                 // Caller is responsible for ensuring this does not alias.
-                let buffer_slice: &mut [u8] = unsafe { &mut *buffer.get_slice_ptr(range.clone()) };
+                let buffer_slice: &mut [u8] = unsafe { &mut *buffer.get_slice_ptr(range.clone())? };
                 buffer_slice.fill(0);
                 upload_after_host_write(buffer)?;
                 Ok(())
@@ -1082,10 +1084,15 @@ impl Command {
                 {
                     // SAFETY:
                     // Caller is responsible for ensuring this does not alias.
-                    let src_region: &[u8] =
-                        unsafe { &*src.get_slice_ptr(src_offset..src_offset + size.get()) };
+                    let src_end = src_offset
+                        .checked_add(size.get())
+                        .ok_or(crate::DeviceError::Lost)?;
+                    let dst_end = dst_offset
+                        .checked_add(size.get())
+                        .ok_or(crate::DeviceError::Lost)?;
+                    let src_region: &[u8] = unsafe { &*src.get_slice_ptr(src_offset..src_end)? };
                     let dst_region: &mut [u8] =
-                        unsafe { &mut *dst.get_slice_ptr(dst_offset..dst_offset + size.get()) };
+                        unsafe { &mut *dst.get_slice_ptr(dst_offset..dst_end)? };
                     dst_region.copy_from_slice(src_region);
                 }
                 upload_after_host_write(src)?;
@@ -1413,6 +1420,23 @@ mod tests {
             [0, 2, 4]
         );
     }
+
+    #[test]
+    fn beginning_encoding_with_pending_commands_returns_an_error() {
+        let mut encoder = CommandBuffer::new();
+        unsafe {
+            encoder.set_viewport(
+                &crate::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 1.0,
+                    h: 1.0,
+                },
+                0.0..1.0,
+            );
+            assert!(encoder.begin_encoding(None).is_err());
+        }
+    }
     use crate::{CommandEncoder as _, Queue as _};
     use std::sync::Mutex;
 
@@ -1736,7 +1760,7 @@ unsafe fn submit_copy_buffer_to_texture(
                     .offset
                     .checked_add(trace_len)
                     .ok_or(crate::DeviceError::Lost)?;
-                let host_bytes = &*src.get_slice_ptr(region.buffer_layout.offset..trace_end);
+                let host_bytes = &*src.get_slice_ptr(region.buffer_layout.offset..trace_end)?;
                 let gpu_bytes = src.gpu_slice(region.buffer_layout.offset..trace_end)?;
                 super::trace::record_resource(format_args!(
                     "upload buffer_id={} buffer_label={:?} texture_id={} texture_label={:?} format={:?} dimension={:?} mip={} origin={:?} size={:?} offset={} bytes_per_row={} rows_per_image={} deko_row_length={} deko_image_height={} host_fingerprint={:016x} gpu_staging_fingerprint={:016x}",
@@ -2278,9 +2302,12 @@ unsafe fn submit_copy_texture_to_buffer(
                 } else {
                     dk::dkCmdBufCopyImageToBuffer(cmdbuf, &src_view, &copy_rect, &copy_dst, 0);
                 }
-                downloaded_ranges.push(
-                    region.buffer_layout.offset..region.buffer_layout.offset + required_bytes,
-                );
+                let download_end = region
+                    .buffer_layout
+                    .offset
+                    .checked_add(required_bytes)
+                    .ok_or(crate::DeviceError::Lost)?;
+                downloaded_ranges.push(region.buffer_layout.offset..download_end);
             }
             dk::dkCmdBufBarrier(
                 cmdbuf,
@@ -2291,8 +2318,11 @@ unsafe fn submit_copy_texture_to_buffer(
         })?;
         for range in downloaded_ranges {
             dst.download_from_gpu(range.clone())?;
-            let fingerprint_end = range.start + (range.end - range.start).min(256);
-            let bytes = &*dst.get_slice_ptr(range.start..fingerprint_end);
+            let fingerprint_end = range
+                .start
+                .checked_add((range.end - range.start).min(256))
+                .ok_or(crate::DeviceError::Lost)?;
+            let bytes = &*dst.get_slice_ptr(range.start..fingerprint_end)?;
             super::trace::record(format_args!(
                 "readback texture_id={} texture_label={:?} buffer_id={} buffer_label={:?} offset={} bytes={} fingerprint={:016x}",
                 src.id(),
@@ -3142,7 +3172,7 @@ unsafe fn submit_deko_draw(
                         gpu_size,
                         0,
                         core::mem::size_of::<u32>() as u32,
-                        core::ptr::from_ref(&view_index).cast(),
+                        ptr::from_ref(&view_index).cast(),
                     );
                     draw(cmdbuf, pipeline)?;
                 }

@@ -248,17 +248,20 @@ impl Buffer {
     /// This may be used to create any number of simultaneous pointers;
     /// aliasing is only a concern when actually reading, writing, or converting the pointer
     /// to a reference.
-    pub(super) fn get_slice_ptr(&self, range: crate::MemoryRange) -> *mut [u8] {
+    pub(super) fn get_slice_ptr(
+        &self,
+        range: crate::MemoryRange,
+    ) -> super::DeviceResult<*mut [u8]> {
         let base_ptr = self.storage.get();
-        let range = range_to_usize(range, self.size);
+        let range = range_to_usize(range, self.size)?;
 
         // We must obtain a slice pointer without ever creating a slice reference
         // that could alias with another slice.
-        ptr::slice_from_raw_parts_mut(
+        Ok(ptr::slice_from_raw_parts_mut(
             // SAFETY: `range_to_usize` bounds checks this addition.
             unsafe { base_ptr.cast::<u8>().add(range.start) },
             range.len(),
-        )
+        ))
     }
 
     #[cfg(target_os = "horizon")]
@@ -398,17 +401,31 @@ impl Drop for GpuBufferPool {
 }
 
 /// Convert a [`crate::MemoryRange`] to `Range<usize>` and bounds check it.
-fn range_to_usize(range: crate::MemoryRange, upper_bound: usize) -> Range<usize> {
-    // Note: these assertions should be impossible to trigger from safe code.
-    // We're doing them anyway since this entire backend is for testing
-    // (except for when it is an unused placeholder)
-    let start = usize::try_from(range.start).expect("range too large");
-    let end = usize::try_from(range.end).expect("range too large");
-    assert!(start <= end && end <= upper_bound, "range out of bounds");
-    start..end
+fn range_to_usize(
+    range: crate::MemoryRange,
+    upper_bound: usize,
+) -> super::DeviceResult<Range<usize>> {
+    let start = usize::try_from(range.start).map_err(|_| crate::DeviceError::Lost)?;
+    let end = usize::try_from(range.end).map_err(|_| crate::DeviceError::Lost)?;
+    if start > end || end > upper_bound {
+        return Err(crate::DeviceError::Lost);
+    }
+    Ok(start..end)
 }
 
 #[cfg(target_os = "horizon")]
 fn align_up(value: u32, alignment: u32) -> u32 {
     (value + alignment - 1) & !(alignment - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_mapping_ranges_return_errors() {
+        assert!(range_to_usize(0..4, 4).is_ok());
+        assert!(range_to_usize(3..2, 4).is_err());
+        assert!(range_to_usize(0..5, 4).is_err());
+    }
 }

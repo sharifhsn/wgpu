@@ -481,15 +481,16 @@ impl Device {
     /// Creates a [`RenderPipeline`].
     #[must_use]
     pub fn create_render_pipeline(&self, desc: &RenderPipelineDescriptor<'_>) -> RenderPipeline {
-        let vertex = self
-            .resolve_deko3d_wgsl_artifact(
-                desc.vertex.module,
-                Deko3dWgslArtifactStage::Vertex,
-                desc.vertex.entry_point,
-                desc.multiview_mask,
-            )
-            .unwrap_or_else(|error| panic!("Deko3D WGSL artifact resolution failed: {error}"));
-        let fragment_artifact = desc
+        let vertex = match self.resolve_deko3d_wgsl_artifact(
+            desc.vertex.module,
+            Deko3dWgslArtifactStage::Vertex,
+            desc.vertex.entry_point,
+            desc.multiview_mask,
+        ) {
+            Ok(module) => module,
+            Err(_) => None,
+        };
+        let fragment_artifact = match desc
             .fragment
             .as_ref()
             .map(|fragment| {
@@ -501,8 +502,10 @@ impl Device {
                 )
             })
             .transpose()
-            .map(Option::flatten)
-            .unwrap_or_else(|error| panic!("Deko3D WGSL artifact resolution failed: {error}"));
+        {
+            Ok(module) => module.flatten(),
+            Err(_) => None,
+        };
         let vertex_state = VertexState {
             module: vertex.as_ref().unwrap_or(desc.vertex.module),
             entry_point: vertex
@@ -544,14 +547,15 @@ impl Device {
     /// Creates a [`ComputePipeline`].
     #[must_use]
     pub fn create_compute_pipeline(&self, desc: &ComputePipelineDescriptor<'_>) -> ComputePipeline {
-        let module = self
-            .resolve_deko3d_wgsl_artifact(
-                desc.module,
-                Deko3dWgslArtifactStage::Compute,
-                desc.entry_point,
-                None,
-            )
-            .unwrap_or_else(|error| panic!("Deko3D WGSL artifact resolution failed: {error}"));
+        let module = match self.resolve_deko3d_wgsl_artifact(
+            desc.module,
+            Deko3dWgslArtifactStage::Compute,
+            desc.entry_point,
+            None,
+        ) {
+            Ok(module) => module,
+            Err(_) => None,
+        };
         let descriptor = ComputePipelineDescriptor {
             label: desc.label,
             layout: desc.layout,

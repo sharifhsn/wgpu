@@ -2832,25 +2832,6 @@ impl BindGroupInner {
             wgt::StorageTextureAccess::ReadWrite => wgt::TextureUses::STORAGE_READ_WRITE,
             _ => return Err(crate::DeviceError::Lost),
         };
-        let descriptor_stride = align_up(
-            size_of::<dk::DkImageDescriptor>() as u32,
-            dk::DK_IMAGE_DESCRIPTOR_ALIGNMENT,
-        );
-        let descriptor_size = descriptor_stride
-            .checked_mul(count)
-            .ok_or(crate::DeviceError::OutOfMemory)?;
-        let allocation_size = align_up(descriptor_size, dk::DK_MEMBLOCK_ALIGNMENT);
-        let mut maker = dk::DkMemBlockMaker::defaults(raw_device, allocation_size);
-        maker.flags = dk::DkMemBlockFlags_CpuUncached | dk::DkMemBlockFlags_GpuCached;
-        let descriptor_mem_block = unsafe { dk::dkMemBlockCreate(&maker) };
-        if descriptor_mem_block.is_null() {
-            return Err(crate::DeviceError::OutOfMemory);
-        }
-        let image_descriptor_gpu_addr = unsafe { dk::dkMemBlockGetGpuAddr(descriptor_mem_block) };
-        if image_descriptor_gpu_addr == u64::MAX {
-            unsafe { dk::dkMemBlockDestroy(descriptor_mem_block) };
-            return Err(crate::DeviceError::Lost);
-        }
         let mut elements = Vec::with_capacity(count as usize);
         for texture_binding in desc.textures {
             if !texture_binding.usage.contains(required_usage) {
@@ -2877,6 +2858,25 @@ impl BindGroupInner {
                 texture: texture.clone(),
                 image_descriptor,
             });
+        }
+        let descriptor_stride = align_up(
+            size_of::<dk::DkImageDescriptor>() as u32,
+            dk::DK_IMAGE_DESCRIPTOR_ALIGNMENT,
+        );
+        let descriptor_size = descriptor_stride
+            .checked_mul(count)
+            .ok_or(crate::DeviceError::OutOfMemory)?;
+        let allocation_size = align_up(descriptor_size, dk::DK_MEMBLOCK_ALIGNMENT);
+        let mut maker = dk::DkMemBlockMaker::defaults(raw_device, allocation_size);
+        maker.flags = dk::DkMemBlockFlags_CpuUncached | dk::DkMemBlockFlags_GpuCached;
+        let descriptor_mem_block = unsafe { dk::dkMemBlockCreate(&maker) };
+        if descriptor_mem_block.is_null() {
+            return Err(crate::DeviceError::OutOfMemory);
+        }
+        let image_descriptor_gpu_addr = unsafe { dk::dkMemBlockGetGpuAddr(descriptor_mem_block) };
+        if image_descriptor_gpu_addr == u64::MAX {
+            unsafe { dk::dkMemBlockDestroy(descriptor_mem_block) };
+            return Err(crate::DeviceError::Lost);
         }
         Ok(Self {
             inner: BindGroupInnerRaw::StorageTexture(StorageTextureBinding {
@@ -3049,7 +3049,9 @@ impl BindGroupInner {
                         })
                         .collect::<DeviceResult<Vec<_>>>()?;
                     if count == 1 {
-                        bindings.push(BufferBinding::Uniform(array.into_iter().next().unwrap()));
+                        bindings.push(BufferBinding::Uniform(
+                            array.into_iter().next().ok_or(crate::DeviceError::Lost)?,
+                        ));
                     } else {
                         bindings.push(BufferBinding::UniformArray(array));
                     }
@@ -3074,7 +3076,9 @@ impl BindGroupInner {
                         })
                         .collect::<DeviceResult<Vec<_>>>()?;
                     if count == 1 {
-                        bindings.push(BufferBinding::Storage(array.into_iter().next().unwrap()));
+                        bindings.push(BufferBinding::Storage(
+                            array.into_iter().next().ok_or(crate::DeviceError::Lost)?,
+                        ));
                     } else {
                         bindings.push(BufferBinding::StorageArray(array));
                     }
@@ -3726,14 +3730,14 @@ fn supported_bind_group_layout_kind(
             {
                 let uniforms = buffer_entries
                     .iter()
-                    .map(|entry| match *entry {
+                    .filter_map(|entry| match *entry {
                         BufferBindGroupLayoutKind::Uniform {
                             binding,
                             visibility,
                             has_dynamic_offset,
                             count: 1,
-                        } => (binding, visibility, has_dynamic_offset),
-                        _ => unreachable!(),
+                        } => Some((binding, visibility, has_dynamic_offset)),
+                        _ => None,
                     })
                     .collect();
                 return Some(BindGroupLayoutKind::UniformBuffers(uniforms));
@@ -5058,7 +5062,8 @@ impl crate::Device for Device {
         // mappings from being created, so we don’t need to perform any checks here, except for
         // bounds checks on the range which are built into `get_slice_ptr()`.
         Ok(crate::BufferMapping {
-            ptr: ptr::NonNull::new(buffer.get_slice_ptr(range).cast::<u8>()).unwrap(),
+            ptr: ptr::NonNull::new(buffer.get_slice_ptr(range)?.cast::<u8>())
+                .ok_or(crate::DeviceError::Lost)?,
             is_coherent: true,
         })
     }
