@@ -70,13 +70,15 @@ pub trait Deko3dWgslArtifactProvider: Send + Sync {
     fn resolve(&self, request: Deko3dWgslArtifactRequest<'_>) -> Result<Arc<[u8]>, String>;
 }
 
-/// Failure to install or resolve a Deko3D WGSL artifact provider.
+/// Failure to install a Deko3D WGSL artifact provider or compile WGSL for Deko3D.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Deko3dWgslArtifactError {
     /// A provider was already installed for this device.
     AlreadyInstalled,
     /// A Deko3D WGSL module required a provider but none is installed.
     NotInstalled,
+    /// The built-in Deko3D shader compiler rejected the request.
+    Compiler(String),
     /// The trusted provider rejected an artifact request.
     Provider(String),
     /// The trusted provider returned malformed DKSH bytes.
@@ -90,6 +92,9 @@ impl core::fmt::Display for Deko3dWgslArtifactError {
                 f.write_str("a Deko3D WGSL artifact provider is already installed")
             }
             Self::NotInstalled => f.write_str("no Deko3D WGSL artifact provider is installed"),
+            Self::Compiler(message) => {
+                write!(f, "Deko3D WGSL compilation failed: {message}")
+            }
             Self::Provider(message) => write!(
                 f,
                 "Deko3D WGSL artifact provider rejected the request: {message}"

@@ -94,7 +94,7 @@ webgl = ["web", "wgpu-core/webgl", "dep:wgpu-hal", "dep:smallvec"]
 noop = ["wgpu-core/noop", "dep:wgpu-hal", "dep:smallvec"]
 
 ## Reserves the Deko3D backend path for original Nintendo Switch homebrew.
-deko3d = ["wgsl", "wgpu-core?/deko3d"]
+deko3d = ["std", "wgsl", "dep:deko-shader-compiler", "wgpu-core?/deko3d"]
 
 #! **Note:** In the documentation, if you see that an item depends on a backend,
 #! it means that the item is only available when that backend is enabled _and_ the backend
@@ -198,6 +198,7 @@ parking_lot = ["dep:parking_lot"]
 #########################
 
 [dependencies]
+deko-shader-compiler = { git = "https://github.com/sharifhsn/deko-shader-compiler", rev = "0a789581662cf2777e24848351aeb883c1988b5d", optional = true }
 naga = { workspace = true, optional = true, features = ["termcolor"] }
 wgpu-core = { workspace = true, optional = true }
 wgpu-types.workspace = true

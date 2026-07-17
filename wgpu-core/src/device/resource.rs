@@ -2416,7 +2416,13 @@ impl Device {
         descriptor: &pipeline::ShaderModuleDescriptorPassthrough<'a>,
     ) -> Result<Arc<pipeline::ShaderModule>, pipeline::CreateShaderModuleError> {
         self.check_is_valid()?;
-        self.require_features(wgt::Features::PASSTHROUGH_SHADERS)?;
+        // Deko3D's ordinary WGSL path compiles to DKSH inside wgpu immediately before this call.
+        // Requiring applications to opt into the unsafe public passthrough feature would make
+        // safe `create_shader_module(Wgsl)` fail during pipeline creation. Other backends still
+        // require the explicit feature for caller-supplied passthrough binaries.
+        if self.backend() != wgt::Backend::Deko3d {
+            self.require_features(wgt::Features::PASSTHROUGH_SHADERS)?;
+        }
 
         let hal_shader = match self.backend() {
             wgt::Backend::Vulkan => hal::ShaderInput::SpirV(

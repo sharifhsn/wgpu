@@ -1,4 +1,10 @@
-use alloc::{boxed::Box, string::String, sync::Arc, vec};
+use alloc::{
+    borrow::ToOwned,
+    boxed::Box,
+    string::{String, ToString},
+    sync::Arc,
+    vec,
+};
 #[cfg(wgpu_core)]
 use core::ops::Deref;
 use core::{error, fmt, future::Future, marker::PhantomData};
@@ -11,6 +17,18 @@ use sha2::{Digest, Sha256};
 
 struct Deko3dWgslArtifactProviderState {
     provider: Mutex<Option<Arc<dyn Deko3dWgslArtifactProvider>>>,
+    #[cfg(feature = "deko3d")]
+    compiler: deko_shader_compiler::CompilerCache,
+}
+
+impl Default for Deko3dWgslArtifactProviderState {
+    fn default() -> Self {
+        Self {
+            provider: Mutex::new(None),
+            #[cfg(feature = "deko3d")]
+            compiler: deko_shader_compiler::CompilerCache::default(),
+        }
+    }
 }
 
 fn validate_deko3d_dksh(bytes: &[u8]) -> Result<(), Deko3dWgslArtifactError> {
@@ -78,12 +96,64 @@ fn resolve_deko3d_wgsl_artifact(
     state: &Deko3dWgslArtifactProviderState,
     request: Deko3dWgslArtifactRequest<'_>,
 ) -> Result<Arc<[u8]>, Deko3dWgslArtifactError> {
-    let provider = state.provider()?;
-    let dksh = provider
-        .resolve(request)
-        .map_err(Deko3dWgslArtifactError::Provider)?;
+    let dksh = if let Some(provider) = state.provider() {
+        provider
+            .resolve(request)
+            .map_err(Deko3dWgslArtifactError::Provider)?
+    } else {
+        #[cfg(feature = "deko3d")]
+        {
+            compile_deko3d_wgsl(&state.compiler, request)?
+        }
+        #[cfg(not(feature = "deko3d"))]
+        {
+            return Err(Deko3dWgslArtifactError::NotInstalled);
+        }
+    };
     validate_deko3d_dksh(&dksh)?;
     Ok(dksh)
+}
+
+#[cfg(feature = "deko3d")]
+fn compile_deko3d_wgsl(
+    cache: &deko_shader_compiler::CompilerCache,
+    request: Deko3dWgslArtifactRequest<'_>,
+) -> Result<Arc<[u8]>, Deko3dWgslArtifactError> {
+    use deko_shader_compiler::{BindingArraySize, Options, PipelineConstants, Stage};
+
+    let source = core::str::from_utf8(request.wgsl)
+        .map_err(|error| Deko3dWgslArtifactError::Compiler(error.to_string()))?;
+    let stage = match request.stage {
+        Deko3dWgslArtifactStage::Vertex => Stage::Vertex,
+        Deko3dWgslArtifactStage::Fragment => Stage::Fragment,
+        Deko3dWgslArtifactStage::Compute => Stage::Compute,
+    };
+    let entry_point = deko_shader_compiler::Compiler
+        .resolve_wgsl_entry_point(source, stage, request.entry_point)
+        .map_err(|error| Deko3dWgslArtifactError::Compiler(error.to_string()))?;
+    let constants = request
+        .constants
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), *value))
+        .collect::<PipelineConstants>();
+    let options = Options {
+        multiview_mask: request.multiview_mask.map(core::num::NonZeroU32::get),
+        zero_initialize_workgroup_memory: request.zero_initialize_workgroup_memory,
+        binding_array_sizes: request
+            .binding_array_sizes
+            .iter()
+            .map(|size| BindingArraySize {
+                group: size.group,
+                binding: size.binding,
+                count: size.count,
+            })
+            .collect(),
+        ..Options::default()
+    };
+    let (_, artifact) = cache
+        .compile_wgsl(source, stage, &entry_point, &constants, options)
+        .map_err(|error| Deko3dWgslArtifactError::Compiler(error.to_string()))?;
+    Ok(Arc::from(artifact.dksh.clone()))
 }
 
 #[cfg(feature = "wgsl")]
@@ -135,11 +205,8 @@ impl Deko3dWgslArtifactProviderState {
         Ok(())
     }
 
-    fn provider(&self) -> Result<Arc<dyn Deko3dWgslArtifactProvider>, Deko3dWgslArtifactError> {
-        self.provider
-            .lock()
-            .clone()
-            .ok_or(Deko3dWgslArtifactError::NotInstalled)
+    fn provider(&self) -> Option<Arc<dyn Deko3dWgslArtifactProvider>> {
+        self.provider.lock().clone()
     }
 }
 
@@ -174,9 +241,7 @@ impl Device {
     pub(crate) fn new(inner: dispatch::DispatchDevice) -> Self {
         Self {
             inner,
-            deko3d_artifacts: Arc::new(Deko3dWgslArtifactProviderState {
-                provider: Mutex::new(None),
-            }),
+            deko3d_artifacts: Arc::new(Deko3dWgslArtifactProviderState::default()),
         }
     }
 
@@ -1315,6 +1380,7 @@ mod deko3d_artifact_tests {
     fn provider_is_set_once_and_distinguishes_stage_and_entry_point() {
         let state = Deko3dWgslArtifactProviderState {
             provider: Mutex::new(None),
+            ..Default::default()
         };
         let wgsl = b"@vertex fn vertex_main() {}";
         let provider = Arc::new(Provider {
@@ -1365,6 +1431,7 @@ mod deko3d_artifact_tests {
     fn provider_rejects_a_one_byte_wgsl_miss_and_bad_dksh() {
         let state = Deko3dWgslArtifactProviderState {
             provider: Mutex::new(None),
+            ..Default::default()
         };
         let wgsl = b"@compute fn main() {}";
         let provider = Arc::new(Provider {
@@ -1392,6 +1459,7 @@ mod deko3d_artifact_tests {
 
         let corrupt_state = Deko3dWgslArtifactProviderState {
             provider: Mutex::new(None),
+            ..Default::default()
         };
         let mut corrupt = dksh().to_vec();
         corrupt[0] ^= 1;
@@ -1409,6 +1477,29 @@ mod deko3d_artifact_tests {
             ),
             Err(Deko3dWgslArtifactError::InvalidDksh(_))
         ));
+    }
+
+    #[cfg(feature = "deko3d")]
+    #[test]
+    fn built_in_compiler_resolves_compute_wgsl_without_a_provider() {
+        let state = Deko3dWgslArtifactProviderState::default();
+        let wgsl = br#"
+            @group(0) @binding(0) var<storage, read> input: array<u32>;
+            @group(0) @binding(1) var<storage, read_write> output: array<u32>;
+
+            @compute @workgroup_size(4)
+            fn compute_main(@builtin(global_invocation_id) id: vec3<u32>) {
+                output[id.x] = input[id.x] * 3u + 1u;
+            }
+        "#;
+        let artifact = resolve_deko3d_wgsl_artifact(
+            &state,
+            request(wgsl, Deko3dWgslArtifactStage::Compute, "main"),
+        )
+        .unwrap();
+
+        assert_eq!(&artifact[..4], b"DKSH");
+        assert_eq!(state.compiler.len(), 1);
     }
 
     #[test]
@@ -1437,6 +1528,7 @@ mod deko3d_artifact_tests {
 
         let state = Arc::new(Deko3dWgslArtifactProviderState {
             provider: Mutex::new(None),
+            ..Default::default()
         });
         let provider = Arc::new(ReentrantProvider {
             state: state.clone(),

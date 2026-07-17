@@ -892,6 +892,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "deko-bitview"
+version = "0.1.0"
+source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=0a789581662cf2777e24848351aeb883c1988b5d#0a789581662cf2777e24848351aeb883c1988b5d"
+
+[[package]]
+name = "deko-compiler-utils"
+version = "0.1.0"
+source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=0a789581662cf2777e24848351aeb883c1988b5d#0a789581662cf2777e24848351aeb883c1988b5d"
+
+[[package]]
+name = "deko-dksh"
+version = "0.1.0"
+source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=0a789581662cf2777e24848351aeb883c1988b5d#0a789581662cf2777e24848351aeb883c1988b5d"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "deko-nak"
+version = "0.1.0"
+source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=0a789581662cf2777e24848351aeb883c1988b5d#0a789581662cf2777e24848351aeb883c1988b5d"
+dependencies = [
+ "deko-bitview",
+ "deko-compiler-utils",
+ "deko-shader-compiler-macros",
+ "paste",
+ "rustc-hash 2.1.1",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "deko-shader-compiler"
+version = "0.1.0"
+source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=0a789581662cf2777e24848351aeb883c1988b5d#0a789581662cf2777e24848351aeb883c1988b5d"
+dependencies = [
+ "deko-dksh",
+ "deko-nak",
+ "naga 29.0.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rustc-hash 2.1.1",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "deko-shader-compiler-macros"
+version = "0.1.0"
+source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=0a789581662cf2777e24848351aeb883c1988b5d#0a789581662cf2777e24848351aeb883c1988b5d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "deko3d-sys"
 version = "0.1.0"
 
@@ -2389,6 +2443,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "naga"
+version = "29.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2bf919621e7975acb27d881bae2fb993e0d45c8e0446e85e6272971e00dc8df"
+dependencies = [
+ "arrayvec",
+ "bit-set 0.9.1",
+ "bitflags 2.11.0",
+ "cfg-if",
+ "cfg_aliases",
+ "codespan-reporting",
+ "half",
+ "hashbrown 0.16.1",
+ "hexf-parse",
+ "indexmap",
+ "libm",
+ "log",
+ "num-traits",
+ "once_cell",
+ "rustc-hash 1.1.0",
+ "thiserror 2.0.18",
+ "unicode-ident",
+]
+
+[[package]]
 name = "naga-cli"
 version = "29.0.4"
 dependencies = [
@@ -2398,7 +2477,7 @@ dependencies = [
  "codespan-reporting",
  "env_logger",
  "log",
- "naga",
+ "naga 29.0.4",
 ]
 
 [[package]]
@@ -2408,7 +2487,7 @@ dependencies = [
  "arbitrary",
  "cfg_aliases",
  "libfuzzer-sys",
- "naga",
+ "naga 29.0.4",
 ]
 
 [[package]]
@@ -2416,7 +2495,7 @@ name = "naga-test"
 version = "29.0.4"
 dependencies = [
  "bitflags 2.11.0",
- "naga",
+ "naga 29.0.4",
  "ron",
  "serde",
  "serde_json",
@@ -4622,11 +4701,12 @@ dependencies = [
  "bytemuck",
  "cfg-if",
  "cfg_aliases",
+ "deko-shader-compiler",
  "document-features",
  "hashbrown 0.16.1",
  "js-sys",
  "log",
- "naga",
+ "naga 29.0.4",
  "parking_lot",
  "portable-atomic",
  "profiling",
@@ -4649,7 +4729,7 @@ dependencies = [
  "anyhow",
  "bincode 2.0.1",
  "bytemuck",
- "naga",
+ "naga 29.0.4",
  "naga-test",
  "nanorand",
  "pico-args",
@@ -4688,7 +4768,7 @@ dependencies = [
  "indexmap",
  "log",
  "macro_rules_attribute",
- "naga",
+ "naga 29.0.4",
  "once_cell",
  "parking_lot",
  "portable-atomic",
@@ -4833,7 +4913,7 @@ dependencies = [
  "libloading",
  "log",
  "mach-dxcompiler-rs",
- "naga",
+ "naga 29.0.4",
  "ndk-sys",
  "objc2 0.6.4",
  "objc2-core-foundation",
@@ -4891,7 +4971,7 @@ dependencies = [
 name = "wgpu-naga-bridge"
 version = "29.0.4"
 dependencies = [
- "naga",
+ "naga 29.0.4",
  "wgpu-types",
 ]
 
@@ -4917,7 +4997,7 @@ dependencies = [
  "js-sys",
  "libtest-mimic",
  "log",
- "naga",
+ "naga 29.0.4",
  "nanorand",
  "nv-flip",
  "parking_lot",
