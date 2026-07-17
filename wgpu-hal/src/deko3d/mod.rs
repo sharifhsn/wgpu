@@ -144,7 +144,7 @@ impl Resource {
 pub enum BindGroupLayoutKind {
     TextureSamplers {
         bindings: Vec<(u32, Option<u32>, u32, wgt::ShaderStages)>,
-        uniforms: Vec<(u32, wgt::ShaderStages, bool)>,
+        buffers: Vec<BufferBindGroupLayoutKind>,
     },
     UniformBuffers(Vec<(u32, wgt::ShaderStages, bool)>),
     Inactive,
@@ -413,7 +413,7 @@ pub(super) enum BindGroupInnerRaw {
         sampler_descriptor_gpu_addr: dk::DkGpuAddr,
         image_descriptor_stride: u64,
         sampler_descriptor_stride: u64,
-        uniforms: Vec<UniformBufferBinding>,
+        buffers: Vec<BufferBinding>,
     },
     UniformBuffers(Vec<UniformBufferBinding>),
     StorageBuffer(StorageBufferBinding),
@@ -914,6 +914,11 @@ impl ShaderModuleInner {
     pub(super) fn raw_shader(&self) -> *const dk::DkShader {
         &self.inner.shader
     }
+
+    #[cfg(target_os = "horizon")]
+    fn stage(&self) -> dk::DkStage {
+        unsafe { dk::dkShaderGetStage(&self.inner.shader) }
+    }
 }
 
 impl RenderPipelineInner {
@@ -1322,10 +1327,12 @@ impl BindGroupInner {
         stage: dk::DkStage,
     ) -> DeviceResult<()> {
         let bindings = match &self.inner {
-            BindGroupInnerRaw::TextureSamplers { uniforms, .. } => uniforms,
             BindGroupInnerRaw::UniformBuffers(bindings) => bindings,
             BindGroupInnerRaw::StorageBuffer(_) => return Err(crate::DeviceError::Lost),
-            BindGroupInnerRaw::BufferGroup(bindings) => {
+            BindGroupInnerRaw::TextureSamplers {
+                buffers: bindings, ..
+            }
+            | BindGroupInnerRaw::BufferGroup(bindings) => {
                 let index = bindings
                     .iter()
                     .position(|binding| {
@@ -1401,7 +1408,10 @@ impl BindGroupInner {
                 };
                 (binding, dynamic_offset)
             }
-            BindGroupInnerRaw::BufferGroup(bindings) => {
+            BindGroupInnerRaw::TextureSamplers {
+                buffers: bindings, ..
+            }
+            | BindGroupInnerRaw::BufferGroup(bindings) => {
                 let index = bindings
                     .iter()
                     .position(|binding| {
@@ -1855,8 +1865,7 @@ impl SurfaceState {
             ));
         }
 
-        let mut queue_maker = dk::DkQueueMaker::defaults(raw_device);
-        queue_maker.flags = dk::DkQueueFlags_Graphics;
+        let queue_maker = dk::DkQueueMaker::defaults(raw_device);
         let render_queue = unsafe { dk::dkQueueCreate(&queue_maker) };
         if render_queue.is_null() {
             unsafe {
@@ -1955,8 +1964,7 @@ impl RenderPipelineInner {
         }
         let ms_mode = map_sample_count(desc.multisample.count)
             .map_err(|_| crate::PipelineError::Device(crate::DeviceError::Lost))?;
-        let sample_mask = u32::try_from(desc.multisample.mask)
-            .map_err(|_| crate::PipelineError::Device(crate::DeviceError::Lost))?;
+        let sample_mask = map_sample_mask(desc.multisample.mask);
         if desc.primitive.topology != wgt::PrimitiveTopology::TriangleList
             || desc.primitive.strip_index_format.is_some()
             || desc.primitive.unclipped_depth
@@ -2006,6 +2014,18 @@ impl RenderPipelineInner {
         let Resource::ShaderModule(fragment_shader) = fragment_stage.module else {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         };
+        if vertex_shader.stage() != dk::DkStage::DkStage_Vertex {
+            return Err(crate::PipelineError::Linkage(
+                wgt::ShaderStages::VERTEX,
+                String::from("Deko3D shader artifact is not a vertex shader"),
+            ));
+        }
+        if fragment_shader.stage() != dk::DkStage::DkStage_Fragment {
+            return Err(crate::PipelineError::Linkage(
+                wgt::ShaderStages::FRAGMENT,
+                String::from("Deko3D shader artifact is not a fragment shader"),
+            ));
+        }
         let Resource::PipelineLayout(pipeline_layout) = desc.layout else {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         };
@@ -2138,6 +2158,12 @@ impl ComputePipelineInner {
         let Resource::ShaderModule(compute_shader) = desc.stage.module else {
             return Err(crate::PipelineError::Device(crate::DeviceError::Lost));
         };
+        if compute_shader.stage() != dk::DkStage::DkStage_Compute {
+            return Err(crate::PipelineError::Linkage(
+                wgt::ShaderStages::COMPUTE,
+                String::from("Deko3D shader artifact is not a compute shader"),
+            ));
+        }
 
         Ok(Self {
             inner: ComputePipelineInnerRaw {
@@ -2170,6 +2196,10 @@ fn map_sample_count(sample_count: u32) -> DeviceResult<dk::DkMsMode> {
         8 => Ok(dk::DkMsMode::DkMsMode_8x),
         _ => Err(crate::DeviceError::Lost),
     }
+}
+
+fn map_sample_mask(sample_mask: u64) -> u32 {
+    sample_mask as u32
 }
 
 #[cfg(target_os = "horizon")]
@@ -2572,8 +2602,8 @@ impl BindGroupInner {
             return Err(crate::DeviceError::Lost);
         };
         match kind {
-            BindGroupLayoutKind::TextureSamplers { bindings, uniforms } => unsafe {
-                Self::new_texture_samplers(raw_device, desc, bindings, uniforms)
+            BindGroupLayoutKind::TextureSamplers { bindings, buffers } => unsafe {
+                Self::new_texture_samplers(raw_device, desc, bindings, buffers)
             },
             BindGroupLayoutKind::UniformBuffers(bindings) => {
                 Self::new_uniform_buffers(desc, bindings)
@@ -2623,15 +2653,21 @@ impl BindGroupInner {
         raw_device: dk::DkDevice,
         desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
         layout_bindings: &[(u32, Option<u32>, u32, wgt::ShaderStages)],
-        uniform_layouts: &[(u32, wgt::ShaderStages, bool)],
+        buffer_layouts: &[BufferBindGroupLayoutKind],
     ) -> DeviceResult<Self> {
+        let expected_buffers = buffer_layouts
+            .iter()
+            .try_fold(0usize, |total, entry| {
+                total.checked_add(entry.count() as usize)
+            })
+            .ok_or(crate::DeviceError::Lost)?;
         if layout_bindings.is_empty()
             || layout_bindings
                 .iter()
                 .map(|(_, _, count, _)| *count as usize)
                 .sum::<usize>()
                 > DEKO_TEXTURE_SAMPLER_COUNT
-            || desc.buffers.len() != uniform_layouts.len()
+            || desc.buffers.len() != expected_buffers
             || desc.samplers.len()
                 != layout_bindings
                     .iter()
@@ -2650,7 +2686,7 @@ impl BindGroupInner {
                         .iter()
                         .filter(|(_, sampler, _, _)| sampler.is_some())
                         .count()
-                    + uniform_layouts.len()
+                    + buffer_layouts.len()
         {
             return Err(crate::DeviceError::Lost);
         }
@@ -2757,7 +2793,7 @@ impl BindGroupInner {
                 });
             }
         }
-        let uniforms = Self::uniform_buffer_bindings(desc, uniform_layouts)?;
+        let buffers = Self::buffer_bindings(desc, buffer_layouts)?;
 
         let image_descriptor_stride = align_up(
             size_of::<dk::DkImageDescriptor>() as u32,
@@ -2795,7 +2831,7 @@ impl BindGroupInner {
                 sampler_descriptor_gpu_addr: descriptor_gpu_addr + sampler_offset,
                 image_descriptor_stride: u64::from(image_descriptor_stride),
                 sampler_descriptor_stride: u64::from(sampler_descriptor_stride),
-                uniforms,
+                buffers,
             },
             id: trace::resource_id(),
             label: desc.label.map(String::from),
@@ -3008,6 +3044,20 @@ impl BindGroupInner {
             return Err(crate::DeviceError::Lost);
         }
 
+        let bindings = Self::buffer_bindings(desc, layout_entries)?;
+
+        Ok(Self {
+            inner: BindGroupInnerRaw::BufferGroup(bindings),
+            id: trace::resource_id(),
+            label: desc.label.map(String::from),
+            traced_texture_targets: AtomicU64::new(0),
+        })
+    }
+
+    fn buffer_bindings(
+        desc: &crate::BindGroupDescriptor<Resource, Buffer, Resource, Resource, Resource>,
+        layout_entries: &[BufferBindGroupLayoutKind],
+    ) -> DeviceResult<Vec<BufferBinding>> {
         let mut bindings = Vec::with_capacity(layout_entries.len());
         for layout_entry in layout_entries {
             let Some(entry) = desc
@@ -3086,12 +3136,7 @@ impl BindGroupInner {
             }
         }
 
-        Ok(Self {
-            inner: BindGroupInnerRaw::BufferGroup(bindings),
-            id: trace::resource_id(),
-            label: desc.label.map(String::from),
-            traced_texture_targets: AtomicU64::new(0),
-        })
+        Ok(bindings)
     }
 
     fn make_uniform_buffer_binding(
@@ -3421,7 +3466,8 @@ fn deko3d_texture_format_capabilities(
 ) -> crate::TextureFormatCapabilities {
     use crate::TextureFormatCapabilities as C;
     let mut capabilities = match format {
-        wgt::TextureFormat::Rgba8Unorm
+        wgt::TextureFormat::R8Unorm
+        | wgt::TextureFormat::Rgba8Unorm
         | wgt::TextureFormat::Rgba8UnormSrgb
         | wgt::TextureFormat::Bgra8Unorm
         | wgt::TextureFormat::Bgra8UnormSrgb
@@ -3440,8 +3486,7 @@ fn deko3d_texture_format_capabilities(
             C::SAMPLED | C::DEPTH_STENCIL_ATTACHMENT
         }
         wgt::TextureFormat::Stencil8 => C::DEPTH_STENCIL_ATTACHMENT | C::COPY_SRC | C::COPY_DST,
-        wgt::TextureFormat::R8Unorm
-        | wgt::TextureFormat::Rg8Unorm
+        wgt::TextureFormat::Rg8Unorm
         | wgt::TextureFormat::R8Uint
         | wgt::TextureFormat::R8Sint
         | wgt::TextureFormat::Rg8Uint
@@ -3748,9 +3793,8 @@ fn supported_bind_group_layout_kind(
 
     let mut texture_bindings = Vec::new();
     let mut sampler_bindings = Vec::new();
-    let mut uniforms = Vec::new();
+    let mut buffers = Vec::new();
     let mut occupied_bindings = Vec::new();
-    let mut storage = None;
     for entry in entries {
         if occupied_bindings.contains(&entry.binding) {
             return None;
@@ -3787,55 +3831,29 @@ fn supported_bind_group_layout_kind(
             {
                 sampler_bindings.push((entry.binding, count, entry.visibility));
             }
-            wgt::BindingType::Buffer {
-                ty: wgt::BufferBindingType::Uniform,
-                has_dynamic_offset,
-                min_binding_size,
-            } if !entry.visibility.is_empty()
-                && min_binding_size.is_none_or(|size| size.get() <= DEKO_UNIFORM_BUF_MAX_SIZE) =>
-            {
-                if count != 1 {
-                    return None;
-                }
-                uniforms.push((entry.binding, entry.visibility, has_dynamic_offset));
-            }
-            wgt::BindingType::Buffer {
-                ty: wgt::BufferBindingType::Storage { read_only },
-                has_dynamic_offset,
-                ..
-            } if entries.len() == 1
-                && count == 1
-                && !entry.visibility.is_empty()
-                && (wgt::ShaderStages::VERTEX_FRAGMENT | wgt::ShaderStages::COMPUTE)
-                    .contains(entry.visibility)
-                && entry.binding < DEKO_STORAGE_BUFFER_COUNT =>
-            {
-                storage = Some(BindGroupLayoutKind::StorageBuffer {
-                    binding: entry.binding,
-                    visibility: entry.visibility,
-                    read_only,
-                    has_dynamic_offset,
-                });
+            wgt::BindingType::Buffer { .. } => {
+                buffers.push(supported_buffer_binding_layout_kind(*entry)?);
             }
             _ => return None,
         }
     }
-    if let Some(storage) = storage {
-        return Some(storage);
-    }
     if texture_bindings.is_empty() {
-        return (uniforms.len() == entries.len())
-            .then_some(BindGroupLayoutKind::UniformBuffers(uniforms));
+        return None;
     }
     texture_bindings.sort_unstable_by_key(|(binding, _, _)| *binding);
     sampler_bindings.sort_unstable_by_key(|(binding, _, _)| *binding);
-    uniforms.sort_unstable_by_key(|&(binding, _, _)| binding);
+    buffers.sort_unstable_by_key(|entry| entry.binding());
     if texture_bindings
         .iter()
         .map(|(_, count, _)| *count as usize)
         .sum::<usize>()
         > DEKO_TEXTURE_SAMPLER_COUNT
-        || uniforms.len() > DEKO_UNIFORM_BUFFER_COUNT as usize
+        || buffers
+            .iter()
+            .filter(|entry| matches!(entry, BufferBindGroupLayoutKind::Uniform { .. }))
+            .map(|entry| entry.count() as usize)
+            .sum::<usize>()
+            > DEKO_UNIFORM_BUFFER_COUNT as usize
     {
         return None;
     }
@@ -3864,7 +3882,7 @@ fn supported_bind_group_layout_kind(
     }) {
         return None;
     }
-    Some(BindGroupLayoutKind::TextureSamplers { bindings, uniforms })
+    Some(BindGroupLayoutKind::TextureSamplers { bindings, buffers })
 }
 
 fn supported_buffer_binding_layout_kind(
@@ -3883,8 +3901,7 @@ fn supported_buffer_binding_layout_kind(
             ty: wgt::BufferBindingType::Uniform,
             has_dynamic_offset,
             min_binding_size,
-        } if entry.binding.checked_add(count)? <= DEKO_UNIFORM_BUFFER_COUNT
-            && !(has_dynamic_offset && count > 1)
+        } if !(has_dynamic_offset && count > 1)
             && min_binding_size.is_none_or(|size| size.get() <= DEKO_UNIFORM_BUF_MAX_SIZE) =>
         {
             Some(BufferBindGroupLayoutKind::Uniform {
@@ -3898,17 +3915,13 @@ fn supported_buffer_binding_layout_kind(
             ty: wgt::BufferBindingType::Storage { read_only },
             has_dynamic_offset,
             ..
-        } if entry.binding.checked_add(count)? <= DEKO_STORAGE_BUFFER_COUNT
-            && !(has_dynamic_offset && count > 1) =>
-        {
-            Some(BufferBindGroupLayoutKind::Storage {
-                binding: entry.binding,
-                visibility: entry.visibility,
-                read_only,
-                has_dynamic_offset,
-                count,
-            })
-        }
+        } if !(has_dynamic_offset && count > 1) => Some(BufferBindGroupLayoutKind::Storage {
+            binding: entry.binding,
+            visibility: entry.visibility,
+            read_only,
+            has_dynamic_offset,
+            count,
+        }),
         _ => None,
     }
 }
@@ -4027,6 +4040,7 @@ mod tests {
     #[test]
     fn supported_color_targets_report_expected_capabilities() {
         for format in [
+            wgt::TextureFormat::R8Unorm,
             wgt::TextureFormat::Rgba8Unorm,
             wgt::TextureFormat::Rgba8UnormSrgb,
             wgt::TextureFormat::Rgba16Float,
@@ -4056,6 +4070,12 @@ mod tests {
         };
         assert!(rgba32.contains(crate::TextureFormatCapabilities::SAMPLED));
         assert!(rgba32.contains(crate::TextureFormatCapabilities::COPY_DST));
+    }
+
+    #[test]
+    fn sample_mask_keeps_the_d3d_representable_low_bits() {
+        assert_eq!(map_sample_mask(u64::MAX), u32::MAX);
+        assert_eq!(map_sample_mask(0x1_0000_00a5), 0xa5);
     }
 
     #[test]
@@ -4102,6 +4122,16 @@ mod tests {
             },
             count: None,
         };
+        let storage = |binding| wgt::BindGroupLayoutEntry {
+            binding,
+            visibility: wgt::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgt::BindingType::Buffer {
+                ty: wgt::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
         let layout = [
             texture(0),
             sampler(1),
@@ -4109,9 +4139,10 @@ mod tests {
             sampler(3),
             uniform(8),
             uniform(9),
+            storage(14),
         ];
         let kind = supported_bind_group_layout_kind(&layout).unwrap();
-        let BindGroupLayoutKind::TextureSamplers { bindings, uniforms } = kind else {
+        let BindGroupLayoutKind::TextureSamplers { bindings, buffers } = kind else {
             panic!("expected texture/sampler layout");
         };
         assert_eq!(
@@ -4121,7 +4152,7 @@ mod tests {
                 (2, Some(3), 1, wgt::ShaderStages::FRAGMENT),
             ]
         );
-        assert_eq!(uniforms.len(), 2);
+        assert_eq!(buffers.len(), 3);
         assert!(supported_bind_group_layout_kind(&[texture(0), sampler(3)]).is_none());
         assert!(supported_bind_group_layout_kind(&[texture(0), uniform(0), sampler(1)]).is_none());
         let too_many = (0..=DEKO_TEXTURE_SAMPLER_COUNT as u32)
@@ -4264,6 +4295,14 @@ mod tests {
     #[test]
     fn advertises_pipeline_cache_support() {
         assert!(supported_features().contains(wgt::Features::PIPELINE_CACHE));
+        assert!(capabilities().downlevel.flags.contains(
+            wgt::DownlevelFlags::VERTEX_STORAGE
+                | wgt::DownlevelFlags::FRAGMENT_STORAGE
+                | wgt::DownlevelFlags::FRAGMENT_WRITABLE_STORAGE
+                | wgt::DownlevelFlags::COMPUTE_SHADERS
+                | wgt::DownlevelFlags::BUFFER_BINDINGS_NOT_16_BYTE_ALIGNED
+                | wgt::DownlevelFlags::INDEPENDENT_BLEND
+        ));
     }
 
     #[test]
@@ -4442,8 +4481,7 @@ impl Adapter {
         }
         eprintln!("[wgpu-deko3d] device_create=ok");
 
-        let mut queue_maker = dk::DkQueueMaker::defaults(raw_device);
-        queue_maker.flags = dk::DkQueueFlags_Graphics;
+        let queue_maker = dk::DkQueueMaker::defaults(raw_device);
         let raw_queue = unsafe { dk::dkQueueCreate(&queue_maker) };
         if raw_queue.is_null() {
             eprintln!("[wgpu-deko3d] queue_create=failed");
@@ -4676,7 +4714,13 @@ pub fn capabilities() -> crate::Capabilities {
         downlevel: wgt::DownlevelCapabilities {
             flags: wgt::DownlevelFlags::SURFACE_VIEW_FORMATS
                 | wgt::DownlevelFlags::CUBE_ARRAY_TEXTURES
-                | wgt::DownlevelFlags::INDIRECT_EXECUTION,
+                | wgt::DownlevelFlags::INDIRECT_EXECUTION
+                | wgt::DownlevelFlags::COMPUTE_SHADERS
+                | wgt::DownlevelFlags::VERTEX_STORAGE
+                | wgt::DownlevelFlags::FRAGMENT_STORAGE
+                | wgt::DownlevelFlags::FRAGMENT_WRITABLE_STORAGE
+                | wgt::DownlevelFlags::BUFFER_BINDINGS_NOT_16_BYTE_ALIGNED
+                | wgt::DownlevelFlags::INDEPENDENT_BLEND,
             limits: wgt::DownlevelLimits {},
             shader_model: wgt::ShaderModel::Sm5,
         },
@@ -5042,7 +5086,8 @@ impl crate::Device for Device {
     unsafe fn create_buffer(&self, desc: &crate::BufferDescriptor) -> DeviceResult<Buffer> {
         #[cfg(target_os = "horizon")]
         {
-            Buffer::new(desc, self.inner.buffer_pool.clone())
+            let buffer = Buffer::new(desc, self.inner.buffer_pool.clone())?;
+            Ok(buffer)
         }
         #[cfg(not(target_os = "horizon"))]
         {
@@ -5094,9 +5139,8 @@ impl crate::Device for Device {
     unsafe fn create_texture(&self, desc: &crate::TextureDescriptor) -> DeviceResult<Resource> {
         #[cfg(target_os = "horizon")]
         {
-            Ok(Resource::Texture(Arc::new(unsafe {
-                TextureInner::new(self.inner.raw_device(), desc)?
-            })))
+            let texture = unsafe { TextureInner::new(self.inner.raw_device(), desc)? };
+            Ok(Resource::Texture(Arc::new(texture)))
         }
         #[cfg(not(target_os = "horizon"))]
         {
@@ -5196,7 +5240,8 @@ impl crate::Device for Device {
     unsafe fn create_sampler(&self, desc: &crate::SamplerDescriptor) -> DeviceResult<Resource> {
         #[cfg(target_os = "horizon")]
         {
-            Ok(Resource::Sampler(Arc::new(SamplerInner::new(desc)?)))
+            let sampler = SamplerInner::new(desc)?;
+            Ok(Resource::Sampler(Arc::new(sampler)))
         }
         #[cfg(not(target_os = "horizon"))]
         {
@@ -5284,9 +5329,10 @@ impl crate::Device for Device {
         {
             match shader {
                 crate::ShaderInput::Deko3dDksh(bytes) => {
-                    Ok(Resource::ShaderModule(Arc::new(unsafe {
+                    let module = unsafe {
                         ShaderModuleInner::new_dksh(self.inner.raw_device(), bytes)?
-                    })))
+                    };
+                    Ok(Resource::ShaderModule(Arc::new(module)))
                 }
                 crate::ShaderInput::Naga(_) => Ok(Resource::Placeholder),
                 _ => Err(crate::ShaderError::Compilation(String::from(
@@ -5333,9 +5379,8 @@ impl crate::Device for Device {
     ) -> Result<Resource, crate::PipelineError> {
         #[cfg(target_os = "horizon")]
         {
-            Ok(Resource::ComputePipeline(Arc::new(
-                ComputePipelineInner::new(desc)?,
-            )))
+            let pipeline = ComputePipelineInner::new(desc)?;
+            Ok(Resource::ComputePipeline(Arc::new(pipeline)))
         }
         #[cfg(not(target_os = "horizon"))]
         {

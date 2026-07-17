@@ -266,43 +266,7 @@ impl CommandBuffer {
             if let Err(error) = unsafe { command.execute(queue, surface_queue, &mut state) } {
                 eprintln!(
                     "[wgpu-deko3d] command_execute_failed command={} error={error:?}",
-                    match command {
-                        Command::ClearBuffer { .. } => "clear_buffer",
-                        Command::CopyBufferToBuffer { .. } => "copy_buffer_to_buffer",
-                        Command::CopyBufferToTexture { .. } => "copy_buffer_to_texture",
-                        Command::CopyTextureToTexture { .. } => "copy_texture_to_texture",
-                        Command::CopyTextureToBuffer { .. } => "copy_texture_to_buffer",
-                        Command::CopyQueryResults { .. } => "copy_query_results",
-                        Command::ResetQueries { .. } => "reset_queries",
-                        Command::BeginOcclusionQuery { .. } => "begin_occlusion_query",
-                        Command::EndOcclusionQuery { .. } => "end_occlusion_query",
-                        Command::WriteTimestamp(_) => "write_timestamp",
-                        Command::ResourceBarrier { .. } => "resource_barrier",
-                        Command::BeginRenderPass { .. } => "begin_render_pass",
-                        Command::EndRenderPass => "end_render_pass",
-                        Command::BeginComputePass { .. } => "begin_compute_pass",
-                        Command::EndComputePass => "end_compute_pass",
-                        Command::SetRenderPipeline { .. } => "set_render_pipeline",
-                        Command::SetComputePipeline { .. } => "set_compute_pipeline",
-                        Command::SetVertexBuffer { .. } => "set_vertex_buffer",
-                        Command::SetIndexBuffer { .. } => "set_index_buffer",
-                        Command::SetBindGroup { .. } => "set_bind_group",
-                        Command::SetImmediates { .. } => "set_immediates",
-                        Command::SetViewport { .. } => "set_viewport",
-                        Command::SetScissor { .. } => "set_scissor",
-                        Command::SetStencilReference { .. } => "set_stencil_reference",
-                        Command::SetBlendConstants { .. } => "set_blend_constants",
-                        Command::Draw { .. } => "draw",
-                        Command::DrawIndexed { .. } => "draw_indexed",
-                        Command::DrawIndirect { .. } => "draw_indirect",
-                        Command::DrawIndexedIndirect { .. } => "draw_indexed_indirect",
-                        Command::DrawIndirectCount { .. } => "draw_indirect_count",
-                        Command::DrawIndexedIndirectCount { .. } => "draw_indexed_indirect_count",
-                        Command::DispatchWorkgroups { .. } => "dispatch_workgroups",
-                        Command::DispatchWorkgroupsIndirect { .. } => {
-                            "dispatch_workgroups_indirect"
-                        }
-                    }
+                    command.name()
                 );
                 #[cfg(target_os = "horizon")]
                 super::trace::dump("command_execute_failed");
@@ -1055,6 +1019,44 @@ impl crate::CommandEncoder for CommandBuffer {
 }
 
 impl Command {
+    fn name(&self) -> &'static str {
+        match self {
+            Command::ClearBuffer { .. } => "clear_buffer",
+            Command::CopyBufferToBuffer { .. } => "copy_buffer_to_buffer",
+            Command::CopyBufferToTexture { .. } => "copy_buffer_to_texture",
+            Command::CopyTextureToTexture { .. } => "copy_texture_to_texture",
+            Command::CopyTextureToBuffer { .. } => "copy_texture_to_buffer",
+            Command::CopyQueryResults { .. } => "copy_query_results",
+            Command::ResetQueries { .. } => "reset_queries",
+            Command::BeginOcclusionQuery { .. } => "begin_occlusion_query",
+            Command::EndOcclusionQuery { .. } => "end_occlusion_query",
+            Command::WriteTimestamp(_) => "write_timestamp",
+            Command::ResourceBarrier { .. } => "resource_barrier",
+            Command::BeginRenderPass { .. } => "begin_render_pass",
+            Command::EndRenderPass => "end_render_pass",
+            Command::BeginComputePass { .. } => "begin_compute_pass",
+            Command::EndComputePass => "end_compute_pass",
+            Command::SetRenderPipeline { .. } => "set_render_pipeline",
+            Command::SetComputePipeline { .. } => "set_compute_pipeline",
+            Command::SetVertexBuffer { .. } => "set_vertex_buffer",
+            Command::SetIndexBuffer { .. } => "set_index_buffer",
+            Command::SetBindGroup { .. } => "set_bind_group",
+            Command::SetImmediates { .. } => "set_immediates",
+            Command::SetViewport { .. } => "set_viewport",
+            Command::SetScissor { .. } => "set_scissor",
+            Command::SetStencilReference { .. } => "set_stencil_reference",
+            Command::SetBlendConstants { .. } => "set_blend_constants",
+            Command::Draw { .. } => "draw",
+            Command::DrawIndexed { .. } => "draw_indexed",
+            Command::DrawIndirect { .. } => "draw_indirect",
+            Command::DrawIndexedIndirect { .. } => "draw_indexed_indirect",
+            Command::DrawIndirectCount { .. } => "draw_indirect_count",
+            Command::DrawIndexedIndirectCount { .. } => "draw_indexed_indirect_count",
+            Command::DispatchWorkgroups { .. } => "dispatch_workgroups",
+            Command::DispatchWorkgroupsIndirect { .. } => "dispatch_workgroups_indirect",
+        }
+    }
+
     /// # Safety
     ///
     /// Must be called with appropriate synchronization for the resources affected by the command,
@@ -1413,6 +1415,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn color_copy_size_covers_integer_and_float_texels() {
+        for (format, bytes) in [
+            (wgt::TextureFormat::R8Uint, 1),
+            (wgt::TextureFormat::R16Uint, 2),
+            (wgt::TextureFormat::Rg32Sint, 8),
+            (wgt::TextureFormat::Rgba16Float, 8),
+            (wgt::TextureFormat::Rgba32Float, 16),
+        ] {
+            assert_eq!(color_copy_texel_size(format).unwrap(), bytes);
+        }
+        assert!(color_copy_texel_size(wgt::TextureFormat::Bc1RgbaUnorm).is_err());
+    }
+
+    #[test]
     fn selective_multiview_replays_only_active_view_indices() {
         let mask = core::num::NonZeroU32::new(0b10101).unwrap();
         assert_eq!(
@@ -1651,6 +1667,15 @@ unsafe fn submit_copy_buffer_to_buffer(
     }
 }
 
+fn color_copy_texel_size(format: wgt::TextureFormat) -> DeviceResult<u32> {
+    if format.block_dimensions() != (1, 1) {
+        return Err(crate::DeviceError::Lost);
+    }
+    format
+        .block_copy_size(Some(wgt::TextureAspect::All))
+        .ok_or(crate::DeviceError::Lost)
+}
+
 #[cfg(target_os = "horizon")]
 unsafe fn submit_copy_buffer_to_texture(
     queue: &Queue,
@@ -1659,18 +1684,7 @@ unsafe fn submit_copy_buffer_to_texture(
     dst: &TextureInner,
     regions: &[crate::BufferTextureCopy],
 ) -> DeviceResult<()> {
-    let bytes_per_texel = match dst.format() {
-        wgt::TextureFormat::R8Unorm => 1,
-        wgt::TextureFormat::Rg8Unorm => 2,
-        wgt::TextureFormat::Rgba8Unorm
-        | wgt::TextureFormat::Rgba8UnormSrgb
-        | wgt::TextureFormat::Rgb9e5Ufloat
-        | wgt::TextureFormat::R32Float => 4,
-        wgt::TextureFormat::Rg16Float => 4,
-        wgt::TextureFormat::Rgba16Float => 8,
-        wgt::TextureFormat::Rgba32Float => 16,
-        _ => return Err(crate::DeviceError::Lost),
-    };
+    let bytes_per_texel = color_copy_texel_size(dst.format())?;
     unsafe {
         submit_deko_commands(queue, surface_queue, "copy_buffer_to_texture", |cmdbuf| {
             dk::dkCmdBufBarrier(
@@ -2158,18 +2172,7 @@ unsafe fn submit_copy_texture_to_buffer(
     dst: &Buffer,
     regions: &[crate::BufferTextureCopy],
 ) -> DeviceResult<()> {
-    let bytes_per_texel = match src.format() {
-        wgt::TextureFormat::R8Unorm => 1,
-        wgt::TextureFormat::Rg8Unorm => 2,
-        wgt::TextureFormat::Rgba8Unorm
-        | wgt::TextureFormat::Rgba8UnormSrgb
-        | wgt::TextureFormat::Rgb9e5Ufloat
-        | wgt::TextureFormat::R32Float => 4,
-        wgt::TextureFormat::Rg16Float => 4,
-        wgt::TextureFormat::Rgba16Float => 8,
-        wgt::TextureFormat::Rgba32Float => 16,
-        _ => return Err(crate::DeviceError::Lost),
-    };
+    let bytes_per_texel = color_copy_texel_size(src.format())?;
     let mut downloaded_ranges = Vec::with_capacity(regions.len());
     unsafe {
         submit_deko_commands(queue, surface_queue, "copy_texture_to_buffer", |cmdbuf| {

@@ -501,6 +501,10 @@ impl Device {
 
         let enable_indirect_validation = instance_flags
             .contains(wgt::InstanceFlags::VALIDATION_INDIRECT_CALL)
+            // Deko3D consumes CPU-visible indirect records through its command
+            // replay layer and validates them before issuing native commands.
+            // It also cannot runtime-compile this private Naga compute shader.
+            && adapter.backend() != wgt::Backend::Deko3d
             && downlevel.flags.contains(
                 wgt::DownlevelFlags::INDIRECT_EXECUTION | wgt::DownlevelFlags::COMPUTE_SHADERS,
             )

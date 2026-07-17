@@ -488,7 +488,13 @@ impl Device {
             desc.multiview_mask,
         ) {
             Ok(module) => module,
-            Err(_) => None,
+            Err(error) => {
+                std::eprintln!(
+                    "[wgpu-deko3d] vertex artifact resolution failed for pipeline {:?}: {error}",
+                    desc.label
+                );
+                None
+            }
         };
         let fragment_artifact = match desc
             .fragment
@@ -504,7 +510,13 @@ impl Device {
             .transpose()
         {
             Ok(module) => module.flatten(),
-            Err(_) => None,
+            Err(error) => {
+                std::eprintln!(
+                    "[wgpu-deko3d] fragment artifact resolution failed for pipeline {:?}: {error}",
+                    desc.label
+                );
+                None
+            }
         };
         let vertex_state = VertexState {
             module: vertex.as_ref().unwrap_or(desc.vertex.module),
@@ -554,7 +566,13 @@ impl Device {
             None,
         ) {
             Ok(module) => module,
-            Err(_) => None,
+            Err(error) => {
+                std::eprintln!(
+                    "[wgpu-deko3d] compute artifact resolution failed for pipeline {:?}: {error}",
+                    desc.label
+                );
+                None
+            }
         };
         let descriptor = ComputePipelineDescriptor {
             label: desc.label,

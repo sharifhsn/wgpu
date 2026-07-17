@@ -574,7 +574,7 @@ impl DkRasterizerState {
     }
 
     pub fn set_depth_bias_enable(&mut self, enable: bool) {
-        self.bits = (self.bits & !(0b111 << 14)) | (u32::from(enable) * 0b100 << 14);
+        self.bits = (self.bits & !(0b111 << 14)) | ((u32::from(enable) * 0b100) << 14);
     }
 }
 
@@ -1305,6 +1305,7 @@ unsafe extern "C" {
 
     pub fn dkShaderInitialize(obj: *mut DkShader, maker: *const DkShaderMaker);
     pub fn dkShaderIsValid(obj: *const DkShader) -> bool;
+    pub fn dkShaderGetStage(obj: *const DkShader) -> DkStage;
 
     pub fn dkImageLayoutInitialize(obj: *mut DkImageLayout, maker: *const DkImageLayoutMaker);
     pub fn dkImageLayoutGetSize(obj: *const DkImageLayout) -> u64;
@@ -1466,6 +1467,7 @@ fn abi_surface_compile_smoke() {
     let _ = core::mem::size_of::<DkCmdBuf>();
     let _ = core::mem::size_of::<DkSwapchainMaker>();
     let _ = dkDeviceCreate as unsafe extern "C" fn(*const DkDeviceMaker) -> DkDevice;
+    let _ = dkShaderGetStage as unsafe extern "C" fn(*const DkShader) -> DkStage;
     let _ = nwindowGetDefault as unsafe extern "C" fn() -> *mut NWindow;
 }
 
@@ -1509,5 +1511,12 @@ mod tests {
         assert_eq!((rasterizer.bits >> 14) & 0b111, 0b100);
         rasterizer.set_depth_bias_enable(false);
         assert_eq!((rasterizer.bits >> 14) & 0b111, 0);
+    }
+
+    #[test]
+    fn queue_defaults_enable_graphics_and_compute() {
+        let maker = DkQueueMaker::defaults(core::ptr::null_mut());
+        assert_ne!(maker.flags & DkQueueFlags_Graphics, 0);
+        assert_ne!(maker.flags & DkQueueFlags_Compute, 0);
     }
 }

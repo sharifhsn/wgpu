@@ -23,6 +23,7 @@ pub struct Writer<'a, W> {
     names: crate::FastHashMap<NameKey, String>,
     /// A map with the names of global variables needed for reflections.
     reflection_names_globals: crate::FastHashMap<Handle<crate::GlobalVariable>, String>,
+    depth_image_loads: crate::FastHashSet<Handle<crate::GlobalVariable>>,
     /// The selected entry point.
     pub(in crate::back::glsl) entry_point: &'a crate::EntryPoint,
     /// The index of the selected entry point.
@@ -44,6 +45,177 @@ pub struct Writer<'a, W> {
     varying: crate::FastHashMap<String, VaryingLocation>,
     /// Number of user-defined clip planes. Only non-zero for vertex shaders.
     clip_distance_count: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DepthImageUse {
+    load: bool,
+    sample: bool,
+}
+
+impl DepthImageUse {
+    const fn merge(&mut self, other: Self) {
+        self.load |= other.load;
+        self.sample |= other.sample;
+    }
+}
+
+#[derive(Default)]
+struct DepthImageUseSummary {
+    globals: crate::FastHashMap<Handle<crate::GlobalVariable>, DepthImageUse>,
+    arguments: Vec<DepthImageUse>,
+}
+
+enum ImageOrigin {
+    Global(Handle<crate::GlobalVariable>),
+    Argument(u32),
+}
+
+fn image_origin(
+    expressions: &crate::Arena<crate::Expression>,
+    mut expression: Handle<crate::Expression>,
+) -> Option<ImageOrigin> {
+    loop {
+        match expressions[expression] {
+            crate::Expression::GlobalVariable(global) => {
+                return Some(ImageOrigin::Global(global));
+            }
+            crate::Expression::FunctionArgument(index) => {
+                return Some(ImageOrigin::Argument(index));
+            }
+            crate::Expression::Access { base, .. }
+            | crate::Expression::AccessIndex { base, .. } => {
+                expression = base;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn type_is_depth_image(module: &crate::Module, mut ty: Handle<crate::Type>) -> bool {
+    loop {
+        match module.types[ty].inner {
+            TypeInner::BindingArray { base, .. } => ty = base,
+            TypeInner::Image {
+                class: crate::ImageClass::Depth { .. },
+                ..
+            } => return true,
+            _ => return false,
+        }
+    }
+}
+
+fn origin_is_depth_image(
+    origin: &ImageOrigin,
+    function: &crate::Function,
+    module: &crate::Module,
+) -> bool {
+    let ty = match *origin {
+        ImageOrigin::Global(global) => module.global_variables[global].ty,
+        ImageOrigin::Argument(index) => match function.arguments.get(index as usize) {
+            Some(argument) => argument.ty,
+            None => return false,
+        },
+    };
+    type_is_depth_image(module, ty)
+}
+
+fn mark_depth_image_use(
+    summary: &mut DepthImageUseSummary,
+    origin: ImageOrigin,
+    image_use: DepthImageUse,
+) {
+    match origin {
+        ImageOrigin::Global(global) => summary.globals.entry(global).or_default().merge(image_use),
+        ImageOrigin::Argument(index) => {
+            if let Some(argument) = summary.arguments.get_mut(index as usize) {
+                argument.merge(image_use);
+            }
+        }
+    }
+}
+
+#[allow(clippy::pattern_type_mismatch)]
+fn collect_depth_image_calls(
+    block: &crate::Block,
+    function: &crate::Function,
+    summaries: &[DepthImageUseSummary],
+    summary: &mut DepthImageUseSummary,
+) {
+    for statement in block {
+        match statement {
+            crate::Statement::Block(block) => {
+                collect_depth_image_calls(block, function, summaries, summary)
+            }
+            crate::Statement::If { accept, reject, .. } => {
+                collect_depth_image_calls(accept, function, summaries, summary);
+                collect_depth_image_calls(reject, function, summaries, summary);
+            }
+            crate::Statement::Switch { cases, .. } => {
+                for case in cases {
+                    collect_depth_image_calls(&case.body, function, summaries, summary);
+                }
+            }
+            crate::Statement::Loop {
+                body, continuing, ..
+            } => {
+                collect_depth_image_calls(body, function, summaries, summary);
+                collect_depth_image_calls(continuing, function, summaries, summary);
+            }
+            crate::Statement::Call {
+                function: callee,
+                arguments,
+                ..
+            } => {
+                let callee_summary = &summaries[callee.index()];
+                for (&global, &image_use) in &callee_summary.globals {
+                    summary.globals.entry(global).or_default().merge(image_use);
+                }
+                for (&argument, &image_use) in arguments.iter().zip(&callee_summary.arguments) {
+                    if image_use.load || image_use.sample {
+                        if let Some(origin) = image_origin(&function.expressions, argument) {
+                            mark_depth_image_use(summary, origin, image_use);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_depth_image_uses(
+    function: &crate::Function,
+    module: &crate::Module,
+    summaries: &[DepthImageUseSummary],
+) -> DepthImageUseSummary {
+    let mut summary = DepthImageUseSummary {
+        globals: crate::FastHashMap::default(),
+        arguments: vec![DepthImageUse::default(); function.arguments.len()],
+    };
+    for (_, expression) in function.expressions.iter() {
+        let (image, is_load) = match *expression {
+            crate::Expression::ImageLoad { image, .. } => (image, true),
+            crate::Expression::ImageSample { image, .. } => (image, false),
+            _ => continue,
+        };
+        let Some(origin) = image_origin(&function.expressions, image) else {
+            continue;
+        };
+        if !origin_is_depth_image(&origin, function, module) {
+            continue;
+        }
+        mark_depth_image_use(
+            &mut summary,
+            origin,
+            DepthImageUse {
+                load: is_load,
+                sample: !is_load,
+            },
+        );
+    }
+    collect_depth_image_calls(&function.body, function, summaries, &mut summary);
+    summary
 }
 
 impl<'a, W: Write> Writer<'a, W> {
@@ -104,6 +276,7 @@ impl<'a, W: Write> Writer<'a, W> {
             features: FeaturesManager::new(),
             names,
             reflection_names_globals: crate::FastHashMap::default(),
+            depth_image_loads: crate::FastHashSet::default(),
             entry_point: &module.entry_points[ep_idx],
             entry_point_idx: ep_idx as u16,
             multiview: pipeline_options.multiview,
@@ -117,8 +290,62 @@ impl<'a, W: Write> Writer<'a, W> {
 
         // Find all features required to print this module
         this.collect_required_features()?;
+        this.collect_depth_image_loads()?;
 
         Ok(this)
+    }
+
+    fn collect_depth_image_loads(&mut self) -> Result<(), Error> {
+        let entry_point_info = self.info.get_entry_point(self.entry_point_idx as usize);
+        let include_unused = self
+            .options
+            .writer_flags
+            .contains(WriterFlags::INCLUDE_UNUSED_ITEMS);
+        let mut summaries = Vec::with_capacity(self.module.functions.len());
+
+        for (handle, function) in self.module.functions.iter() {
+            debug_assert_eq!(handle.index(), summaries.len());
+            summaries.push(collect_depth_image_uses(function, self.module, &summaries));
+        }
+        let entry_summary =
+            collect_depth_image_uses(&self.entry_point.function, self.module, &summaries);
+
+        let mut sampled_depth_images = crate::FastHashSet::default();
+        let mut merge_summary = |summary: &DepthImageUseSummary| {
+            for (&global, image_use) in &summary.globals {
+                if image_use.load {
+                    self.depth_image_loads.insert(global);
+                }
+                if image_use.sample {
+                    sampled_depth_images.insert(global);
+                }
+            }
+        };
+        merge_summary(&entry_summary);
+        if include_unused {
+            for summary in &summaries {
+                merge_summary(summary);
+            }
+        } else {
+            for (handle, _) in self.module.functions.iter() {
+                if entry_point_info.dominates_global_use(&self.info[handle]) {
+                    merge_summary(&summaries[handle.index()]);
+                }
+            }
+        }
+
+        if self
+            .depth_image_loads
+            .iter()
+            .any(|image| sampled_depth_images.contains(image))
+        {
+            return Err(Error::Custom(
+                "WGSL depth textures cannot be both sampled and textureLoad sources in GLSL"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     /// Writes the [`Module`](crate::Module) as glsl to the output
@@ -329,72 +556,37 @@ impl<'a, W: Write> Writer<'a, W> {
                 // We treat images separately because they might require
                 // writing the storage format
                 TypeInner::Image {
-                    mut dim,
+                    dim,
                     arrayed,
                     class,
-                } => {
-                    // Gather the storage format if needed
-                    let storage_format_access = match self.module.types[global.ty].inner {
-                        TypeInner::Image {
-                            class: crate::ImageClass::Storage { format, access },
-                            ..
-                        } => Some((format, access)),
-                        _ => None,
+                } => self.write_image_global(handle, global, dim, arrayed, class, None)?,
+                TypeInner::BindingArray { base, size }
+                    if matches!(self.module.types[base].inner, TypeInner::Image { .. }) =>
+                {
+                    let TypeInner::Image {
+                        dim,
+                        arrayed,
+                        class,
+                    } = self.module.types[base].inner
+                    else {
+                        unreachable!()
                     };
-
-                    if dim == crate::ImageDimension::D1 && es {
-                        dim = crate::ImageDimension::D2
-                    }
-
-                    // Gether the location if needed
-                    let layout_binding = if self.options.version.supports_explicit_locations() {
-                        let br = global.binding.as_ref().unwrap();
-                        self.options.binding_map.get(br).cloned()
-                    } else {
-                        None
-                    };
-
-                    // Write all the layout qualifiers
-                    if layout_binding.is_some() || storage_format_access.is_some() {
-                        write!(self.out, "layout(")?;
-                        if let Some(binding) = layout_binding {
-                            write!(self.out, "binding = {binding}")?;
-                        }
-                        if let Some((format, _)) = storage_format_access {
-                            let format_str = glsl_storage_format(format)?;
-                            let separator = match layout_binding {
-                                Some(_) => ",",
-                                None => "",
-                            };
-                            write!(self.out, "{separator}{format_str}")?;
-                        }
-                        write!(self.out, ") ")?;
-                    }
-
-                    if let Some((_, access)) = storage_format_access {
-                        self.write_storage_access(access)?;
-                    }
-
-                    // All images in glsl are `uniform`
-                    // The trailing space is important
-                    write!(self.out, "uniform ")?;
-
-                    // write the type
-                    //
-                    // This is way we need the leading space because `write_image_type` doesn't add
-                    // any spaces at the beginning or end
-                    self.write_image_type(dim, arrayed, class)?;
-
-                    // Finally write the name and end the global with a `;`
-                    // The leading space is important
-                    let global_name = self.get_global_name(handle, global);
-                    writeln!(self.out, " {global_name};")?;
-                    writeln!(self.out)?;
-
-                    self.reflection_names_globals.insert(handle, global_name);
+                    self.write_image_global(
+                        handle,
+                        global,
+                        dim,
+                        arrayed,
+                        class,
+                        Some((base, size)),
+                    )?;
                 }
                 // glsl has no concept of samplers so we just ignore it
                 TypeInner::Sampler { .. } => continue,
+                TypeInner::BindingArray { base, .. }
+                    if matches!(self.module.types[base].inner, TypeInner::Sampler { .. }) =>
+                {
+                    continue
+                }
                 // All other globals are written by `write_global`
                 _ => {
                     self.write_global(handle, global)?;
@@ -452,6 +644,77 @@ impl<'a, W: Write> Writer<'a, W> {
 
         // Collect all reflection info and return it to the user
         self.collect_reflection_info()
+    }
+
+    fn write_image_global(
+        &mut self,
+        handle: Handle<crate::GlobalVariable>,
+        global: &crate::GlobalVariable,
+        mut dim: crate::ImageDimension,
+        arrayed: bool,
+        class: crate::ImageClass,
+        binding_array: Option<(Handle<crate::Type>, crate::ArraySize)>,
+    ) -> BackendResult {
+        if let Some((_, size)) = binding_array {
+            if !matches!(
+                size.resolve(self.module.to_ctx())?,
+                proc::IndexableLength::Known(_)
+            ) {
+                return Err(Error::Custom(
+                    "GLSL does not support unbounded binding arrays".to_string(),
+                ));
+            }
+        }
+        let storage_format_access = match class {
+            crate::ImageClass::Storage { format, access } => Some((format, access)),
+            _ => None,
+        };
+
+        if dim == crate::ImageDimension::D1 && self.options.version.is_es() {
+            dim = crate::ImageDimension::D2;
+        }
+
+        let layout_binding = if self.options.version.supports_explicit_locations() {
+            let br = global.binding.as_ref().unwrap();
+            self.options.binding_map.get(br).cloned()
+        } else {
+            None
+        };
+
+        if layout_binding.is_some() || storage_format_access.is_some() {
+            write!(self.out, "layout(")?;
+            if let Some(binding) = layout_binding {
+                write!(self.out, "binding = {binding}")?;
+            }
+            if let Some((format, _)) = storage_format_access {
+                let format_str = glsl_storage_format(format)?;
+                let separator = if layout_binding.is_some() { "," } else { "" };
+                write!(self.out, "{separator}{format_str}")?;
+            }
+            write!(self.out, ") ")?;
+        }
+
+        if let Some((_, access)) = storage_format_access {
+            self.write_storage_access(access)?;
+        }
+        write!(self.out, "uniform ")?;
+        self.write_image_type(
+            dim,
+            arrayed,
+            class,
+            self.depth_image_loads.contains(&handle),
+        )?;
+
+        let global_name = self.get_global_name(handle, global);
+        write!(self.out, " {global_name}")?;
+        if let Some((base, size)) = binding_array {
+            self.write_array_size(base, size)?;
+        }
+        writeln!(self.out, ";")?;
+        writeln!(self.out)?;
+
+        self.reflection_names_globals.insert(handle, global_name);
+        Ok(())
     }
 
     fn write_array_size(
@@ -572,6 +835,7 @@ impl<'a, W: Write> Writer<'a, W> {
         dim: crate::ImageDimension,
         arrayed: bool,
         class: crate::ImageClass,
+        depth_load: bool,
     ) -> BackendResult {
         // glsl images consist of four parts the scalar prefix, the image "type", the dimensions
         // and modifiers
@@ -595,7 +859,9 @@ impl<'a, W: Write> Writer<'a, W> {
             Ic::Sampled { kind, multi: true } => ("sampler", S { kind, width: 4 }, "MS", ""),
             Ic::Sampled { kind, multi: false } => ("sampler", S { kind, width: 4 }, "", ""),
             Ic::Depth { multi: true } => ("sampler", float, "MS", ""),
-            Ic::Depth { multi: false } => ("sampler", float, "", "Shadow"),
+            Ic::Depth { multi: false } => {
+                ("sampler", float, "", if depth_load { "" } else { "Shadow" })
+            }
             Ic::Storage { format, .. } => ("image", format.into(), "", ""),
             Ic::External => unimplemented!(),
         };
@@ -804,7 +1070,11 @@ impl<'a, W: Write> Writer<'a, W> {
         global: &crate::GlobalVariable,
     ) -> BackendResult {
         // Write the block name, it's just the struct name appended with `_block_ID`
-        let ty_name = &self.names[&NameKey::Type(global.ty)];
+        let (block_ty, binding_array_size) = match self.module.types[global.ty].inner {
+            TypeInner::BindingArray { base, size } => (base, Some(size)),
+            _ => (global.ty, None),
+        };
+        let ty_name = &self.names[&NameKey::Type(block_ty)];
         let block_name = format!(
             "{}_block_{}{:?}",
             // avoid double underscores as they are reserved in GLSL
@@ -815,7 +1085,7 @@ impl<'a, W: Write> Writer<'a, W> {
         write!(self.out, "{block_name} ")?;
         self.reflection_names_globals.insert(handle, block_name);
 
-        match self.module.types[global.ty].inner {
+        match self.module.types[block_ty].inner {
             TypeInner::Struct { ref members, .. }
                 if self.module.types[members.last().unwrap().ty]
                     .inner
@@ -824,9 +1094,18 @@ impl<'a, W: Write> Writer<'a, W> {
                 // Structs with dynamically sized arrays must have their
                 // members lifted up as members of the interface block. GLSL
                 // can't write such struct types anyway.
-                self.write_struct_body(global.ty, members)?;
+                self.write_struct_body(block_ty, members)?;
                 write!(self.out, " ")?;
                 self.write_global_name(handle, global)?;
+                if let Some(size) = binding_array_size {
+                    self.write_array_size(block_ty, size)?;
+                }
+            }
+            TypeInner::Struct { ref members, .. } if binding_array_size.is_some() => {
+                self.write_struct_body(block_ty, members)?;
+                write!(self.out, " ")?;
+                self.write_global_name(handle, global)?;
+                self.write_array_size(block_ty, binding_array_size.unwrap())?;
             }
             _ => {
                 // A global of any other type is written as the sole member
@@ -1293,7 +1572,7 @@ impl<'a, W: Write> Writer<'a, W> {
                     //
                     // This is way we need the leading space because `write_image_type` doesn't add
                     // any spaces at the beginning or end
-                    this.write_image_type(dim, arrayed, class)?;
+                    this.write_image_type(dim, arrayed, class, false)?;
                 }
                 TypeInner::Pointer { base, .. } => {
                     // write parameter qualifiers
@@ -1635,11 +1914,14 @@ impl<'a, W: Write> Writer<'a, W> {
                         ..
                     } = ctx.expressions[handle]
                     {
-                        if let TypeInner::Image {
-                            class: crate::ImageClass::Sampled { .. },
-                            ..
-                        } = *ctx.resolve_type(image, &self.module.types)
-                        {
+                        if matches!(
+                            *ctx.resolve_type(image, &self.module.types),
+                            TypeInner::Image {
+                                class: crate::ImageClass::Sampled { .. }
+                                    | crate::ImageClass::Depth { .. },
+                                ..
+                            }
+                        ) {
                             if let proc::BoundsCheckPolicy::Restrict = self.policies.image_load {
                                 write!(self.out, "{level}")?;
                                 self.write_clamped_lod(ctx, handle, image, level_expr)?
@@ -2455,6 +2737,7 @@ impl<'a, W: Write> Writer<'a, W> {
                     }
                     TypeInner::Matrix { .. }
                     | TypeInner::Array { .. }
+                    | TypeInner::BindingArray { .. }
                     | TypeInner::ValuePointer { .. } => write!(self.out, "[{index}]")?,
                     TypeInner::Struct { .. } => {
                         // This will never panic in case the type is a `Struct`, this is not true
@@ -4077,12 +4360,7 @@ impl<'a, W: Write> Writer<'a, W> {
                 };
                 ("imageLoad", policy)
             }
-            // TODO: Is there even a function for this?
-            crate::ImageClass::Depth { multi: _ } => {
-                return Err(Error::Custom(
-                    "WGSL `textureLoad` from depth textures is not supported in GLSL".to_string(),
-                ))
-            }
+            crate::ImageClass::Depth { .. } => ("texelFetch", self.policies.image_load),
             crate::ImageClass::External => unimplemented!(),
         };
 
@@ -4269,29 +4547,32 @@ impl<'a, W: Write> Writer<'a, W> {
         // Close the image load function.
         write!(self.out, ")")?;
 
+        let depth_load = matches!(class, crate::ImageClass::Depth { .. });
+        if depth_load {
+            write!(self.out, ".x")?;
+        }
+
         // If we were using the `ReadZeroSkipWrite` policy we need to end the first branch
         // (which is taken if the condition is `true`) with a colon (`:`) and write the
         // second branch which is just a 0 value.
         if let proc::BoundsCheckPolicy::ReadZeroSkipWrite = policy {
-            // Get the kind of the output value.
-            let kind = match class {
-                // Only sampled images can reach here since storage images
-                // don't need bounds checks and depth images aren't implemented
-                crate::ImageClass::Sampled { kind, .. } => kind,
-                _ => unreachable!(),
-            };
-
             // End the first branch
             write!(self.out, " : ")?;
-            // Write the 0 value
-            write!(
-                self.out,
-                "{}vec4(",
-                glsl_scalar(crate::Scalar { kind, width: 4 })?.prefix,
-            )?;
-            self.write_zero_init_scalar(kind)?;
-            // Close the zero value constructor
-            write!(self.out, ")")?;
+            if depth_load {
+                write!(self.out, "0.0")?;
+            } else {
+                let kind = match class {
+                    crate::ImageClass::Sampled { kind, .. } => kind,
+                    _ => unreachable!(),
+                };
+                write!(
+                    self.out,
+                    "{}vec4(",
+                    glsl_scalar(crate::Scalar { kind, width: 4 })?.prefix,
+                )?;
+                self.write_zero_init_scalar(kind)?;
+                write!(self.out, ")")?;
+            }
             // Close the parentheses surrounding our ternary
             write!(self.out, ")")?;
         }
@@ -4482,22 +4763,28 @@ impl<'a, W: Write> Writer<'a, W> {
             if info[handle].is_empty() {
                 continue;
             }
-            match self.module.types[var.ty].inner {
-                TypeInner::Image { .. } => {
-                    let tex_name = self.reflection_names_globals[&handle].clone();
-                    match texture_mapping.entry(tex_name) {
-                        hash_map::Entry::Vacant(v) => {
-                            v.insert(TextureMapping {
-                                texture: handle,
-                                sampler: None,
-                            });
-                        }
-                        hash_map::Entry::Occupied(_) => {
-                            // already used with a sampler, do nothing
-                        }
+            let is_image = match self.module.types[var.ty].inner {
+                TypeInner::Image { .. } => true,
+                TypeInner::BindingArray { base, .. } => {
+                    matches!(self.module.types[base].inner, TypeInner::Image { .. })
+                }
+                _ => false,
+            };
+            if is_image {
+                let tex_name = self.reflection_names_globals[&handle].clone();
+                match texture_mapping.entry(tex_name) {
+                    hash_map::Entry::Vacant(v) => {
+                        v.insert(TextureMapping {
+                            texture: handle,
+                            sampler: None,
+                        });
+                    }
+                    hash_map::Entry::Occupied(_) => {
+                        // already used with a sampler, do nothing
                     }
                 }
-                _ => match var.space {
+            } else {
+                match var.space {
                     crate::AddressSpace::Uniform | crate::AddressSpace::Storage { .. } => {
                         let name = self.reflection_names_globals[&handle].clone();
                         uniforms.insert(handle, name);
@@ -4507,7 +4794,7 @@ impl<'a, W: Write> Writer<'a, W> {
                         immediates_info = Some((name, var.ty));
                     }
                     _ => (),
-                },
+                }
             }
         }
 

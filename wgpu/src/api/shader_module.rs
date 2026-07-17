@@ -317,3 +317,23 @@ pub struct Deko3dDkshShaderModuleDescriptor<'a> {
     pub dksh: alloc::borrow::Cow<'a, [u8]>,
 }
 static_assertions::assert_impl_all!(Deko3dDkshShaderModuleDescriptor<'_>: Send, Sync);
+
+impl<'a> Deko3dDkshShaderModuleDescriptor<'a> {
+    /// Constructs a descriptor for one offline-compiled entry point.
+    ///
+    /// Deko3D DKSH already contains the selected graphics or compute entry point, so the name is
+    /// retained for source compatibility with newer wgpu artifact tooling but is not encoded
+    /// separately by the wgpu 29 passthrough descriptor.
+    pub fn single_entry(
+        label: Label<'a>,
+        _entry_point: &'a str,
+        num_workgroups: (u32, u32, u32),
+        dksh: alloc::borrow::Cow<'a, [u8]>,
+    ) -> Self {
+        Self {
+            label,
+            num_workgroups,
+            dksh,
+        }
+    }
+}
