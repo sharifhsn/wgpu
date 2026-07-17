@@ -150,6 +150,14 @@ fn compile_deko3d_wgsl(
     let (key, artifact, telemetry) = cache
         .compile_wgsl_with_telemetry(source, stage, &entry_point, &constants, options)
         .map_err(|error| Deko3dWgslArtifactError::Compiler(error.to_string()))?;
+    #[cfg(target_os = "horizon")]
+    eprintln!(
+        "[wgpu-deko3d] shader_cache key={} stage={stage:?} entry_point={entry_point} source={:?} elapsed_us={}",
+        key.to_hex(),
+        telemetry.source,
+        telemetry.elapsed.as_micros(),
+    );
+    #[cfg(not(target_os = "horizon"))]
     log::info!(
         target: "wgpu_deko3d_shader",
         "shader_cache key={} stage={stage:?} entry_point={entry_point} source={:?} elapsed_us={}",
