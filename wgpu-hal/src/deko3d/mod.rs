@@ -1299,15 +1299,27 @@ impl BindGroupInner {
                     & mask
                     == 0
                 {
+                    let image_words = unsafe {
+                        core::slice::from_raw_parts(
+                            ptr::addr_of!(binding.image_descriptor).cast::<u32>(),
+                            size_of::<dk::DkImageDescriptor>() / size_of::<u32>(),
+                        )
+                    };
                     trace::record(format_args!(
-                        "bind bind_group_id={} shader_group={} binding={} native_target={} texture_id={} view_id={} sampler_id={:?}",
+                        "bind bind_group_id={} shader_group={} binding={} native_target={} texture_id={} view_id={} sampler_id={:?} image_set={:#x} sampler_set={:#x} image_stride={} sampler_stride={} tic0={:#x} tic1={:#x}",
                         self.id,
                         shader_group,
                         binding_number,
                         target,
                         binding.texture.id(),
                         binding.view_id,
-                        binding.sampler.as_ref().map(|sampler| sampler.inner.id)
+                        binding.sampler.as_ref().map(|sampler| sampler.inner.id),
+                        image_descriptor_gpu_addr,
+                        sampler_descriptor_gpu_addr,
+                        image_descriptor_stride,
+                        sampler_descriptor_stride,
+                        image_words[0],
+                        image_words[1],
                     ));
                 }
             }
@@ -1381,6 +1393,7 @@ impl BindGroupInner {
         Ok(())
     }
 
+    #[cfg(target_os = "horizon")]
     pub(super) unsafe fn bind_uniform_binding(
         &self,
         cmdbuf: dk::DkCmdBuf,
@@ -2886,6 +2899,37 @@ impl BindGroupInner {
         }
 
         let sampler_offset = u64::from(image_descriptor_stride) * u64::from(descriptor_capacity);
+        let descriptor_cpu_addr = unsafe { dk::dkMemBlockGetCpuAddr(descriptor_mem_block) };
+        if descriptor_cpu_addr.is_null() {
+            unsafe { dk::dkMemBlockDestroy(descriptor_mem_block) };
+            return Err(crate::DeviceError::Lost);
+        }
+
+        // Deko3D requires the descriptor-set size passed at bind time to cover every shader
+        // target that may be selected dynamically. Ryujinx mirrors that complete range into a
+        // host descriptor array, so advertising the full range while leaving unused entries as
+        // allocator garbage is invalid even when native hardware would never dereference them.
+        // Seed every slot with the first valid texture/default-sampler pair; draw submission
+        // overwrites all targets actually referenced by the current pipeline.
+        let fallback = bindings.first().ok_or(crate::DeviceError::Lost)?;
+        for index in 0..descriptor_capacity {
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    ptr::addr_of!(fallback.image_descriptor).cast::<u8>(),
+                    descriptor_cpu_addr
+                        .cast::<u8>()
+                        .add((index * image_descriptor_stride) as usize),
+                    size_of::<dk::DkImageDescriptor>(),
+                );
+                ptr::copy_nonoverlapping(
+                    ptr::addr_of!(fallback.sampler_descriptor).cast::<u8>(),
+                    descriptor_cpu_addr.cast::<u8>().add(
+                        (sampler_offset + u64::from(index * sampler_descriptor_stride)) as usize,
+                    ),
+                    size_of::<dk::DkSamplerDescriptor>(),
+                );
+            }
+        }
 
         Ok(Self {
             inner: BindGroupInnerRaw::TextureSamplers {
@@ -4220,7 +4264,13 @@ mod tests {
             ]
         );
         assert_eq!(buffers.len(), 3);
-        assert!(supported_bind_group_layout_kind(&[texture(0), sampler(3)]).is_none());
+        assert!(matches!(
+            supported_bind_group_layout_kind(&[texture(0), sampler(3)]),
+            Some(BindGroupLayoutKind::TextureSamplers { bindings, buffers })
+                if bindings
+                    == vec![(0, Some(3), 1, wgt::ShaderStages::FRAGMENT)]
+                    && buffers.is_empty()
+        ));
         assert!(supported_bind_group_layout_kind(&[texture(0), uniform(0), sampler(1)]).is_none());
         let too_many = (0..=DEKO_TEXTURE_SAMPLER_COUNT as u32)
             .flat_map(|index| [texture(index * 2), sampler(index * 2 + 1)])
