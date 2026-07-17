@@ -5226,7 +5226,10 @@ impl crate::Device for Device {
         Ok(crate::BufferMapping {
             ptr: ptr::NonNull::new(buffer.get_slice_ptr(range)?.cast::<u8>())
                 .ok_or(crate::DeviceError::Lost)?,
-            is_coherent: true,
+            // The pointer addresses Deko3D's CPU shadow allocation, not the GPU-visible
+            // memory block. wgpu-core must therefore invalidate read mappings before it
+            // exposes them to the application.
+            is_coherent: false,
         })
     }
     unsafe fn unmap_buffer(&self, buffer: &Buffer) {
@@ -5251,7 +5254,27 @@ impl crate::Device for Device {
             }
         }
     }
-    unsafe fn invalidate_mapped_ranges<I>(&self, buffer: &Buffer, ranges: I) {}
+    unsafe fn invalidate_mapped_ranges<I>(&self, buffer: &Buffer, ranges: I)
+    where
+        I: Iterator<Item = crate::MemoryRange>,
+    {
+        #[cfg(not(target_os = "horizon"))]
+        {
+            let _ = buffer;
+            let _ = ranges;
+        }
+        #[cfg(target_os = "horizon")]
+        for range in ranges {
+            if let Err(error) = unsafe { buffer.download_from_gpu(range) } {
+                eprintln!("[wgpu-deko3d] invalidate_mapped_ranges failed: {error:?}");
+                trace::record(format_args!(
+                    "failure kind=invalidate_mapped_ranges buffer_id={} error={error:?}",
+                    buffer.id()
+                ));
+                trace::dump("invalidate_mapped_ranges_failed");
+            }
+        }
+    }
 
     unsafe fn create_texture(&self, desc: &crate::TextureDescriptor) -> DeviceResult<Resource> {
         #[cfg(target_os = "horizon")]
