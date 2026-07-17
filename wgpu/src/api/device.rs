@@ -1503,7 +1503,7 @@ mod deko3d_artifact_tests {
 
     #[cfg(feature = "deko3d")]
     #[test]
-    fn built_in_compiler_resolves_compute_wgsl_without_a_provider() {
+    fn built_in_compiler_resolves_compute_and_gradient_wgsl_without_a_provider() {
         let state = Deko3dWgslArtifactProviderState::default();
         let wgsl = br#"
             @group(0) @binding(0) var<storage, read> input: array<u32>;
@@ -1522,6 +1522,30 @@ mod deko3d_artifact_tests {
 
         assert_eq!(&artifact[..4], b"DKSH");
         assert_eq!(state.compiler.lock().len(), 1);
+
+        let gradient_wgsl = br#"
+            @group(0) @binding(0) var image: texture_2d<f32>;
+            @group(0) @binding(1) var image_sampler: sampler;
+
+            @fragment
+            fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+                return textureSampleGrad(
+                    image,
+                    image_sampler,
+                    uv,
+                    vec2<f32>(1.0, 0.0),
+                    vec2<f32>(0.0, 1.0),
+                );
+            }
+        "#;
+        let gradient_artifact = resolve_deko3d_wgsl_artifact(
+            &state,
+            request(gradient_wgsl, Deko3dWgslArtifactStage::Fragment, "main"),
+        )
+        .unwrap();
+
+        assert_eq!(&gradient_artifact[..4], b"DKSH");
+        assert_eq!(state.compiler.lock().len(), 2);
     }
 
     #[test]

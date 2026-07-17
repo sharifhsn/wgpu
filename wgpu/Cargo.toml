@@ -198,7 +198,7 @@ parking_lot = ["dep:parking_lot"]
 #########################
 
 [dependencies]
-deko-shader-compiler = { git = "https://github.com/sharifhsn/deko-shader-compiler", rev = "1a908ab3e0f5a13ad91c7940aa03982f66555212", optional = true }
+deko-shader-compiler = { git = "https://github.com/sharifhsn/deko-shader-compiler", rev = "9388e0f0fda9b957beffad07c995db14508d1b1a", optional = true }
 naga = { workspace = true, optional = true, features = ["termcolor"] }
 wgpu-core = { workspace = true, optional = true }
 wgpu-types.workspace = true
