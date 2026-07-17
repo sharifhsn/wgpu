@@ -1512,7 +1512,8 @@ mod deko3d_artifact_tests {
             @compute @workgroup_size(4)
             fn compute_main(@builtin(global_invocation_id) id: vec3<u32>) {
                 subgroupBarrier();
-                output[id.x] = input[id.x] * 3u + 1u;
+                let first = subgroupBroadcastFirst(id.x);
+                output[id.x] = input[id.x] * 3u + 1u + first - first;
             }
         "#;
         let artifact = resolve_deko3d_wgsl_artifact(
