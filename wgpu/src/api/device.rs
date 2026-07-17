@@ -151,7 +151,7 @@ fn compile_deko3d_wgsl(
         .compile_wgsl_with_telemetry(source, stage, &entry_point, &constants, options)
         .map_err(|error| Deko3dWgslArtifactError::Compiler(error.to_string()))?;
     #[cfg(target_os = "horizon")]
-    eprintln!(
+    std::eprintln!(
         "[wgpu-deko3d] shader_cache key={} stage={stage:?} entry_point={entry_point} source={:?} elapsed_us={}",
         key.to_hex(),
         telemetry.source,
