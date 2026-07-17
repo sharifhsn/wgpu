@@ -1510,9 +1510,16 @@ mod deko3d_artifact_tests {
             @group(0) @binding(1) var<storage, read_write> output: array<u32>;
 
             @compute @workgroup_size(4)
-            fn compute_main(@builtin(global_invocation_id) id: vec3<u32>) {
+            fn compute_main(
+                @builtin(global_invocation_id) id: vec3<u32>,
+                @builtin(subgroup_invocation_id) lane: u32,
+                @builtin(subgroup_size) subgroup_size: u32,
+                @builtin(subgroup_id) subgroup: u32,
+                @builtin(num_subgroups) subgroup_count: u32,
+            ) {
                 subgroupBarrier();
                 let first = subgroupBroadcastFirst(id.x);
+                _ = lane + subgroup_size + subgroup + subgroup_count;
                 output[id.x] = input[id.x] * 3u + 1u + first - first;
             }
         "#;
