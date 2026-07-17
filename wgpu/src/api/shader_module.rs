@@ -40,6 +40,10 @@ pub struct Deko3dWgslArtifactRequest<'a> {
     pub stage: Deko3dWgslArtifactStage,
     /// Requested pipeline entry point, with `main` substituted for an omitted entry point.
     pub entry_point: &'a str,
+    /// Pipeline-overridable constants. Duplicate names are permitted and the last value wins.
+    pub constants: &'a [(&'a str, f64)],
+    /// Whether workgroup-scoped memory must be initialized to zero for this stage.
+    pub zero_initialize_workgroup_memory: bool,
     /// Render-pipeline view mask. Multiview vertex artifacts must write `gl_Layer` and read the
     /// current view index from Deko3D vertex uniform-buffer slot 14. Compute and fragment artifact
     /// requests always use `None`.
@@ -48,7 +52,7 @@ pub struct Deko3dWgslArtifactRequest<'a> {
 
 /// A trusted source of offline-compiled Deko3D DKSH artifacts.
 pub trait Deko3dWgslArtifactProvider: Send + Sync {
-    /// Resolves an exact WGSL/stage/entry-point/multiview request to validated DKSH bytes.
+    /// Resolves an exact WGSL/stage/entry-point/options request to validated DKSH bytes.
     fn resolve(&self, request: Deko3dWgslArtifactRequest<'_>) -> Result<Arc<[u8]>, String>;
 }
 
