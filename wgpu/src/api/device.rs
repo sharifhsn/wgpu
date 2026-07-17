@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 struct Deko3dWgslArtifactProviderState {
     provider: Mutex<Option<Arc<dyn Deko3dWgslArtifactProvider>>>,
     #[cfg(feature = "deko3d")]
-    compiler: deko_shader_compiler::CompilerCache,
+    compiler: Mutex<deko_shader_compiler::CompilerCache>,
 }
 
 impl Default for Deko3dWgslArtifactProviderState {
@@ -26,7 +26,7 @@ impl Default for Deko3dWgslArtifactProviderState {
         Self {
             provider: Mutex::new(None),
             #[cfg(feature = "deko3d")]
-            compiler: deko_shader_compiler::CompilerCache::default(),
+            compiler: Mutex::new(deko_shader_compiler::CompilerCache::default()),
         }
     }
 }
@@ -103,7 +103,8 @@ fn resolve_deko3d_wgsl_artifact(
     } else {
         #[cfg(feature = "deko3d")]
         {
-            compile_deko3d_wgsl(&state.compiler, request)?
+            let compiler = state.compiler.lock().clone();
+            compile_deko3d_wgsl(&compiler, request)?
         }
         #[cfg(not(feature = "deko3d"))]
         {
@@ -254,6 +255,16 @@ impl Device {
         provider: Arc<dyn Deko3dWgslArtifactProvider>,
     ) -> Result<(), Deko3dWgslArtifactError> {
         self.deko3d_artifacts.install(provider)
+    }
+
+    /// Enables the persistent Deko3D shader cache below `directory` for this device.
+    ///
+    /// The cache is shared by [`Device`] clones. Files are checksummed and validated before use;
+    /// missing, stale, corrupt, or unwritable entries fall back to normal compilation.
+    #[cfg(feature = "deko3d")]
+    pub fn set_deko3d_shader_cache_directory(&self, directory: impl Into<std::path::PathBuf>) {
+        let mut compiler = self.deko3d_artifacts.compiler.lock();
+        *compiler = compiler.clone().with_persistent_directory(directory);
     }
 
     fn resolve_deko3d_wgsl_artifact(
@@ -1499,7 +1510,7 @@ mod deko3d_artifact_tests {
         .unwrap();
 
         assert_eq!(&artifact[..4], b"DKSH");
-        assert_eq!(state.compiler.len(), 1);
+        assert_eq!(state.compiler.lock().len(), 1);
     }
 
     #[test]
