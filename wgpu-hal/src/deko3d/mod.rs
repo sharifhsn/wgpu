@@ -700,7 +700,9 @@ const DEKO_COUNTER_REPORT_SIZE: wgt::BufferAddress = 16;
 #[cfg(target_os = "horizon")]
 const DEKO_QUERY_RESULT_SIZE: wgt::BufferAddress = 8;
 const DEKO_UNIFORM_BUF_MAX_SIZE: u64 = 0x10000;
-const DEKO_TEXTURE_SAMPLER_COUNT: usize = 32;
+// DKSH binding-map targets are global across every wgpu bind group. Bevy's full PBR pipelines
+// use targets above 31, so both descriptor arenas must cover the compiler's complete 6-bit range.
+const DEKO_TEXTURE_SAMPLER_COUNT: usize = 64;
 const DEKO_STORAGE_TEXTURE_COUNT: u32 = 8;
 const DEKO_STORAGE_BUFFER_COUNT: u32 = 16;
 
