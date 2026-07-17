@@ -1,10 +1,6 @@
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    string::{String, ToString},
-    sync::Arc,
-    vec,
-};
+#[cfg(feature = "deko3d")]
+use alloc::{borrow::ToOwned, string::ToString};
+use alloc::{boxed::Box, string::String, sync::Arc, vec};
 #[cfg(wgpu_core)]
 use core::ops::Deref;
 use core::{error, fmt, future::Future, marker::PhantomData};
@@ -151,9 +147,16 @@ fn compile_deko3d_wgsl(
             .collect(),
         ..Options::default()
     };
-    let (_, artifact) = cache
-        .compile_wgsl(source, stage, &entry_point, &constants, options)
+    let (key, artifact, telemetry) = cache
+        .compile_wgsl_with_telemetry(source, stage, &entry_point, &constants, options)
         .map_err(|error| Deko3dWgslArtifactError::Compiler(error.to_string()))?;
+    log::info!(
+        target: "wgpu_deko3d_shader",
+        "shader_cache key={} stage={stage:?} entry_point={entry_point} source={:?} elapsed_us={}",
+        key.to_hex(),
+        telemetry.source,
+        telemetry.elapsed.as_micros(),
+    );
     Ok(Arc::from(artifact.dksh.clone()))
 }
 
