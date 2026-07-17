@@ -25,7 +25,10 @@ impl ComputePipeline {
     /// This method will raise a validation error if there is no bind group layout at `index`.
     pub fn get_bind_group_layout(&self, index: u32) -> BindGroupLayout {
         let bind_group = self.inner.get_bind_group_layout(index);
-        BindGroupLayout { inner: bind_group }
+        BindGroupLayout {
+            inner: bind_group,
+            deko3d_binding_array_sizes: Default::default(),
+        }
     }
 
     #[cfg(custom)]

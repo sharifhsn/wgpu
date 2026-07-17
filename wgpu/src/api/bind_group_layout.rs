@@ -1,3 +1,5 @@
+use alloc::sync::Arc;
+
 use crate::*;
 
 /// Handle to a binding group layout.
@@ -14,6 +16,7 @@ use crate::*;
 #[derive(Debug, Clone)]
 pub struct BindGroupLayout {
     pub(crate) inner: dispatch::DispatchBindGroupLayout,
+    pub(crate) deko3d_binding_array_sizes: Arc<[(u32, u32)]>,
 }
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(BindGroupLayout: Send, Sync);

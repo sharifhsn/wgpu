@@ -1,3 +1,5 @@
+use alloc::sync::Arc;
+
 use crate::*;
 
 /// Handle to a pipeline layout.
@@ -9,6 +11,7 @@ use crate::*;
 #[derive(Debug, Clone)]
 pub struct PipelineLayout {
     pub(crate) inner: dispatch::DispatchPipelineLayout,
+    pub(crate) deko3d_binding_array_sizes: Arc<[Deko3dWgslBindingArraySize]>,
 }
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(PipelineLayout: Send, Sync);

@@ -29,6 +29,17 @@ pub enum Deko3dWgslArtifactStage {
     Compute,
 }
 
+/// Pipeline-layout descriptor count for one runtime-sized WGSL resource binding array.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct Deko3dWgslBindingArraySize {
+    /// Bind-group index.
+    pub group: u32,
+    /// Binding index within the group.
+    pub binding: u32,
+    /// Number of descriptors declared by the bind-group layout.
+    pub count: u32,
+}
+
 /// Exact WGSL and pipeline-stage metadata used to resolve a Deko3D DKSH artifact.
 #[derive(Clone, Copy, Debug)]
 pub struct Deko3dWgslArtifactRequest<'a> {
@@ -48,6 +59,9 @@ pub struct Deko3dWgslArtifactRequest<'a> {
     /// current view index from Deko3D vertex uniform-buffer slot 14. Compute and fragment artifact
     /// requests always use `None`.
     pub multiview_mask: Option<NonZeroU32>,
+    /// Descriptor counts from the explicit pipeline layout. Runtime-sized WGSL
+    /// `binding_array<T>` declarations require the matching entry.
+    pub binding_array_sizes: &'a [Deko3dWgslBindingArraySize],
 }
 
 /// A trusted source of offline-compiled Deko3D DKSH artifacts.

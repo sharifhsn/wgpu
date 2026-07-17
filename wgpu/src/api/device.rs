@@ -198,6 +198,7 @@ impl Device {
         entry_point: Option<&str>,
         compilation_options: &PipelineCompilationOptions<'_>,
         multiview_mask: Option<core::num::NonZeroU32>,
+        binding_array_sizes: &[Deko3dWgslBindingArraySize],
     ) -> Result<Option<ShaderModule>, Deko3dWgslArtifactError> {
         if self.adapter_info().backend != Backend::Deko3d {
             return Ok(None);
@@ -220,6 +221,7 @@ impl Device {
                 zero_initialize_workgroup_memory: compilation_options
                     .zero_initialize_workgroup_memory,
                 multiview_mask,
+                binding_array_sizes,
             },
         )?;
         Ok(Some(unsafe {
@@ -472,25 +474,56 @@ impl Device {
         desc: &BindGroupLayoutDescriptor<'_>,
     ) -> BindGroupLayout {
         let layout = self.inner.create_bind_group_layout(desc);
-        BindGroupLayout { inner: layout }
+        let deko3d_binding_array_sizes = desc
+            .entries
+            .iter()
+            .filter_map(|entry| entry.count.map(|count| (entry.binding, count.get())))
+            .collect();
+        BindGroupLayout {
+            inner: layout,
+            deko3d_binding_array_sizes,
+        }
     }
 
     /// Creates a [`PipelineLayout`].
     #[must_use]
     pub fn create_pipeline_layout(&self, desc: &PipelineLayoutDescriptor<'_>) -> PipelineLayout {
         let layout = self.inner.create_pipeline_layout(desc);
-        PipelineLayout { inner: layout }
+        let deko3d_binding_array_sizes = desc
+            .bind_group_layouts
+            .iter()
+            .enumerate()
+            .filter_map(|(group, layout)| layout.map(|layout| (group, layout)))
+            .flat_map(|(group, layout)| {
+                layout
+                    .deko3d_binding_array_sizes
+                    .iter()
+                    .map(move |&(binding, count)| Deko3dWgslBindingArraySize {
+                        group: u32::try_from(group).expect("bind-group index exceeds u32"),
+                        binding,
+                        count,
+                    })
+            })
+            .collect();
+        PipelineLayout {
+            inner: layout,
+            deko3d_binding_array_sizes,
+        }
     }
 
     /// Creates a [`RenderPipeline`].
     #[must_use]
     pub fn create_render_pipeline(&self, desc: &RenderPipelineDescriptor<'_>) -> RenderPipeline {
+        let binding_array_sizes = desc
+            .layout
+            .map_or(&[][..], |layout| &*layout.deko3d_binding_array_sizes);
         let vertex = match self.resolve_deko3d_wgsl_artifact(
             desc.vertex.module,
             Deko3dWgslArtifactStage::Vertex,
             desc.vertex.entry_point,
             &desc.vertex.compilation_options,
             desc.multiview_mask,
+            binding_array_sizes,
         ) {
             Ok(module) => module,
             Err(error) => {
@@ -511,6 +544,7 @@ impl Device {
                     fragment.entry_point,
                     &fragment.compilation_options,
                     None,
+                    binding_array_sizes,
                 )
             })
             .transpose()
@@ -565,12 +599,16 @@ impl Device {
     /// Creates a [`ComputePipeline`].
     #[must_use]
     pub fn create_compute_pipeline(&self, desc: &ComputePipelineDescriptor<'_>) -> ComputePipeline {
+        let binding_array_sizes = desc
+            .layout
+            .map_or(&[][..], |layout| &*layout.deko3d_binding_array_sizes);
         let module = match self.resolve_deko3d_wgsl_artifact(
             desc.module,
             Deko3dWgslArtifactStage::Compute,
             desc.entry_point,
             &desc.compilation_options,
             None,
+            binding_array_sizes,
         ) {
             Ok(module) => module,
             Err(error) => {
@@ -1269,6 +1307,7 @@ mod deko3d_artifact_tests {
             constants: &[],
             zero_initialize_workgroup_memory: true,
             multiview_mask: None,
+            binding_array_sizes: &[],
         }
     }
 
