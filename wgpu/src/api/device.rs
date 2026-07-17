@@ -1546,6 +1546,51 @@ mod deko3d_artifact_tests {
 
         assert_eq!(&gradient_artifact[..4], b"DKSH");
         assert_eq!(state.compiler.lock().len(), 2);
+
+        let rewritten_gradients = [
+            br#"
+                @group(0) @binding(0) var image: texture_3d<f32>;
+                @group(0) @binding(1) var image_sampler: sampler;
+
+                @fragment
+                fn main(@location(0) uvw: vec3<f32>) -> @location(0) vec4<f32> {
+                    return textureSampleGrad(
+                        image,
+                        image_sampler,
+                        uvw,
+                        vec3<f32>(1.0, 0.0, 0.0),
+                        vec3<f32>(0.0, 1.0, 0.0),
+                    );
+                }
+            "#
+            .as_slice(),
+            br#"
+                @group(0) @binding(0) var image: texture_cube_array<f32>;
+                @group(0) @binding(1) var image_sampler: sampler;
+
+                @fragment
+                fn main(@location(0) direction: vec3<f32>) -> @location(0) vec4<f32> {
+                    return textureSampleGrad(
+                        image,
+                        image_sampler,
+                        direction,
+                        2,
+                        vec3<f32>(1.0, 0.0, 0.0),
+                        vec3<f32>(0.0, 1.0, 0.0),
+                    );
+                }
+            "#
+            .as_slice(),
+        ];
+        for wgsl in rewritten_gradients {
+            let artifact = resolve_deko3d_wgsl_artifact(
+                &state,
+                request(wgsl, Deko3dWgslArtifactStage::Fragment, "main"),
+            )
+            .unwrap();
+            assert_eq!(&artifact[..4], b"DKSH");
+        }
+        assert_eq!(state.compiler.lock().len(), 4);
     }
 
     #[test]
