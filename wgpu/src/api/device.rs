@@ -1503,7 +1503,7 @@ mod deko3d_artifact_tests {
 
     #[cfg(feature = "deko3d")]
     #[test]
-    fn built_in_compiler_resolves_compute_and_gradient_wgsl_without_a_provider() {
+    fn built_in_compiler_resolves_expanded_wgsl_without_a_provider() {
         let state = Deko3dWgslArtifactProviderState::default();
         let wgsl = br#"
             @group(0) @binding(0) var<storage, read> input: array<u32>;
@@ -1593,6 +1593,34 @@ mod deko3d_artifact_tests {
             assert_eq!(&artifact[..4], b"DKSH");
         }
         assert_eq!(state.compiler.lock().len(), 4);
+
+        let multiview_shaders: &[(&[u8], Deko3dWgslArtifactStage)] = &[
+            (
+                br#"
+                    @vertex
+                    fn main(@builtin(view_index) view: u32) -> @builtin(position) vec4<f32> {
+                        return vec4<f32>(f32(view), 0.0, 0.0, 1.0);
+                    }
+                "#,
+                Deko3dWgslArtifactStage::Vertex,
+            ),
+            (
+                br#"
+                    @fragment
+                    fn main(@builtin(view_index) view: u32) -> @location(0) vec4<f32> {
+                        return vec4<f32>(f32(view));
+                    }
+                "#,
+                Deko3dWgslArtifactStage::Fragment,
+            ),
+        ];
+        for (wgsl, stage) in multiview_shaders {
+            let mut multiview = request(wgsl, *stage, "main");
+            multiview.multiview_mask = core::num::NonZeroU32::new(0b101);
+            let artifact = resolve_deko3d_wgsl_artifact(&state, multiview).unwrap();
+            assert_eq!(&artifact[..4], b"DKSH");
+        }
+        assert_eq!(state.compiler.lock().len(), 6);
     }
 
     #[test]
