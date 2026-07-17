@@ -2704,17 +2704,19 @@ unsafe fn bind_compute_texture_bindings(
     cmdbuf: dk::DkCmdBuf,
     state: &ExecutionState,
     pipeline: &super::ComputePipelineInnerRaw,
-) -> DeviceResult<()> {
-    let textures = pipeline
+) -> DeviceResult<Option<(dk::DkGpuAddr, u64)>> {
+    let sampled_bindings = pipeline
         .compute_shader
         .inner
         .bindings
         .iter()
-        .filter(|binding| binding.kind == ShaderBindingKind::Texture)
+        .filter(|binding| {
+            matches!(
+                binding.kind,
+                ShaderBindingKind::Texture | ShaderBindingKind::Sampler
+            )
+        })
         .collect::<Vec<_>>();
-    if textures.is_empty() {
-        return Ok(());
-    }
     let bound_group = |index: u32| {
         state
             .bind_groups
@@ -2722,43 +2724,76 @@ unsafe fn bind_compute_texture_bindings(
             .and_then(Option::as_ref)
             .ok_or(crate::DeviceError::Lost)
     };
-    let (image_addr, sampler_addr, image_stride, sampler_stride) = textures
-        .iter()
-        .find_map(|binding| {
-            bound_group(binding.group)
-                .ok()
-                .and_then(|group| group.group.texture_descriptor_set())
-        })
-        .ok_or(crate::DeviceError::Lost)?;
-    for binding in textures {
+    let sampled_set = sampled_bindings.iter().find_map(|binding| {
+        bound_group(binding.group)
+            .ok()
+            .and_then(|group| group.group.texture_descriptor_set())
+    });
+    let image_set = sampled_set
+        .map(|(image_addr, _, image_stride, _)| (image_addr, image_stride))
+        .or_else(|| {
+            pipeline
+                .compute_shader
+                .inner
+                .bindings
+                .iter()
+                .filter(|binding| binding.kind == ShaderBindingKind::StorageTexture)
+                .find_map(|binding| {
+                    bound_group(binding.group)
+                        .ok()
+                        .and_then(|group| group.group.image_descriptor_set())
+                })
+        });
+    let Some((image_addr, image_stride)) = image_set else {
+        return Ok(None);
+    };
+    let sampler_set =
+        sampled_set.map(|(_, sampler_addr, _, sampler_stride)| (sampler_addr, sampler_stride));
+    for binding in sampled_bindings {
         let group = bound_group(binding.group)?;
         unsafe {
-            group.group.push_texture_binding(
-                cmdbuf,
-                image_addr,
-                sampler_addr,
-                image_stride,
-                sampler_stride,
-                binding.group,
-                binding.binding,
-                binding.target,
-                dk::DkStage::DkStage_Compute,
-            )?;
+            match binding.kind {
+                ShaderBindingKind::Texture => {
+                    let (sampler_addr, sampler_stride) =
+                        sampler_set.ok_or(crate::DeviceError::Lost)?;
+                    group.group.push_texture_binding(
+                        cmdbuf,
+                        image_addr,
+                        sampler_addr,
+                        image_stride,
+                        sampler_stride,
+                        binding.group,
+                        binding.binding,
+                        binding.target,
+                        dk::DkStage::DkStage_Compute,
+                    )?
+                }
+                ShaderBindingKind::Sampler => {
+                    let (sampler_addr, sampler_stride) =
+                        sampler_set.ok_or(crate::DeviceError::Lost)?;
+                    group.group.push_sampler_binding(
+                        cmdbuf,
+                        sampler_addr,
+                        sampler_stride,
+                        binding.binding,
+                        binding.target,
+                        dk::DkStage::DkStage_Compute,
+                    )?
+                }
+                _ => unreachable!("filtered above"),
+            }
         }
     }
-    unsafe {
-        dk::dkCmdBufBindImageDescriptorSet(
-            cmdbuf,
-            image_addr,
-            super::DEKO_TEXTURE_SAMPLER_COUNT as u32,
-        );
-        dk::dkCmdBufBindSamplerDescriptorSet(
-            cmdbuf,
-            sampler_addr,
-            super::DEKO_TEXTURE_SAMPLER_COUNT as u32,
-        );
+    if let Some((sampler_addr, _)) = sampler_set {
+        unsafe {
+            dk::dkCmdBufBindSamplerDescriptorSet(
+                cmdbuf,
+                sampler_addr,
+                super::DEKO_TEXTURE_SAMPLER_COUNT as u32,
+            );
+        }
     }
-    Ok(())
+    Ok(Some((image_addr, image_stride)))
 }
 
 #[cfg(target_os = "horizon")]
@@ -2788,7 +2823,7 @@ unsafe fn submit_dispatch_workgroups(
             pipeline
                 .pipeline_layout
                 .bind_immediates(cmdbuf, wgt::ShaderStages::COMPUTE)?;
-            bind_compute_texture_bindings(cmdbuf, state, pipeline)?;
+            let image_descriptor_set = bind_compute_texture_bindings(cmdbuf, state, pipeline)?;
             for binding in &pipeline.compute_shader.inner.bindings {
                 let group = state
                     .bind_groups
@@ -2812,6 +2847,8 @@ unsafe fn submit_dispatch_workgroups(
                     )?,
                     ShaderBindingKind::StorageTexture => group.group.bind_storage_texture(
                         cmdbuf,
+                        image_descriptor_set.ok_or(crate::DeviceError::Lost)?.0,
+                        image_descriptor_set.ok_or(crate::DeviceError::Lost)?.1,
                         &group.dynamic_offsets,
                         binding.binding,
                         binding.target,
@@ -2819,6 +2856,13 @@ unsafe fn submit_dispatch_workgroups(
                     )?,
                     ShaderBindingKind::Texture | ShaderBindingKind::Sampler => {}
                 }
+            }
+            if let Some((image_addr, _)) = image_descriptor_set {
+                dk::dkCmdBufBindImageDescriptorSet(
+                    cmdbuf,
+                    image_addr,
+                    super::DEKO_TEXTURE_SAMPLER_COUNT as u32,
+                );
             }
             dk::dkCmdBufDispatchCompute(cmdbuf, count[0], count[1], count[2]);
             Ok(())
@@ -2861,7 +2905,7 @@ unsafe fn submit_dispatch_workgroups_indirect(
                 pipeline
                     .pipeline_layout
                     .bind_immediates(cmdbuf, wgt::ShaderStages::COMPUTE)?;
-                bind_compute_texture_bindings(cmdbuf, state, pipeline)?;
+                let image_descriptor_set = bind_compute_texture_bindings(cmdbuf, state, pipeline)?;
                 for binding in &pipeline.compute_shader.inner.bindings {
                     let group = state
                         .bind_groups
@@ -2885,6 +2929,8 @@ unsafe fn submit_dispatch_workgroups_indirect(
                         )?,
                         ShaderBindingKind::StorageTexture => group.group.bind_storage_texture(
                             cmdbuf,
+                            image_descriptor_set.ok_or(crate::DeviceError::Lost)?.0,
+                            image_descriptor_set.ok_or(crate::DeviceError::Lost)?.1,
                             &group.dynamic_offsets,
                             binding.binding,
                             binding.target,
@@ -2892,6 +2938,13 @@ unsafe fn submit_dispatch_workgroups_indirect(
                         )?,
                         ShaderBindingKind::Texture | ShaderBindingKind::Sampler => {}
                     }
+                }
+                if let Some((image_addr, _)) = image_descriptor_set {
+                    dk::dkCmdBufBindImageDescriptorSet(
+                        cmdbuf,
+                        image_addr,
+                        super::DEKO_TEXTURE_SAMPLER_COUNT as u32,
+                    );
                 }
                 dk::dkCmdBufDispatchComputeIndirect(cmdbuf, dispatch_addr);
                 Ok(())
@@ -3018,39 +3071,74 @@ unsafe fn submit_deko_draw(
                     .filter(|_| (index as usize) < pipeline.bind_group_count)
                     .ok_or(crate::DeviceError::Lost)
             };
-            let fragment_textures = pipeline
-                .fragment_bindings
+            let sampled_bindings = pipeline
+                .vertex_bindings
                 .iter()
-                .filter(|binding| binding.kind == ShaderBindingKind::Texture)
+                .chain(pipeline.fragment_bindings.iter())
+                .filter(|binding| {
+                    matches!(
+                        binding.kind,
+                        ShaderBindingKind::Texture | ShaderBindingKind::Sampler
+                    )
+                })
                 .collect::<Vec<_>>();
-            if !fragment_textures.is_empty() {
-                let (image_addr, sampler_addr, image_stride, sampler_stride) = fragment_textures
-                    .iter()
-                    .find_map(|binding| {
-                        bound_group(binding.group)
-                            .ok()
-                            .and_then(|group| group.group.texture_descriptor_set())
-                    })
-                    .ok_or(crate::DeviceError::Lost)?;
-                for binding in fragment_textures {
-                    let group = bound_group(binding.group)?;
-                    group.group.push_texture_binding(
-                        cmdbuf,
-                        image_addr,
-                        sampler_addr,
-                        image_stride,
-                        sampler_stride,
-                        binding.group,
-                        binding.binding,
-                        binding.target,
-                        dk::DkStage::DkStage_Fragment,
-                    )?;
+            let sampled_set = sampled_bindings.iter().find_map(|binding| {
+                bound_group(binding.group)
+                    .ok()
+                    .and_then(|group| group.group.texture_descriptor_set())
+            });
+            let image_descriptor_set = sampled_set
+                .map(|(image_addr, _, image_stride, _)| (image_addr, image_stride))
+                .or_else(|| {
+                    pipeline
+                        .vertex_bindings
+                        .iter()
+                        .chain(pipeline.fragment_bindings.iter())
+                        .filter(|binding| binding.kind == ShaderBindingKind::StorageTexture)
+                        .find_map(|binding| {
+                            bound_group(binding.group)
+                                .ok()
+                                .and_then(|group| group.group.image_descriptor_set())
+                        })
+                });
+            if let Some((image_addr, _, image_stride, _)) = sampled_set {
+                let (_, sampler_addr, _, sampler_stride) =
+                    sampled_set.ok_or(crate::DeviceError::Lost)?;
+                for (bindings, stage) in [
+                    (&pipeline.vertex_bindings, dk::DkStage::DkStage_Vertex),
+                    (&pipeline.fragment_bindings, dk::DkStage::DkStage_Fragment),
+                ] {
+                    for binding in bindings.iter().filter(|binding| {
+                        matches!(
+                            binding.kind,
+                            ShaderBindingKind::Texture | ShaderBindingKind::Sampler
+                        )
+                    }) {
+                        let group = bound_group(binding.group)?;
+                        match binding.kind {
+                            ShaderBindingKind::Texture => group.group.push_texture_binding(
+                                cmdbuf,
+                                image_addr,
+                                sampler_addr,
+                                image_stride,
+                                sampler_stride,
+                                binding.group,
+                                binding.binding,
+                                binding.target,
+                                stage,
+                            )?,
+                            ShaderBindingKind::Sampler => group.group.push_sampler_binding(
+                                cmdbuf,
+                                sampler_addr,
+                                sampler_stride,
+                                binding.binding,
+                                binding.target,
+                                stage,
+                            )?,
+                            _ => unreachable!("filtered above"),
+                        }
+                    }
                 }
-                dk::dkCmdBufBindImageDescriptorSet(
-                    cmdbuf,
-                    image_addr,
-                    super::DEKO_TEXTURE_SAMPLER_COUNT as u32,
-                );
                 dk::dkCmdBufBindSamplerDescriptorSet(
                     cmdbuf,
                     sampler_addr,
@@ -3092,14 +3180,25 @@ unsafe fn submit_deko_draw(
                     .filter(|binding| binding.kind == ShaderBindingKind::StorageTexture)
                 {
                     let group = bound_group(binding.group)?;
+                    let (image_addr, image_stride) =
+                        image_descriptor_set.ok_or(crate::DeviceError::Lost)?;
                     group.group.bind_storage_texture(
                         cmdbuf,
+                        image_addr,
+                        image_stride,
                         &group.dynamic_offsets,
                         binding.binding,
                         binding.target,
                         stage,
                     )?;
                 }
+            }
+            if let Some((image_addr, _)) = image_descriptor_set {
+                dk::dkCmdBufBindImageDescriptorSet(
+                    cmdbuf,
+                    image_addr,
+                    super::DEKO_TEXTURE_SAMPLER_COUNT as u32,
+                );
             }
             dk::dkCmdBufBindRasterizerState(cmdbuf, &pipeline.rasterizer_state);
             dk::dkCmdBufBindColorState(cmdbuf, &pipeline.color_state);

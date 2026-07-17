@@ -425,6 +425,7 @@ pub(super) enum BindGroupInnerRaw {
 #[cfg(target_os = "horizon")]
 pub(super) struct TextureSamplerBinding {
     texture_binding: u32,
+    sampler_binding: Option<u32>,
     visibility: wgt::ShaderStages,
     view_id: u64,
     #[allow(dead_code)]
@@ -1234,6 +1235,22 @@ impl BindGroupInner {
     }
 
     #[cfg(target_os = "horizon")]
+    pub(super) fn image_descriptor_set(&self) -> Option<(dk::DkGpuAddr, u64)> {
+        match &self.inner {
+            BindGroupInnerRaw::TextureSamplers {
+                image_descriptor_gpu_addr,
+                image_descriptor_stride,
+                ..
+            } => Some((*image_descriptor_gpu_addr, *image_descriptor_stride)),
+            BindGroupInnerRaw::StorageTexture(binding) => Some((
+                binding.image_descriptor_gpu_addr,
+                binding.image_descriptor_stride,
+            )),
+            _ => None,
+        }
+    }
+
+    #[cfg(target_os = "horizon")]
     pub(super) unsafe fn push_texture_binding(
         &self,
         cmdbuf: dk::DkCmdBuf,
@@ -1318,6 +1335,50 @@ impl BindGroupInner {
     }
 
     #[cfg(target_os = "horizon")]
+    pub(super) unsafe fn push_sampler_binding(
+        &self,
+        cmdbuf: dk::DkCmdBuf,
+        sampler_descriptor_gpu_addr: dk::DkGpuAddr,
+        sampler_descriptor_stride: u64,
+        binding_number: u32,
+        target: u32,
+        stage: dk::DkStage,
+    ) -> DeviceResult<()> {
+        let BindGroupInnerRaw::TextureSamplers { bindings, .. } = &self.inner else {
+            return Err(crate::DeviceError::Lost);
+        };
+        let visibility = match stage {
+            dk::DkStage::DkStage_Vertex => wgt::ShaderStages::VERTEX,
+            dk::DkStage::DkStage_Fragment => wgt::ShaderStages::FRAGMENT,
+            dk::DkStage::DkStage_Compute => wgt::ShaderStages::COMPUTE,
+            _ => return Err(crate::DeviceError::Lost),
+        };
+        for (array_index, binding) in bindings
+            .iter()
+            .filter(|binding| {
+                binding.sampler_binding == Some(binding_number)
+                    && binding.visibility.contains(visibility)
+            })
+            .enumerate()
+        {
+            let target = target
+                .checked_add(u32::try_from(array_index).map_err(|_| crate::DeviceError::Lost)?)
+                .ok_or(crate::DeviceError::Lost)?;
+            let address = sampler_descriptor_gpu_addr
+                .checked_add(u64::from(target) * sampler_descriptor_stride)
+                .ok_or(crate::DeviceError::Lost)?;
+            unsafe {
+                dk::dkCmdBufPushData(
+                    cmdbuf,
+                    address,
+                    ptr::addr_of!(binding.sampler_descriptor).cast(),
+                    size_of::<dk::DkSamplerDescriptor>() as u32,
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub(super) unsafe fn bind_uniform_binding(
         &self,
         cmdbuf: dk::DkCmdBuf,
@@ -1500,6 +1561,8 @@ impl BindGroupInner {
     pub(super) unsafe fn bind_storage_texture(
         &self,
         cmdbuf: dk::DkCmdBuf,
+        image_descriptor_gpu_addr: dk::DkGpuAddr,
+        image_descriptor_stride: u64,
         dynamic_offsets: &[wgt::DynamicOffset],
         binding_number: u32,
         target: u32,
@@ -1523,9 +1586,10 @@ impl BindGroupInner {
         unsafe {
             for (array_index, element) in binding.elements.iter().enumerate() {
                 let index = u32::try_from(array_index).map_err(|_| crate::DeviceError::Lost)?;
-                let descriptor_address = binding
-                    .image_descriptor_gpu_addr
-                    .checked_add(u64::from(index) * binding.image_descriptor_stride)
+                let descriptor_target =
+                    target.checked_add(index).ok_or(crate::DeviceError::Lost)?;
+                let descriptor_address = image_descriptor_gpu_addr
+                    .checked_add(u64::from(descriptor_target) * image_descriptor_stride)
                     .ok_or(crate::DeviceError::Lost)?;
                 dk::dkCmdBufPushData(
                     cmdbuf,
@@ -1534,17 +1598,14 @@ impl BindGroupInner {
                     size_of::<dk::DkImageDescriptor>() as u32,
                 );
             }
-            dk::dkCmdBufBindImageDescriptorSet(
-                cmdbuf,
-                binding.image_descriptor_gpu_addr,
-                binding.elements.len() as u32,
-            );
             for index in 0..binding.elements.len() as u32 {
+                let descriptor_target =
+                    target.checked_add(index).ok_or(crate::DeviceError::Lost)?;
                 dk::dkCmdBufBindImage(
                     cmdbuf,
                     stage,
-                    target.checked_add(index).ok_or(crate::DeviceError::Lost)?,
-                    dk::dkMakeImageHandle(index),
+                    descriptor_target,
+                    dk::dkMakeImageHandle(descriptor_target),
                 );
             }
         }
@@ -2784,6 +2845,7 @@ impl BindGroupInner {
                 }
                 bindings.push(TextureSamplerBinding {
                     texture_binding,
+                    sampler_binding,
                     visibility,
                     view_id: *view_id,
                     texture: owner.clone(),
@@ -2899,8 +2961,11 @@ impl BindGroupInner {
             size_of::<dk::DkImageDescriptor>() as u32,
             dk::DK_IMAGE_DESCRIPTOR_ALIGNMENT,
         );
+        // Descriptor sets are global command-buffer state in Deko3D. Allocate a
+        // full set so descriptors from every bound wgpu group can be copied into
+        // whichever resource group supplies the active set.
         let descriptor_size = descriptor_stride
-            .checked_mul(count)
+            .checked_mul(DEKO_TEXTURE_SAMPLER_COUNT as u32)
             .ok_or(crate::DeviceError::OutOfMemory)?;
         let allocation_size = align_up(descriptor_size, dk::DK_MEMBLOCK_ALIGNMENT);
         let mut maker = dk::DkMemBlockMaker::defaults(raw_device, allocation_size);
@@ -3857,17 +3922,17 @@ fn supported_bind_group_layout_kind(
     {
         return None;
     }
+    // Texture and sampler bindings are independent shader resources. Pair them
+    // by declaration order (when compatible), never by a native binding offset.
     let bindings = texture_bindings
         .into_iter()
-        .map(|(texture, count, visibility)| {
-            let sampler = sampler_bindings
-                .iter()
-                .find(|&&(sampler, sampler_count, sampler_visibility)| {
-                    sampler == texture + 1
-                        && sampler_count == count
-                        && sampler_visibility == visibility
-                })
-                .map(|&(sampler, _, _)| sampler);
+        .enumerate()
+        .map(|(index, (texture, count, visibility))| {
+            let sampler = sampler_bindings.get(index).and_then(
+                |&(sampler, sampler_count, sampler_visibility)| {
+                    (sampler_count == count && sampler_visibility == visibility).then_some(sampler)
+                },
+            );
             (texture, sampler, count, visibility)
         })
         .collect::<Vec<_>>();
