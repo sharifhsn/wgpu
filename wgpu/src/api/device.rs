@@ -1534,6 +1534,21 @@ mod deko3d_artifact_tests {
                 output[lane] = 99u;
             }
 
+            fn terminal_loop_controls(lane: u32) -> u32 {
+                var value = lane;
+                loop {
+                    value += 1u;
+                    if lane == 0u {
+                        break;
+                    }
+                    continue;
+                    continuing {
+                        break if value == lane + 3u;
+                    }
+                }
+                return value;
+            }
+
             @compute @workgroup_size(4)
             fn compute_main(
                 @builtin(global_invocation_id) id: vec3<u32>,
@@ -1568,6 +1583,7 @@ mod deko3d_artifact_tests {
                 _ = all || any;
                 var pointer_value = 0u;
                 let selected = choose(&pointer_value, lane);
+                let loop_value = terminal_loop_controls(lane);
                 write_after_loop_if_live(lane);
                 textureAtomicAdd(atomic_image, vec2<i32>(i32(lane), 0), 1u);
                 var switched = 0u;
@@ -1581,7 +1597,7 @@ mod deko3d_artifact_tests {
                 }
                 let result = input[id.x] * 3u + 1u + first - first + ballot.x - ballot.x
                     + uniform_result - uniform_result + pointer_value - pointer_value
-                    + selected - selected + switched - switched;
+                    + selected - selected + switched - switched + loop_value - loop_value;
                 if lane == 3u {
                     return;
                 }

@@ -894,17 +894,17 @@ dependencies = [
 [[package]]
 name = "deko-bitview"
 version = "0.1.0"
-source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=c3e12f83b567df3285e955b7e037fad6899da788#c3e12f83b567df3285e955b7e037fad6899da788"
+source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=1d735143685b9db4e64d1809db1d7513c83255c2#1d735143685b9db4e64d1809db1d7513c83255c2"
 
 [[package]]
 name = "deko-compiler-utils"
 version = "0.1.0"
-source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=c3e12f83b567df3285e955b7e037fad6899da788#c3e12f83b567df3285e955b7e037fad6899da788"
+source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=1d735143685b9db4e64d1809db1d7513c83255c2#1d735143685b9db4e64d1809db1d7513c83255c2"
 
 [[package]]
 name = "deko-dksh"
 version = "0.1.0"
-source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=c3e12f83b567df3285e955b7e037fad6899da788#c3e12f83b567df3285e955b7e037fad6899da788"
+source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=1d735143685b9db4e64d1809db1d7513c83255c2#1d735143685b9db4e64d1809db1d7513c83255c2"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -912,7 +912,7 @@ dependencies = [
 [[package]]
 name = "deko-nak"
 version = "0.1.0"
-source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=c3e12f83b567df3285e955b7e037fad6899da788#c3e12f83b567df3285e955b7e037fad6899da788"
+source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=1d735143685b9db4e64d1809db1d7513c83255c2#1d735143685b9db4e64d1809db1d7513c83255c2"
 dependencies = [
  "deko-bitview",
  "deko-compiler-utils",
@@ -925,7 +925,7 @@ dependencies = [
 [[package]]
 name = "deko-shader-compiler"
 version = "0.1.0"
-source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=c3e12f83b567df3285e955b7e037fad6899da788#c3e12f83b567df3285e955b7e037fad6899da788"
+source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=1d735143685b9db4e64d1809db1d7513c83255c2#1d735143685b9db4e64d1809db1d7513c83255c2"
 dependencies = [
  "deko-dksh",
  "deko-nak",
@@ -938,7 +938,7 @@ dependencies = [
 [[package]]
 name = "deko-shader-compiler-macros"
 version = "0.1.0"
-source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=c3e12f83b567df3285e955b7e037fad6899da788#c3e12f83b567df3285e955b7e037fad6899da788"
+source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=1d735143685b9db4e64d1809db1d7513c83255c2#1d735143685b9db4e64d1809db1d7513c83255c2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1362,7 +1362,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3530,7 +3530,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3543,7 +3543,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3931,7 +3931,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5090,7 +5090,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
