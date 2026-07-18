@@ -894,17 +894,17 @@ dependencies = [
 [[package]]
 name = "deko-bitview"
 version = "0.1.0"
-source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=8079c50477d7a6eaf723424136322bdaa8d4e90b#8079c50477d7a6eaf723424136322bdaa8d4e90b"
+source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=80d434836c99af75e1c9f8939bc7ad29da99c49e#80d434836c99af75e1c9f8939bc7ad29da99c49e"
 
 [[package]]
 name = "deko-compiler-utils"
 version = "0.1.0"
-source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=8079c50477d7a6eaf723424136322bdaa8d4e90b#8079c50477d7a6eaf723424136322bdaa8d4e90b"
+source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=80d434836c99af75e1c9f8939bc7ad29da99c49e#80d434836c99af75e1c9f8939bc7ad29da99c49e"
 
 [[package]]
 name = "deko-dksh"
 version = "0.1.0"
-source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=8079c50477d7a6eaf723424136322bdaa8d4e90b#8079c50477d7a6eaf723424136322bdaa8d4e90b"
+source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=80d434836c99af75e1c9f8939bc7ad29da99c49e#80d434836c99af75e1c9f8939bc7ad29da99c49e"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -912,7 +912,7 @@ dependencies = [
 [[package]]
 name = "deko-nak"
 version = "0.1.0"
-source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=8079c50477d7a6eaf723424136322bdaa8d4e90b#8079c50477d7a6eaf723424136322bdaa8d4e90b"
+source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=80d434836c99af75e1c9f8939bc7ad29da99c49e#80d434836c99af75e1c9f8939bc7ad29da99c49e"
 dependencies = [
  "deko-bitview",
  "deko-compiler-utils",
@@ -925,7 +925,7 @@ dependencies = [
 [[package]]
 name = "deko-shader-compiler"
 version = "0.1.0"
-source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=8079c50477d7a6eaf723424136322bdaa8d4e90b#8079c50477d7a6eaf723424136322bdaa8d4e90b"
+source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=80d434836c99af75e1c9f8939bc7ad29da99c49e#80d434836c99af75e1c9f8939bc7ad29da99c49e"
 dependencies = [
  "deko-dksh",
  "deko-nak",
@@ -938,7 +938,7 @@ dependencies = [
 [[package]]
 name = "deko-shader-compiler-macros"
 version = "0.1.0"
-source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=8079c50477d7a6eaf723424136322bdaa8d4e90b#8079c50477d7a6eaf723424136322bdaa8d4e90b"
+source = "git+https://github.com/sharifhsn/deko-shader-compiler?rev=80d434836c99af75e1c9f8939bc7ad29da99c49e#80d434836c99af75e1c9f8939bc7ad29da99c49e"
 dependencies = [
  "proc-macro2",
  "quote",
