@@ -1538,15 +1538,16 @@ mod deko3d_artifact_tests {
                 var value = lane;
                 loop {
                     {
-                        value += 1u;
-                        if lane == 0u {
-                            value += 2u;
-                            break;
-                        }
+                        break;
+                    }
+                }
+                loop {
+                    {
                         continue;
                     }
                     continuing {
-                        break if value == lane + 3u;
+                        value += 1u;
+                        break if value == lane + 1u;
                     }
                 }
                 return value;
