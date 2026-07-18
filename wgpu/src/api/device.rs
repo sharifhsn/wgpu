@@ -1520,6 +1520,20 @@ mod deko3d_artifact_tests {
                 return 2u;
             }
 
+            fn write_after_loop_if_live(lane: u32) {
+                var iteration = 0u;
+                loop {
+                    if iteration == lane {
+                        return;
+                    }
+                    iteration += 1u;
+                    if iteration == 2u {
+                        break;
+                    }
+                }
+                output[lane] = 99u;
+            }
+
             @compute @workgroup_size(4)
             fn compute_main(
                 @builtin(global_invocation_id) id: vec3<u32>,
@@ -1554,6 +1568,7 @@ mod deko3d_artifact_tests {
                 _ = all || any;
                 var pointer_value = 0u;
                 let selected = choose(&pointer_value, lane);
+                write_after_loop_if_live(lane);
                 textureAtomicAdd(atomic_image, vec2<i32>(i32(lane), 0), 1u);
                 var switched = 0u;
                 switch lane {
