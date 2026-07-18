@@ -1519,8 +1519,13 @@ mod deko3d_artifact_tests {
             ) {
                 subgroupBarrier();
                 let first = subgroupBroadcastFirst(id.x);
+                let predicate = lane < 16u;
+                let all = subgroupAll(predicate);
+                let any = subgroupAny(predicate);
+                let ballot = subgroupBallot(predicate);
                 _ = lane + subgroup_size + subgroup + subgroup_count;
-                output[id.x] = input[id.x] * 3u + 1u + first - first;
+                _ = all || any;
+                output[id.x] = input[id.x] * 3u + 1u + first - first + ballot.x - ballot.x;
             }
         "#;
         let artifact = resolve_deko3d_wgsl_artifact(

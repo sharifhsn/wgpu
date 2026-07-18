@@ -430,7 +430,9 @@ mod tests {
     #[test]
     fn invalid_mapping_ranges_return_errors() {
         assert!(range_to_usize(0..4, 4).is_ok());
-        assert!(range_to_usize(3..2, 4).is_err());
+        let reversed_start = 3;
+        let reversed_end = 2;
+        assert!(range_to_usize(reversed_start..reversed_end, 4).is_err());
         assert!(range_to_usize(0..5, 4).is_err());
     }
 }
