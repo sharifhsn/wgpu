@@ -1544,6 +1544,9 @@ mod deko3d_artifact_tests {
                 _ = all || any;
                 let result = input[id.x] * 3u + 1u + first - first + ballot.x - ballot.x
                     + uniform_result - uniform_result;
+                if lane == 3u {
+                    return;
+                }
                 if predicate {
                     output[id.x] = result;
                 } else {
