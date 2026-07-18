@@ -5275,18 +5275,21 @@ impl crate::Device for Device {
         })
     }
     unsafe fn unmap_buffer(&self, buffer: &Buffer) {
-        #[cfg(target_os = "horizon")]
-        {
-            let _ = unsafe { buffer.upload_to_gpu() };
-        }
-    }
-    unsafe fn flush_mapped_ranges<I>(&self, buffer: &Buffer, ranges: I) {
-        let _ = ranges;
-        #[cfg(not(target_os = "horizon"))]
+        // Non-coherent write mappings are flushed by wgpu-core before unmapping. Uploading again
+        // here would duplicate the copy and lose the mapped range information.
         let _ = buffer;
-        #[cfg(target_os = "horizon")]
+    }
+    unsafe fn flush_mapped_ranges<I>(&self, buffer: &Buffer, ranges: I)
+    where
+        I: Iterator<Item = crate::MemoryRange>,
+    {
+        #[cfg(not(target_os = "horizon"))]
         {
-            if let Err(error) = unsafe { buffer.upload_to_gpu() } {
+            let _ = (buffer, ranges);
+        }
+        #[cfg(target_os = "horizon")]
+        for range in ranges {
+            if let Err(error) = unsafe { buffer.upload_range_to_gpu(range) } {
                 eprintln!("[wgpu-deko3d] flush_mapped_ranges failed: {error:?}");
                 trace::record(format_args!(
                     "failure kind=flush_mapped_ranges buffer_id={} error={error:?}",

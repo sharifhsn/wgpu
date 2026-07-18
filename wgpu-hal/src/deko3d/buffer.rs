@@ -296,7 +296,15 @@ impl Buffer {
     }
 
     #[cfg(target_os = "horizon")]
-    pub(super) unsafe fn upload_to_gpu(&self) -> Result<(), crate::DeviceError> {
+    pub(super) unsafe fn upload_range_to_gpu(
+        &self,
+        range: Range<wgt::BufferAddress>,
+    ) -> Result<(), crate::DeviceError> {
+        let start = usize::try_from(range.start).map_err(|_| crate::DeviceError::Lost)?;
+        let end = usize::try_from(range.end).map_err(|_| crate::DeviceError::Lost)?;
+        if start > end || end > self.size {
+            return Err(crate::DeviceError::Lost);
+        }
         let gpu = self.gpu.as_ref().ok_or(crate::DeviceError::Lost)?;
         let dst = unsafe { dk::dkMemBlockGetCpuAddr(gpu.mem_block) };
         if dst.is_null() {
@@ -304,9 +312,9 @@ impl Buffer {
         }
         unsafe {
             ptr::copy_nonoverlapping(
-                self.storage.get().cast::<u8>(),
-                dst.cast::<u8>().add(gpu.offset as usize),
-                self.size,
+                self.storage.get().cast::<u8>().add(start),
+                dst.cast::<u8>().add(gpu.offset as usize + start),
+                end - start,
             );
         }
         Ok(())

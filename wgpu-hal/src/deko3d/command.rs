@@ -1073,11 +1073,12 @@ impl Command {
                 // Caller is responsible for ensuring this does not alias.
                 let buffer_slice: &mut [u8] = unsafe { &mut *buffer.get_slice_ptr(range.clone())? };
                 buffer_slice.fill(0);
-                upload_after_host_write(buffer)?;
+                upload_after_host_write(buffer, range.clone())?;
                 Ok(())
             }
 
             Command::CopyBufferToBuffer { src, dst, regions } => {
+                #[cfg(not(target_os = "horizon"))]
                 for &crate::BufferCopy {
                     src_offset,
                     dst_offset,
@@ -1097,7 +1098,6 @@ impl Command {
                         unsafe { &mut *dst.get_slice_ptr(dst_offset..dst_end)? };
                     dst_region.copy_from_slice(src_region);
                 }
-                upload_after_host_write(src)?;
                 #[cfg(target_os = "horizon")]
                 unsafe {
                     submit_copy_buffer_to_buffer(queue, surface_queue, src, dst, regions)?;
@@ -1398,14 +1398,14 @@ impl Command {
     }
 }
 
-fn upload_after_host_write(buffer: &Buffer) -> DeviceResult<()> {
+fn upload_after_host_write(buffer: &Buffer, range: crate::MemoryRange) -> DeviceResult<()> {
     #[cfg(target_os = "horizon")]
     unsafe {
-        buffer.upload_to_gpu()?;
+        buffer.upload_range_to_gpu(range)?;
     }
     #[cfg(not(target_os = "horizon"))]
     {
-        let _ = buffer;
+        let _ = (buffer, range);
     }
     Ok(())
 }

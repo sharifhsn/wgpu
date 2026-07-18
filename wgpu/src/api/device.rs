@@ -15,6 +15,14 @@ struct Deko3dCompilerState {
     compiler: Mutex<deko_shader_compiler::CompilerCache>,
 }
 
+#[cfg(feature = "deko3d")]
+type Deko3dCompiledArtifact = deko_shader_compiler::Artifact;
+
+#[cfg(not(feature = "deko3d"))]
+struct Deko3dCompiledArtifact {
+    dksh: Arc<[u8]>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Deko3dShaderStage {
     Vertex,
@@ -132,12 +140,12 @@ fn validate_deko3d_dksh(bytes: &[u8]) -> Result<(), Deko3dCompileError> {
 fn compile_deko3d_shader_module(
     state: &Deko3dCompilerState,
     request: Deko3dCompileRequest<'_>,
-) -> Result<Arc<[u8]>, Deko3dCompileError> {
+) -> Result<Arc<Deko3dCompiledArtifact>, Deko3dCompileError> {
     #[cfg(feature = "deko3d")]
     {
         let compiler = state.compiler.lock().clone();
         let dksh = compile_deko3d_wgsl(&compiler, request)?;
-        validate_deko3d_dksh(&dksh)?;
+        validate_deko3d_dksh(&dksh.dksh)?;
         Ok(dksh)
     }
     #[cfg(not(feature = "deko3d"))]
@@ -151,7 +159,7 @@ fn compile_deko3d_shader_module(
 fn compile_deko3d_wgsl(
     cache: &deko_shader_compiler::CompilerCache,
     request: Deko3dCompileRequest<'_>,
-) -> Result<Arc<[u8]>, Deko3dCompileError> {
+) -> Result<Arc<Deko3dCompiledArtifact>, Deko3dCompileError> {
     use deko_shader_compiler::{BindingArraySize, Options, PipelineConstants, Stage};
 
     let source = core::str::from_utf8(request.wgsl)
@@ -161,9 +169,6 @@ fn compile_deko3d_wgsl(
         Deko3dShaderStage::Fragment => Stage::Fragment,
         Deko3dShaderStage::Compute => Stage::Compute,
     };
-    let entry_point = deko_shader_compiler::Compiler
-        .resolve_wgsl_entry_point(source, stage, request.entry_point)
-        .map_err(|error| Deko3dCompileError::Compiler(error.to_string()))?;
     let constants = request
         .constants
         .iter()
@@ -183,8 +188,14 @@ fn compile_deko3d_wgsl(
             .collect(),
         ..Options::default()
     };
-    let (key, compiled, telemetry) = cache
-        .compile_wgsl_with_telemetry(source, stage, &entry_point, &constants, options)
+    let (key, entry_point, compiled, telemetry) = cache
+        .compile_wgsl_resolving_entry_point_with_telemetry(
+            source,
+            stage,
+            request.entry_point,
+            &constants,
+            options,
+        )
         .map_err(|error| Deko3dCompileError::Compiler(error.to_string()))?;
     #[cfg(target_os = "horizon")]
     std::eprintln!(
@@ -201,7 +212,7 @@ fn compile_deko3d_wgsl(
         telemetry.source,
         telemetry.elapsed.as_micros(),
     );
-    Ok(Arc::from(compiled.dksh.clone()))
+    Ok(compiled)
 }
 
 #[cfg(feature = "wgsl")]
@@ -318,7 +329,7 @@ impl Device {
             self.create_shader_module_deko3d_dksh(Deko3dDkshShaderModuleDescriptor {
                 label: None,
                 num_workgroups: (0, 0, 0),
-                dksh: alloc::borrow::Cow::Borrowed(&dksh),
+                dksh: alloc::borrow::Cow::Borrowed(&dksh.dksh),
             })
         }))
     }
@@ -1459,7 +1470,7 @@ mod deko3d_compiler_tests {
             compile_deko3d_shader_module(&state, request(wgsl, Deko3dShaderStage::Compute, "main"))
                 .unwrap();
 
-        assert_eq!(&artifact[..4], b"DKSH");
+        assert_eq!(&artifact.dksh[..4], b"DKSH");
         assert_eq!(state.compiler.lock().len(), 1);
 
         let gradient_wgsl = br#"
@@ -1483,7 +1494,7 @@ mod deko3d_compiler_tests {
         )
         .unwrap();
 
-        assert_eq!(&gradient_artifact[..4], b"DKSH");
+        assert_eq!(&gradient_artifact.dksh[..4], b"DKSH");
         assert_eq!(state.compiler.lock().len(), 2);
 
         let rewritten_gradients = [
@@ -1527,7 +1538,7 @@ mod deko3d_compiler_tests {
                 request(wgsl, Deko3dShaderStage::Fragment, "main"),
             )
             .unwrap();
-            assert_eq!(&artifact[..4], b"DKSH");
+            assert_eq!(&artifact.dksh[..4], b"DKSH");
         }
         assert_eq!(state.compiler.lock().len(), 4);
 
@@ -1555,7 +1566,7 @@ mod deko3d_compiler_tests {
             let mut multiview = request(wgsl, *stage, "main");
             multiview.multiview_mask = core::num::NonZeroU32::new(0b101);
             let artifact = compile_deko3d_shader_module(&state, multiview).unwrap();
-            assert_eq!(&artifact[..4], b"DKSH");
+            assert_eq!(&artifact.dksh[..4], b"DKSH");
         }
         assert_eq!(state.compiler.lock().len(), 6);
     }
