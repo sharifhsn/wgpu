@@ -3978,8 +3978,8 @@ fn supported_bind_group_layout_kind(
     {
         return None;
     }
-    // Texture and sampler bindings are independent shader resources. Pair them
-    // by declaration order (when compatible), never by a native binding offset.
+    // Texture and sampler bindings are independent shader resources. Pair matching
+    // declarations by order, never by a native binding offset.
     let bindings = texture_bindings
         .into_iter()
         .enumerate()

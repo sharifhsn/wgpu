@@ -24,6 +24,7 @@ impl Default for Deko3dCompilerState {
     }
 }
 
+#[cfg(feature = "deko3d")]
 fn validate_deko3d_dksh(bytes: &[u8]) -> Result<(), Deko3dWgslArtifactError> {
     const HEADER_SIZE: usize = 24;
     const PROGRAM_SIZE: usize = 64;
@@ -90,15 +91,17 @@ fn resolve_deko3d_wgsl_artifact(
     request: Deko3dWgslArtifactRequest<'_>,
 ) -> Result<Arc<[u8]>, Deko3dWgslArtifactError> {
     #[cfg(feature = "deko3d")]
-    let dksh = {
+    {
         let compiler = state.compiler.lock().clone();
-        compile_deko3d_wgsl(&compiler, request)?
-    };
+        let dksh = compile_deko3d_wgsl(&compiler, request)?;
+        validate_deko3d_dksh(&dksh)?;
+        Ok(dksh)
+    }
     #[cfg(not(feature = "deko3d"))]
-    return Err(Deko3dWgslArtifactError::CompilerUnavailable);
-
-    validate_deko3d_dksh(&dksh)?;
-    Ok(dksh)
+    {
+        let _ = (state, request);
+        Err(Deko3dWgslArtifactError::CompilerUnavailable)
+    }
 }
 
 #[cfg(feature = "deko3d")]
