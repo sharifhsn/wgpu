@@ -1537,11 +1537,14 @@ mod deko3d_artifact_tests {
             fn terminal_loop_controls(lane: u32) -> u32 {
                 var value = lane;
                 loop {
-                    value += 1u;
-                    if lane == 0u {
-                        break;
+                    {
+                        value += 1u;
+                        if lane == 0u {
+                            value += 2u;
+                            break;
+                        }
+                        continue;
                     }
-                    continue;
                     continuing {
                         break if value == lane + 3u;
                     }
