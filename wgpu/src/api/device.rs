@@ -15,6 +15,54 @@ struct Deko3dCompilerState {
     compiler: Mutex<deko_shader_compiler::CompilerCache>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Deko3dShaderStage {
+    Vertex,
+    Fragment,
+    Compute,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(feature = "deko3d"), allow(dead_code))]
+struct Deko3dCompileRequest<'a> {
+    wgsl: &'a [u8],
+    stage: Deko3dShaderStage,
+    entry_point: &'a str,
+    constants: &'a [(&'a str, f64)],
+    zero_initialize_workgroup_memory: bool,
+    multiview_mask: Option<core::num::NonZeroU32>,
+    binding_array_sizes: &'a [Deko3dBindingArraySize],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Deko3dCompileError {
+    #[cfg(not(feature = "deko3d"))]
+    CompilerUnavailable,
+    #[cfg(feature = "deko3d")]
+    Compiler(String),
+    #[cfg(feature = "deko3d")]
+    InvalidDksh(&'static str),
+}
+
+impl core::fmt::Display for Deko3dCompileError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            #[cfg(not(feature = "deko3d"))]
+            Self::CompilerUnavailable => {
+                f.write_str("this wgpu build does not include the Deko3D WGSL compiler")
+            }
+            #[cfg(feature = "deko3d")]
+            Self::Compiler(message) => write!(f, "Deko3D WGSL compilation failed: {message}"),
+            #[cfg(feature = "deko3d")]
+            Self::InvalidDksh(message) => {
+                write!(f, "Deko3D WGSL compiler returned invalid DKSH: {message}")
+            }
+        }
+    }
+}
+
+impl core::error::Error for Deko3dCompileError {}
+
 impl Default for Deko3dCompilerState {
     fn default() -> Self {
         Self {
@@ -25,12 +73,12 @@ impl Default for Deko3dCompilerState {
 }
 
 #[cfg(feature = "deko3d")]
-fn validate_deko3d_dksh(bytes: &[u8]) -> Result<(), Deko3dWgslArtifactError> {
+fn validate_deko3d_dksh(bytes: &[u8]) -> Result<(), Deko3dCompileError> {
     const HEADER_SIZE: usize = 24;
     const PROGRAM_SIZE: usize = 64;
     const SECTION_ALIGNMENT: u32 = 256;
     if bytes.len() < HEADER_SIZE {
-        return Err(Deko3dWgslArtifactError::InvalidDksh("truncated header"));
+        return Err(Deko3dCompileError::InvalidDksh("truncated header"));
     }
     let word = |offset| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
     let magic = word(0);
@@ -48,25 +96,22 @@ fn validate_deko3d_dksh(bytes: &[u8]) -> Result<(), Deko3dWgslArtifactError> {
         || control_size % SECTION_ALIGNMENT != 0
         || code_size % SECTION_ALIGNMENT != 0
     {
-        return Err(Deko3dWgslArtifactError::InvalidDksh("invalid header"));
+        return Err(Deko3dCompileError::InvalidDksh("invalid header"));
     }
     let control_size = usize::try_from(control_size)
-        .map_err(|_| Deko3dWgslArtifactError::InvalidDksh("control section overflow"))?;
+        .map_err(|_| Deko3dCompileError::InvalidDksh("control section overflow"))?;
     let code_size = usize::try_from(code_size)
-        .map_err(|_| Deko3dWgslArtifactError::InvalidDksh("code section overflow"))?;
+        .map_err(|_| Deko3dCompileError::InvalidDksh("code section overflow"))?;
     let total_size = control_size
         .checked_add(code_size)
-        .ok_or(Deko3dWgslArtifactError::InvalidDksh("section overflow"))?;
+        .ok_or(Deko3dCompileError::InvalidDksh("section overflow"))?;
     let programs_offset = usize::try_from(programs_offset)
-        .map_err(|_| Deko3dWgslArtifactError::InvalidDksh("program table overflow"))?;
-    let programs_end =
-        programs_offset
-            .checked_add(PROGRAM_SIZE)
-            .ok_or(Deko3dWgslArtifactError::InvalidDksh(
-                "program table overflow",
-            ))?;
+        .map_err(|_| Deko3dCompileError::InvalidDksh("program table overflow"))?;
+    let programs_end = programs_offset
+        .checked_add(PROGRAM_SIZE)
+        .ok_or(Deko3dCompileError::InvalidDksh("program table overflow"))?;
     if total_size > bytes.len() || programs_offset % 4 != 0 || programs_end > control_size {
-        return Err(Deko3dWgslArtifactError::InvalidDksh(
+        return Err(Deko3dCompileError::InvalidDksh(
             "truncated or invalid program table",
         ));
     }
@@ -79,17 +124,15 @@ fn validate_deko3d_dksh(bytes: &[u8]) -> Result<(), Deko3dWgslArtifactError> {
         || constbuf_offset > code_size as u32
         || constbuf_size > code_size as u32 - constbuf_offset
     {
-        return Err(Deko3dWgslArtifactError::InvalidDksh(
-            "invalid program entry",
-        ));
+        return Err(Deko3dCompileError::InvalidDksh("invalid program entry"));
     }
     Ok(())
 }
 
-fn resolve_deko3d_wgsl_artifact(
+fn compile_deko3d_shader_module(
     state: &Deko3dCompilerState,
-    request: Deko3dWgslArtifactRequest<'_>,
-) -> Result<Arc<[u8]>, Deko3dWgslArtifactError> {
+    request: Deko3dCompileRequest<'_>,
+) -> Result<Arc<[u8]>, Deko3dCompileError> {
     #[cfg(feature = "deko3d")]
     {
         let compiler = state.compiler.lock().clone();
@@ -100,27 +143,27 @@ fn resolve_deko3d_wgsl_artifact(
     #[cfg(not(feature = "deko3d"))]
     {
         let _ = (state, request);
-        Err(Deko3dWgslArtifactError::CompilerUnavailable)
+        Err(Deko3dCompileError::CompilerUnavailable)
     }
 }
 
 #[cfg(feature = "deko3d")]
 fn compile_deko3d_wgsl(
     cache: &deko_shader_compiler::CompilerCache,
-    request: Deko3dWgslArtifactRequest<'_>,
-) -> Result<Arc<[u8]>, Deko3dWgslArtifactError> {
+    request: Deko3dCompileRequest<'_>,
+) -> Result<Arc<[u8]>, Deko3dCompileError> {
     use deko_shader_compiler::{BindingArraySize, Options, PipelineConstants, Stage};
 
     let source = core::str::from_utf8(request.wgsl)
-        .map_err(|error| Deko3dWgslArtifactError::Compiler(error.to_string()))?;
+        .map_err(|error| Deko3dCompileError::Compiler(error.to_string()))?;
     let stage = match request.stage {
-        Deko3dWgslArtifactStage::Vertex => Stage::Vertex,
-        Deko3dWgslArtifactStage::Fragment => Stage::Fragment,
-        Deko3dWgslArtifactStage::Compute => Stage::Compute,
+        Deko3dShaderStage::Vertex => Stage::Vertex,
+        Deko3dShaderStage::Fragment => Stage::Fragment,
+        Deko3dShaderStage::Compute => Stage::Compute,
     };
     let entry_point = deko_shader_compiler::Compiler
         .resolve_wgsl_entry_point(source, stage, request.entry_point)
-        .map_err(|error| Deko3dWgslArtifactError::Compiler(error.to_string()))?;
+        .map_err(|error| Deko3dCompileError::Compiler(error.to_string()))?;
     let constants = request
         .constants
         .iter()
@@ -140,9 +183,9 @@ fn compile_deko3d_wgsl(
             .collect(),
         ..Options::default()
     };
-    let (key, artifact, telemetry) = cache
+    let (key, compiled, telemetry) = cache
         .compile_wgsl_with_telemetry(source, stage, &entry_point, &constants, options)
-        .map_err(|error| Deko3dWgslArtifactError::Compiler(error.to_string()))?;
+        .map_err(|error| Deko3dCompileError::Compiler(error.to_string()))?;
     #[cfg(target_os = "horizon")]
     std::eprintln!(
         "[wgpu-deko3d] shader_cache key={} stage={stage:?} entry_point={entry_point} source={:?} elapsed_us={}",
@@ -158,7 +201,7 @@ fn compile_deko3d_wgsl(
         telemetry.source,
         telemetry.elapsed.as_micros(),
     );
-    Ok(Arc::from(artifact.dksh.clone()))
+    Ok(Arc::from(compiled.dksh.clone()))
 }
 
 #[cfg(feature = "wgsl")]
@@ -242,15 +285,15 @@ impl Device {
         *compiler = compiler.clone().with_persistent_directory(directory);
     }
 
-    fn resolve_deko3d_wgsl_artifact(
+    fn compile_deko3d_shader_module(
         &self,
         shader: &ShaderModule,
-        stage: Deko3dWgslArtifactStage,
+        stage: Deko3dShaderStage,
         entry_point: Option<&str>,
         compilation_options: &PipelineCompilationOptions<'_>,
         multiview_mask: Option<core::num::NonZeroU32>,
-        binding_array_sizes: &[Deko3dWgslBindingArraySize],
-    ) -> Result<Option<ShaderModule>, Deko3dWgslArtifactError> {
+        binding_array_sizes: &[Deko3dBindingArraySize],
+    ) -> Result<Option<ShaderModule>, Deko3dCompileError> {
         if self.adapter_info().backend != Backend::Deko3d {
             return Ok(None);
         }
@@ -258,9 +301,9 @@ impl Device {
             return Ok(None);
         };
         let entry_point = entry_point.unwrap_or("main");
-        let dksh = resolve_deko3d_wgsl_artifact(
+        let dksh = compile_deko3d_shader_module(
             &self.deko3d_compiler,
-            Deko3dWgslArtifactRequest {
+            Deko3dCompileRequest {
                 wgsl,
                 stage,
                 entry_point,
@@ -545,7 +588,7 @@ impl Device {
                 layout
                     .deko3d_binding_array_sizes
                     .iter()
-                    .map(move |&(binding, count)| Deko3dWgslBindingArraySize {
+                    .map(move |&(binding, count)| Deko3dBindingArraySize {
                         group: u32::try_from(group).expect("bind-group index exceeds u32"),
                         binding,
                         count,
@@ -564,9 +607,9 @@ impl Device {
         let binding_array_sizes = desc
             .layout
             .map_or(&[][..], |layout| &*layout.deko3d_binding_array_sizes);
-        let vertex = match self.resolve_deko3d_wgsl_artifact(
+        let vertex = match self.compile_deko3d_shader_module(
             desc.vertex.module,
-            Deko3dWgslArtifactStage::Vertex,
+            Deko3dShaderStage::Vertex,
             desc.vertex.entry_point,
             &desc.vertex.compilation_options,
             desc.multiview_mask,
@@ -575,19 +618,19 @@ impl Device {
             Ok(module) => module,
             Err(error) => {
                 std::eprintln!(
-                    "[wgpu-deko3d] vertex artifact resolution failed for pipeline {:?}: {error}",
+                    "[wgpu-deko3d] vertex WGSL compilation failed for pipeline {:?}: {error}",
                     desc.label
                 );
                 None
             }
         };
-        let fragment_artifact = match desc
+        let fragment_module = match desc
             .fragment
             .as_ref()
             .map(|fragment| {
-                self.resolve_deko3d_wgsl_artifact(
+                self.compile_deko3d_shader_module(
                     fragment.module,
-                    Deko3dWgslArtifactStage::Fragment,
+                    Deko3dShaderStage::Fragment,
                     fragment.entry_point,
                     &fragment.compilation_options,
                     None,
@@ -599,7 +642,7 @@ impl Device {
             Ok(module) => module.flatten(),
             Err(error) => {
                 std::eprintln!(
-                    "[wgpu-deko3d] fragment artifact resolution failed for pipeline {:?}: {error}",
+                    "[wgpu-deko3d] fragment WGSL compilation failed for pipeline {:?}: {error}",
                     desc.label
                 );
                 None
@@ -614,8 +657,8 @@ impl Device {
             buffers: desc.vertex.buffers,
         };
         let fragment_state = desc.fragment.as_ref().map(|fragment| FragmentState {
-            module: fragment_artifact.as_ref().unwrap_or(fragment.module),
-            entry_point: fragment_artifact
+            module: fragment_module.as_ref().unwrap_or(fragment.module),
+            entry_point: fragment_module
                 .as_ref()
                 .map_or(fragment.entry_point, |_| Some("main")),
             compilation_options: fragment.compilation_options.clone(),
@@ -649,9 +692,9 @@ impl Device {
         let binding_array_sizes = desc
             .layout
             .map_or(&[][..], |layout| &*layout.deko3d_binding_array_sizes);
-        let module = match self.resolve_deko3d_wgsl_artifact(
+        let module = match self.compile_deko3d_shader_module(
             desc.module,
-            Deko3dWgslArtifactStage::Compute,
+            Deko3dShaderStage::Compute,
             desc.entry_point,
             &desc.compilation_options,
             None,
@@ -660,7 +703,7 @@ impl Device {
             Ok(module) => module,
             Err(error) => {
                 std::eprintln!(
-                    "[wgpu-deko3d] compute artifact resolution failed for pipeline {:?}: {error}",
+                    "[wgpu-deko3d] compute WGSL compilation failed for pipeline {:?}: {error}",
                     desc.label
                 );
                 None
@@ -1285,15 +1328,15 @@ impl Drop for ErrorScopeGuard {
 }
 
 #[cfg(test)]
-mod deko3d_artifact_tests {
+mod deko3d_compiler_tests {
     use super::*;
 
     fn request<'a>(
         wgsl: &'a [u8],
-        stage: Deko3dWgslArtifactStage,
+        stage: Deko3dShaderStage,
         entry_point: &'a str,
-    ) -> Deko3dWgslArtifactRequest<'a> {
-        Deko3dWgslArtifactRequest {
+    ) -> Deko3dCompileRequest<'a> {
+        Deko3dCompileRequest {
             wgsl,
             stage,
             entry_point,
@@ -1412,11 +1455,9 @@ mod deko3d_artifact_tests {
                 }
             }
         "#;
-        let artifact = resolve_deko3d_wgsl_artifact(
-            &state,
-            request(wgsl, Deko3dWgslArtifactStage::Compute, "main"),
-        )
-        .unwrap();
+        let artifact =
+            compile_deko3d_shader_module(&state, request(wgsl, Deko3dShaderStage::Compute, "main"))
+                .unwrap();
 
         assert_eq!(&artifact[..4], b"DKSH");
         assert_eq!(state.compiler.lock().len(), 1);
@@ -1436,9 +1477,9 @@ mod deko3d_artifact_tests {
                 );
             }
         "#;
-        let gradient_artifact = resolve_deko3d_wgsl_artifact(
+        let gradient_artifact = compile_deko3d_shader_module(
             &state,
-            request(gradient_wgsl, Deko3dWgslArtifactStage::Fragment, "main"),
+            request(gradient_wgsl, Deko3dShaderStage::Fragment, "main"),
         )
         .unwrap();
 
@@ -1481,16 +1522,16 @@ mod deko3d_artifact_tests {
             .as_slice(),
         ];
         for wgsl in rewritten_gradients {
-            let artifact = resolve_deko3d_wgsl_artifact(
+            let artifact = compile_deko3d_shader_module(
                 &state,
-                request(wgsl, Deko3dWgslArtifactStage::Fragment, "main"),
+                request(wgsl, Deko3dShaderStage::Fragment, "main"),
             )
             .unwrap();
             assert_eq!(&artifact[..4], b"DKSH");
         }
         assert_eq!(state.compiler.lock().len(), 4);
 
-        let multiview_shaders: &[(&[u8], Deko3dWgslArtifactStage)] = &[
+        let multiview_shaders: &[(&[u8], Deko3dShaderStage)] = &[
             (
                 br#"
                     @vertex
@@ -1498,7 +1539,7 @@ mod deko3d_artifact_tests {
                         return vec4<f32>(f32(view), 0.0, 0.0, 1.0);
                     }
                 "#,
-                Deko3dWgslArtifactStage::Vertex,
+                Deko3dShaderStage::Vertex,
             ),
             (
                 br#"
@@ -1507,13 +1548,13 @@ mod deko3d_artifact_tests {
                         return vec4<f32>(f32(view));
                     }
                 "#,
-                Deko3dWgslArtifactStage::Fragment,
+                Deko3dShaderStage::Fragment,
             ),
         ];
         for (wgsl, stage) in multiview_shaders {
             let mut multiview = request(wgsl, *stage, "main");
             multiview.multiview_mask = core::num::NonZeroU32::new(0b101);
-            let artifact = resolve_deko3d_wgsl_artifact(&state, multiview).unwrap();
+            let artifact = compile_deko3d_shader_module(&state, multiview).unwrap();
             assert_eq!(&artifact[..4], b"DKSH");
         }
         assert_eq!(state.compiler.lock().len(), 6);

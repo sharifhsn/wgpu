@@ -1,5 +1,5 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::{future::Future, marker::PhantomData, num::NonZeroU32};
+use core::{future::Future, marker::PhantomData};
 
 use crate::*;
 
@@ -18,78 +18,13 @@ pub struct ShaderModule {
     pub(crate) deko3d_wgsl: Option<Arc<[u8]>>,
 }
 
-/// Stage for which a Deko3D offline artifact is requested.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum Deko3dWgslArtifactStage {
-    /// Vertex stage.
-    Vertex,
-    /// Fragment stage.
-    Fragment,
-    /// Compute stage.
-    Compute,
-}
-
 /// Pipeline-layout descriptor count for one runtime-sized WGSL resource binding array.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct Deko3dWgslBindingArraySize {
-    /// Bind-group index.
-    pub group: u32,
-    /// Binding index within the group.
-    pub binding: u32,
-    /// Number of descriptors declared by the bind-group layout.
-    pub count: u32,
+pub(crate) struct Deko3dBindingArraySize {
+    pub(crate) group: u32,
+    pub(crate) binding: u32,
+    pub(crate) count: u32,
 }
-
-/// Exact WGSL and pipeline-stage metadata used to resolve a Deko3D DKSH artifact.
-#[derive(Clone, Copy, Debug)]
-pub struct Deko3dWgslArtifactRequest<'a> {
-    /// The exact final WGSL bytes passed to `create_shader_module`.
-    pub wgsl: &'a [u8],
-    /// Pipeline stage requiring the artifact.
-    pub stage: Deko3dWgslArtifactStage,
-    /// Requested pipeline entry point, with `main` substituted for an omitted entry point.
-    pub entry_point: &'a str,
-    /// Pipeline-overridable constants. Duplicate names are permitted and the last value wins.
-    pub constants: &'a [(&'a str, f64)],
-    /// Whether workgroup-scoped memory must be initialized to zero for this stage.
-    pub zero_initialize_workgroup_memory: bool,
-    /// Render-pipeline view mask. Multiview vertex artifacts must write `gl_Layer` and read the
-    /// current view index from Deko3D vertex uniform-buffer slot 14. Compute and fragment artifact
-    /// requests always use `None`.
-    pub multiview_mask: Option<NonZeroU32>,
-    /// Descriptor counts from the explicit pipeline layout. Runtime-sized WGSL
-    /// `binding_array<T>` declarations require the matching entry.
-    pub binding_array_sizes: &'a [Deko3dWgslBindingArraySize],
-}
-
-/// Failure to compile WGSL for Deko3D.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Deko3dWgslArtifactError {
-    /// This wgpu build does not include the Deko3D compiler.
-    CompilerUnavailable,
-    /// The built-in Deko3D shader compiler rejected the request.
-    Compiler(String),
-    /// The compiler returned malformed DKSH bytes.
-    InvalidDksh(&'static str),
-}
-
-impl core::fmt::Display for Deko3dWgslArtifactError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::CompilerUnavailable => {
-                f.write_str("this wgpu build does not include the Deko3D WGSL compiler")
-            }
-            Self::Compiler(message) => {
-                write!(f, "Deko3D WGSL compilation failed: {message}")
-            }
-            Self::InvalidDksh(message) => {
-                write!(f, "Deko3D WGSL compiler returned invalid DKSH: {message}")
-            }
-        }
-    }
-}
-
-impl core::error::Error for Deko3dWgslArtifactError {}
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(ShaderModule: Send, Sync);
 

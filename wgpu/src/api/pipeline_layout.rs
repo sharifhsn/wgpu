@@ -11,7 +11,7 @@ use crate::*;
 #[derive(Debug, Clone)]
 pub struct PipelineLayout {
     pub(crate) inner: dispatch::DispatchPipelineLayout,
-    pub(crate) deko3d_binding_array_sizes: Arc<[Deko3dWgslBindingArraySize]>,
+    pub(crate) deko3d_binding_array_sizes: Arc<[Deko3dBindingArraySize]>,
 }
 #[cfg(send_sync)]
 static_assertions::assert_impl_all!(PipelineLayout: Send, Sync);
