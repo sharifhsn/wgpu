@@ -1510,6 +1510,15 @@ mod deko3d_artifact_tests {
             @group(0) @binding(1) var<storage, read_write> output: array<u32>;
             var<workgroup> uniform_value: u32;
 
+            fn choose(destination: ptr<function, u32>, lane: u32) -> u32 {
+                if lane == 0u {
+                    *destination = 11u;
+                    return 1u;
+                }
+                *destination = 22u;
+                return 2u;
+            }
+
             @compute @workgroup_size(4)
             fn compute_main(
                 @builtin(global_invocation_id) id: vec3<u32>,
@@ -1542,8 +1551,11 @@ mod deko3d_artifact_tests {
                 _ = subgroupInclusiveMul(value);
                 _ = lane + subgroup_size + subgroup + subgroup_count;
                 _ = all || any;
+                var pointer_value = 0u;
+                let selected = choose(&pointer_value, lane);
                 let result = input[id.x] * 3u + 1u + first - first + ballot.x - ballot.x
-                    + uniform_result - uniform_result;
+                    + uniform_result - uniform_result + pointer_value - pointer_value
+                    + selected - selected;
                 if lane == 3u {
                     return;
                 }
