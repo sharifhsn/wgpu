@@ -1553,9 +1553,18 @@ mod deko3d_artifact_tests {
                 _ = all || any;
                 var pointer_value = 0u;
                 let selected = choose(&pointer_value, lane);
+                var switched = 0u;
+                switch lane {
+                    case 0u, 1u: {
+                        switched = 10u;
+                    }
+                    default: {
+                        switched = 20u;
+                    }
+                }
                 let result = input[id.x] * 3u + 1u + first - first + ballot.x - ballot.x
                     + uniform_result - uniform_result + pointer_value - pointer_value
-                    + selected - selected;
+                    + selected - selected + switched - switched;
                 if lane == 3u {
                     return;
                 }
