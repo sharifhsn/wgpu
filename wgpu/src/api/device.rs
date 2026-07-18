@@ -1508,6 +1508,7 @@ mod deko3d_artifact_tests {
         let wgsl = br#"
             @group(0) @binding(0) var<storage, read> input: array<u32>;
             @group(0) @binding(1) var<storage, read_write> output: array<u32>;
+            var<workgroup> uniform_value: u32;
 
             @compute @workgroup_size(4)
             fn compute_main(
@@ -1523,6 +1524,10 @@ mod deko3d_artifact_tests {
                 let all = subgroupAll(predicate);
                 let any = subgroupAny(predicate);
                 let ballot = subgroupBallot(predicate);
+                if lane == 0u {
+                    uniform_value = 42u;
+                }
+                let uniform_result = workgroupUniformLoad(&uniform_value);
                 let value = lane + 1u;
                 _ = subgroupAdd(value);
                 _ = subgroupMul(value);
@@ -1537,7 +1542,13 @@ mod deko3d_artifact_tests {
                 _ = subgroupInclusiveMul(value);
                 _ = lane + subgroup_size + subgroup + subgroup_count;
                 _ = all || any;
-                output[id.x] = input[id.x] * 3u + 1u + first - first + ballot.x - ballot.x;
+                let result = input[id.x] * 3u + 1u + first - first + ballot.x - ballot.x
+                    + uniform_result - uniform_result;
+                if predicate {
+                    output[id.x] = result;
+                } else {
+                    output[id.x] = result + 0u;
+                }
             }
         "#;
         let artifact = resolve_deko3d_wgsl_artifact(
