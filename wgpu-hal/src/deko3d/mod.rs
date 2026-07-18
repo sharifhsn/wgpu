@@ -585,7 +585,7 @@ fn parse_shader_bindings(
     bytes: &[u8],
     header: DkshHeader,
 ) -> Result<Vec<ShaderBinding>, crate::ShaderError> {
-    const MAGIC: &[u8; 8] = b"DKRBv001";
+    const MAGIC: &[u8; 8] = b"DKRBMETA";
     const ENTRY_SIZE: usize = 16;
     let offset = usize::try_from(header.control_sz)
         .ok()
@@ -5511,14 +5511,13 @@ impl crate::Device for Device {
         {
             match shader {
                 crate::ShaderInput::Deko3dDksh(bytes) => {
-                    let module = unsafe {
-                        ShaderModuleInner::new_dksh(self.inner.raw_device(), bytes)?
-                    };
+                    let module =
+                        unsafe { ShaderModuleInner::new_dksh(self.inner.raw_device(), bytes)? };
                     Ok(Resource::ShaderModule(Arc::new(module)))
                 }
                 crate::ShaderInput::Naga(_) => Ok(Resource::Placeholder),
                 _ => Err(crate::ShaderError::Compilation(String::from(
-                    "deko3d accepts WGSL only through a trusted stage-specific DKSH artifact provider",
+                    "deko3d requires compiled DKSH at the HAL boundary",
                 ))),
             }
         }

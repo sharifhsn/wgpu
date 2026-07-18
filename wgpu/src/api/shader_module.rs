@@ -45,8 +45,6 @@ pub struct Deko3dWgslBindingArraySize {
 pub struct Deko3dWgslArtifactRequest<'a> {
     /// The exact final WGSL bytes passed to `create_shader_module`.
     pub wgsl: &'a [u8],
-    /// SHA-256 digest of [`Self::wgsl`].
-    pub wgsl_sha256: [u8; 32],
     /// Pipeline stage requiring the artifact.
     pub stage: Deko3dWgslArtifactStage,
     /// Requested pipeline entry point, with `main` substituted for an omitted entry point.
@@ -64,45 +62,29 @@ pub struct Deko3dWgslArtifactRequest<'a> {
     pub binding_array_sizes: &'a [Deko3dWgslBindingArraySize],
 }
 
-/// A trusted source of offline-compiled Deko3D DKSH artifacts.
-pub trait Deko3dWgslArtifactProvider: Send + Sync {
-    /// Resolves an exact WGSL/stage/entry-point/options request to validated DKSH bytes.
-    fn resolve(&self, request: Deko3dWgslArtifactRequest<'_>) -> Result<Arc<[u8]>, String>;
-}
-
-/// Failure to install a Deko3D WGSL artifact provider or compile WGSL for Deko3D.
+/// Failure to compile WGSL for Deko3D.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Deko3dWgslArtifactError {
-    /// A provider was already installed for this device.
-    AlreadyInstalled,
-    /// A Deko3D WGSL module required a provider but none is installed.
-    NotInstalled,
+    /// This wgpu build does not include the Deko3D compiler.
+    CompilerUnavailable,
     /// The built-in Deko3D shader compiler rejected the request.
     Compiler(String),
-    /// The trusted provider rejected an artifact request.
-    Provider(String),
-    /// The trusted provider returned malformed DKSH bytes.
+    /// The compiler returned malformed DKSH bytes.
     InvalidDksh(&'static str),
 }
 
 impl core::fmt::Display for Deko3dWgslArtifactError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::AlreadyInstalled => {
-                f.write_str("a Deko3D WGSL artifact provider is already installed")
+            Self::CompilerUnavailable => {
+                f.write_str("this wgpu build does not include the Deko3D WGSL compiler")
             }
-            Self::NotInstalled => f.write_str("no Deko3D WGSL artifact provider is installed"),
             Self::Compiler(message) => {
                 write!(f, "Deko3D WGSL compilation failed: {message}")
             }
-            Self::Provider(message) => write!(
-                f,
-                "Deko3D WGSL artifact provider rejected the request: {message}"
-            ),
-            Self::InvalidDksh(message) => write!(
-                f,
-                "Deko3D WGSL artifact provider returned invalid DKSH: {message}"
-            ),
+            Self::InvalidDksh(message) => {
+                write!(f, "Deko3D WGSL compiler returned invalid DKSH: {message}")
+            }
         }
     }
 }
@@ -340,23 +322,3 @@ pub struct Deko3dDkshShaderModuleDescriptor<'a> {
     pub dksh: alloc::borrow::Cow<'a, [u8]>,
 }
 static_assertions::assert_impl_all!(Deko3dDkshShaderModuleDescriptor<'_>: Send, Sync);
-
-impl<'a> Deko3dDkshShaderModuleDescriptor<'a> {
-    /// Constructs a descriptor for one offline-compiled entry point.
-    ///
-    /// Deko3D DKSH already contains the selected graphics or compute entry point, so the name is
-    /// retained for source compatibility with newer wgpu artifact tooling but is not encoded
-    /// separately by the wgpu 29 passthrough descriptor.
-    pub fn single_entry(
-        label: Label<'a>,
-        _entry_point: &'a str,
-        num_workgroups: (u32, u32, u32),
-        dksh: alloc::borrow::Cow<'a, [u8]>,
-    ) -> Self {
-        Self {
-            label,
-            num_workgroups,
-            dksh,
-        }
-    }
-}

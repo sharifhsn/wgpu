@@ -33,12 +33,10 @@ write masks for sprites and UI. It also accepts common 8/16-bit normalized and i
 attributes plus half floats. RGBA8 texture uploads accept WebGPU's padded rows; readback and
 non-RGBA8 texture transfer remain unsupported.
 
-For captured WGSL, install one [`Deko3dWgslArtifactProvider`] on the `Device` before pipeline
-creation. The provider receives the exact WGSL bytes and SHA-256 digest plus the requested
-vertex, fragment, or compute entry point, and returns a single-program DKSH artifact. It is
-set-once, shared by `Device` clones, and invoked outside wgpu's provider lock. WGSL is only a
-manifest key on Deko3D: the stage-specific DKSH is selected when a pipeline is created.
-This does not add a general runtime WGSL compiler or broaden the single-program DKSH contract.
+WGSL shader modules compile automatically when their render or compute pipeline is created. The
+selected entry point, pipeline constants, multiview state, workgroup initialization policy, and
+binding-array sizes are passed directly to `deko-shader-compiler`; its validated single-program
+DKSH is then consumed by the Deko3D HAL. WGSL compilation is self-contained in wgpu.
 
 Static bind groups accept up to four sampled 2D texture/sampler pairs at consecutive binding
 slots `(0,1)`, `(2,3)`, `(4,5)`, and `(6,7)`, plus static uniform buffers at bindings below 16.
