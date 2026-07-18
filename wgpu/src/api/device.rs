@@ -1508,6 +1508,7 @@ mod deko3d_artifact_tests {
         let wgsl = br#"
             @group(0) @binding(0) var<storage, read> input: array<u32>;
             @group(0) @binding(1) var<storage, read_write> output: array<u32>;
+            @group(0) @binding(2) var atomic_image: texture_storage_2d<r32uint, atomic>;
             var<workgroup> uniform_value: u32;
 
             fn choose(destination: ptr<function, u32>, lane: u32) -> u32 {
@@ -1553,6 +1554,7 @@ mod deko3d_artifact_tests {
                 _ = all || any;
                 var pointer_value = 0u;
                 let selected = choose(&pointer_value, lane);
+                textureAtomicAdd(atomic_image, vec2<i32>(i32(lane), 0), 1u);
                 var switched = 0u;
                 switch lane {
                     case 0u, 1u: {

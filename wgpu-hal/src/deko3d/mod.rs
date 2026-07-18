@@ -2562,7 +2562,8 @@ impl TextureInner {
         if desc.usage.intersects(
             wgt::TextureUses::STORAGE_READ_ONLY
                 | wgt::TextureUses::STORAGE_WRITE_ONLY
-                | wgt::TextureUses::STORAGE_READ_WRITE,
+                | wgt::TextureUses::STORAGE_READ_WRITE
+                | wgt::TextureUses::STORAGE_ATOMIC,
         ) {
             image_layout_maker.flags |= dk::DkImageFlags_UsageLoadStore;
         }
@@ -2974,7 +2975,7 @@ impl BindGroupInner {
             wgt::StorageTextureAccess::ReadOnly => wgt::TextureUses::STORAGE_READ_ONLY,
             wgt::StorageTextureAccess::WriteOnly => wgt::TextureUses::STORAGE_WRITE_ONLY,
             wgt::StorageTextureAccess::ReadWrite => wgt::TextureUses::STORAGE_READ_WRITE,
-            _ => return Err(crate::DeviceError::Lost),
+            wgt::StorageTextureAccess::Atomic => wgt::TextureUses::STORAGE_ATOMIC,
         };
         let mut elements = Vec::with_capacity(count as usize);
         for texture_binding in desc.textures {
@@ -3649,6 +3650,12 @@ fn deko3d_texture_format_capabilities(
     ) {
         capabilities |= C::STORAGE_READ_ONLY | C::STORAGE_WRITE_ONLY | C::STORAGE_READ_WRITE;
     }
+    if matches!(
+        format,
+        wgt::TextureFormat::R32Uint | wgt::TextureFormat::R32Sint
+    ) {
+        capabilities |= C::STORAGE_ATOMIC;
+    }
     if capabilities.intersects(C::COLOR_ATTACHMENT | C::DEPTH_STENCIL_ATTACHMENT) {
         capabilities |= C::MULTISAMPLE_X2 | C::MULTISAMPLE_X4 | C::MULTISAMPLE_X8;
     }
@@ -3823,13 +3830,16 @@ fn supported_bind_group_layout_kind(
                     wgt::StorageTextureAccess::ReadWrite => {
                         crate::TextureFormatCapabilities::STORAGE_READ_WRITE
                     }
-                    _ => return None,
+                    wgt::StorageTextureAccess::Atomic => {
+                        crate::TextureFormatCapabilities::STORAGE_ATOMIC
+                    }
                 };
                 if matches!(
                     access,
                     wgt::StorageTextureAccess::ReadOnly
                         | wgt::StorageTextureAccess::WriteOnly
                         | wgt::StorageTextureAccess::ReadWrite
+                        | wgt::StorageTextureAccess::Atomic
                 ) && deko3d_texture_format_capabilities(format).contains(required)
                     && matches!(
                         view_dimension,
@@ -4407,6 +4417,37 @@ mod tests {
             array,
             Some(BindGroupLayoutKind::StorageTexture { count: 4, .. })
         ));
+
+        let atomic = supported_bind_group_layout_kind(&[wgt::BindGroupLayoutEntry {
+            binding: 2,
+            visibility: wgt::ShaderStages::COMPUTE,
+            ty: wgt::BindingType::StorageTexture {
+                access: wgt::StorageTextureAccess::Atomic,
+                format: wgt::TextureFormat::R32Uint,
+                view_dimension: wgt::TextureViewDimension::D2,
+            },
+            count: None,
+        }]);
+        assert!(matches!(
+            atomic,
+            Some(BindGroupLayoutKind::StorageTexture {
+                access: wgt::StorageTextureAccess::Atomic,
+                ..
+            })
+        ));
+        assert!(supported_features().contains(wgt::Features::TEXTURE_ATOMIC));
+        assert!(
+            deko3d_texture_format_capabilities(wgt::TextureFormat::R32Uint)
+                .contains(crate::TextureFormatCapabilities::STORAGE_ATOMIC)
+        );
+        assert!(
+            deko3d_texture_format_capabilities(wgt::TextureFormat::R32Sint)
+                .contains(crate::TextureFormatCapabilities::STORAGE_ATOMIC)
+        );
+        assert!(
+            !deko3d_texture_format_capabilities(wgt::TextureFormat::R32Float)
+                .contains(crate::TextureFormatCapabilities::STORAGE_ATOMIC)
+        );
     }
 
     #[test]
@@ -4804,6 +4845,7 @@ pub fn supported_features() -> wgt::Features {
         | wgt::Features::BUFFER_BINDING_ARRAY
         | wgt::Features::STORAGE_RESOURCE_BINDING_ARRAY
         | wgt::Features::UNIFORM_BUFFER_BINDING_ARRAYS
+        | wgt::Features::TEXTURE_ATOMIC
         | wgt::Features::MULTIVIEW
         | wgt::Features::SELECTIVE_MULTIVIEW
 }
